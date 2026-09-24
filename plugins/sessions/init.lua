@@ -157,15 +157,7 @@ local function render()
   local inner = board.width - 4
   local input = board.rename and board.rename.input or board.input
   local prefix = board.rename and RENAME_PREFIX or FILTER_PREFIX
-  for _, ln in ipairs(input:render(prefix, dispw(prefix), inner).lines) do
-    lines[#lines + 1] = ln
-  end
-  lines[#lines + 1] = {}
-  -- The query and its blank spacer stay pinned while the list scrolls.
-  if #lines ~= board.reserved then
-    board.reserved = #lines
-    board.win:set_config({ reserved_top = board.reserved })
-  end
+  board.reserved = ListPicker.render_header(board.win, lines, input, prefix, inner)
   local cursor_line = board.reserved
   local words = filter_words()
   for i, s in ipairs(board.items) do
@@ -395,11 +387,11 @@ local function commit_rename()
 end
 
 local function handle_rename_key(key)
-  if key == "esc" then
+  if key == "<Esc>" then
     stop_rename()
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     commit_rename()
-  elseif key ~= "up" and key ~= "down" then
+  elseif key ~= "<Up>" and key ~= "<Down>" then
     if board.rename.input:handle_key(key) ~= "ignored" then
       render()
     end
@@ -407,11 +399,11 @@ local function handle_rename_key(key)
 end
 
 local function handle_key(key)
-  if key == "ctrl+c" then
+  if key == "<C-c>" then
     close()
   elseif board.rename then
     handle_rename_key(key)
-  elseif key == "esc" then
+  elseif key == "<Esc>" then
     if board.confirm then
       board.confirm = nil
       render()
@@ -422,21 +414,21 @@ local function handle_key(key)
     else
       close()
     end
-  elseif key == "up" then
+  elseif key == "<Up>" then
     move_sel(-1, true)
-  elseif key == "down" then
+  elseif key == "<Down>" then
     move_sel(1, true)
-  elseif key == "pageup" then
+  elseif key == "<PageUp>" then
     move_sel(-page_size())
-  elseif key == "pagedown" then
+  elseif key == "<PageDown>" then
     move_sel(page_size())
-  elseif key == "enter" then
+  elseif key == "<CR>" then
     open_selected()
-  elseif key == "ctrl+n" then
+  elseif key == "<C-n>" then
     open_blank()
-  elseif key == "ctrl+r" then
+  elseif key == "<C-r>" then
     start_rename()
-  elseif key == "ctrl+d" then
+  elseif key == "<C-d>" then
     delete_selected()
   else
     local r = board.input:handle_key(key)
@@ -461,7 +453,6 @@ local function open()
     width = "70%",
     height = "70%",
     border = "rounded",
-    reserved_top = 2,
     focus = true,
     footer = FILTER_KEYS,
   })
@@ -470,7 +461,7 @@ local function open()
     buf = buf,
     width = win.width,
     height = win.height,
-    reserved = 2,
+    reserved = 0,
     input = TextInput.new(),
     all = {},
     items = {},
@@ -567,6 +558,8 @@ maki.api.register_command({
   description = "Browse and switch sessions",
   handler = open,
 })
+
+maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 
 maki.api.register_command({
   name = "/rename",

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
@@ -25,6 +25,10 @@ pub enum InputFormat {
 
 #[derive(Parser)]
 #[command(name = "maki", version, about = "AI coding agent for the terminal")]
+// Only one way to name the session to load, or the resolver would quietly pick
+// one. `--fork-session` requires it, since forking nothing used to start a
+// blank session.
+#[command(group = ArgGroup::new("loaded").args(["continue_session", "resume"]))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -50,8 +54,13 @@ pub struct Cli {
     pub continue_session: bool,
 
     /// Resume a specific session by its ID
-    #[arg(short = 's', long, alias = "resume")]
-    pub session: Option<String>,
+    #[arg(
+        short = 'r',
+        long,
+        visible_short_alias = 's',
+        visible_alias = "session"
+    )]
+    pub resume: Option<String>,
 
     /// Output format for --print mode
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -64,10 +73,6 @@ pub struct Cli {
     /// Skip loading custom commands from .maki/commands, .claude/commands, etc.
     #[arg(long)]
     pub no_commands: bool,
-
-    /// Disable rtk command rewriting
-    #[arg(long)]
-    pub no_rtk: bool,
 
     /// Skip user `init.lua` files (global and project) but keep the Lua
     /// host and every builtin plugin running, so tools and the default
@@ -85,6 +90,12 @@ pub struct Cli {
     #[arg(long, alias = "dangerously-skip-permissions")]
     pub yolo: bool,
 
+    /// Load shared project `.maki` config for this run without asking and
+    /// without recording an answer. For containers and CI, where the state
+    /// directory is thrown away anyway. Only use it on a project you trust.
+    #[arg(long)]
+    pub trust: bool,
+
     /// Exit after the agent completes (for automation workflows)
     #[arg(long)]
     pub exit_on_done: bool,
@@ -97,12 +108,12 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
     pub disallowed_tools: Vec<String>,
 
-    /// Session ID for SDK mode
+    /// Write this run under a chosen session ID, unless one already exists there
     #[arg(long)]
     pub session_id: Option<String>,
 
     /// Fork the loaded session under a new ID
-    #[arg(long)]
+    #[arg(long, requires = "loaded")]
     pub fork_session: bool,
 
     /// Maximum number of agent turns
@@ -205,7 +216,16 @@ pub enum Command {
         action: AuthAction,
     },
     /// List all available models
-    Models,
+    Models {
+        /// Refetch the models.dev catalog, ignoring its 24h cache
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// Run the index tool on a file to see how it looks like
     Index { path: String },
     /// Manage MCP server authentication
@@ -253,6 +273,49 @@ pub enum Command {
         #[command(subcommand)]
         action: MigrateAction,
     },
+    /// Manage projects that may load automatic shared project configuration
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TrustAction {
+    /// Trust a project to load automatic shared .maki configuration
+    Add {
+        /// Project to trust. Defaults to the current directory
+        path: Option<PathBuf>,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove a stored project trust decision
+    Remove {
+        /// Project to remove. Defaults to the current directory
+        path: Option<PathBuf>,
+    },
+    /// List stored project trust decisions
+    List,
+}
+
+#[derive(Subcommand)]
+pub enum SessionAction {
+    /// List sessions
+    List {
+        /// Show sessions from all projects
+        #[arg(short, long)]
+        global: bool,
+    },
+    /// Delete a session
+    Delete {
+        /// Session ID (see `maki session list`)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -279,12 +342,12 @@ pub enum McpAction {
 pub enum AuthAction {
     /// Authenticate with a provider (interactive if no provider specified)
     Login {
-        /// Provider slug (e.g. zai, openai). Omit for interactive selection.
+        /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
         provider: Option<String>,
     },
     /// Remove stored credentials for a provider
     Logout {
-        /// Provider slug (e.g. openai)
+        /// Provider slug (e.g. openai, xai)
         provider: String,
     },
     /// Show authentication status for all providers
@@ -318,6 +381,8 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
     #[test_case("CodeExecution", "code_execution")]
@@ -336,5 +401,20 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    /// `--session-id` with `-c` stays legal: continue the latest, but write
+    /// under this id.
+    #[test_case(&["-c", "-r", SESSION_ID], false ; "two sessions to load")]
+    #[test_case(&["-c", "-s", SESSION_ID], false ; "two sessions to load through the short alias")]
+    #[test_case(&["-c", "--session", SESSION_ID], false ; "two sessions to load through the long alias")]
+    #[test_case(&["--fork-session"], false ; "a fork with nothing to fork")]
+    #[test_case(&["--fork-session", "-c"], true ; "a fork of the latest")]
+    #[test_case(&["--fork-session", "-r", SESSION_ID], true ; "a fork of a named session")]
+    #[test_case(&["-c", "--session-id", SESSION_ID], true ; "a redirected continue")]
+    fn session_flag_combinations(args: &[&str], accepted: bool) {
+        let argv = std::iter::once("maki").chain(args.iter().copied());
+
+        assert_eq!(Cli::try_parse_from(argv).is_ok(), accepted);
     }
 }

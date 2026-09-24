@@ -6,17 +6,20 @@ edition.workspace = true
 [dependencies]
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
+maki-otel = { workspace = true }
 maki-highlight = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
 maki-lua = { workspace = true }
 maki-storage = { workspace = true }
 ratatui = { workspace = true }
+ratatui-image = { workspace = true }
 crossterm = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
 syntect = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
 arboard = { workspace = true }
 jiff = { workspace = true }
@@ -28,11 +31,11 @@ toml = { workspace = true }
 arc-swap = { workspace = true }
 getrandom = { workspace = true }
 futures-lite = { workspace = true }
-image = { workspace = true }
+wait-timeout = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 base64 = { workspace = true }
 nucleo = { workspace = true }
 nucleo-matcher = { workspace = true }
-ignore = { workspace = true }
 async-process = { workspace = true }
 libc = { workspace = true }
 strum = { workspace = true }
@@ -47,10 +50,19 @@ open = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
 name = "splash"
+harness = false
+
+[[bench]]
+name = "wrap"
+harness = false
+
+[[bench]]
+name = "reflow"
 harness = false

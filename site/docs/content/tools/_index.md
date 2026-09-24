@@ -7,11 +7,11 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (19 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
-### `bash` *(lua plugin)*
+### `bash` {#bash}
 
 Execute a bash command.
 Commands run in <cwd> by default.
@@ -20,10 +20,11 @@ Commands run in <cwd> by default.
 |-----------|------|----------|---------|-------------|
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
+| `tail` | integer | no |  | Return only the last N lines |
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
-### `list` *(lua plugin)*
+### `list` {#list}
 
 List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
 
@@ -31,7 +32,7 @@ List directory contents. Returns entry names sorted alphabetically, directories 
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the directory |
 
-### `read` *(lua plugin)*
+### `read` {#read}
 
 Read a file. Returns contents with line numbers (1-indexed).
 
@@ -41,7 +42,7 @@ Read a file. Returns contents with line numbers (1-indexed).
 | `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
 | `path` | string | yes | Absolute path to the file |
 
-### `write` *(lua plugin)*
+### `write` {#write}
 
 Write content to a file, replacing existing content.
 
@@ -50,7 +51,7 @@ Write content to a file, replacing existing content.
 | `content` | string | yes | The complete file content to write |
 | `path` | string | yes | Absolute path to the file |
 
-### `edit` *(lua plugin)*
+### `edit` {#edit}
 
 Replace an exact string match in a file.
 
@@ -61,7 +62,7 @@ Replace an exact string match in a file.
 | `path` | string | yes |  | Absolute path to the file |
 | `replace_all` | boolean | no | false | Replace all occurrences |
 
-### `multiedit` *(lua plugin)*
+### `multiedit` {#multiedit}
 
 Make multiple find-and-replace edits to a single file atomically.
 Prefer this over edit when making multiple changes to the same file.
@@ -71,7 +72,7 @@ Prefer this over edit when making multiple changes to the same file.
 | `edits` | array | yes | Array of edit operations to apply sequentially |
 | `path` | string | yes | Absolute path to the file |
 
-### `edit_lines` *(lua plugin, opt-in)*
+### `edit_lines` {#edit_lines}
 
 Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
 
@@ -82,17 +83,17 @@ Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new
 | `path` | string | yes | Absolute path to the file |
 | `start` | integer | yes | First line (1-indexed) |
 
-### `insert_lines` *(lua plugin, opt-in)*
+### `insert_lines` <span class="badge badge-optin">opt-in</span> {#insert_lines}
 
-Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved. Do not use with the batch tool.
+Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `line` | integer | yes | Line number to insert before (1-indexed). Use 1 to insert at the top. |
+| `line` | integer | yes | Line number to insert after (1-indexed). Use 0 to insert at the top. |
 | `new_string` | string | yes | Text to insert |
 | `path` | string | yes | Absolute path to the file |
 
-### `glob` *(lua plugin)*
+### `glob` {#glob}
 
 Find files by glob pattern.
 
@@ -101,7 +102,7 @@ Find files by glob pattern.
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
 
-### `grep` *(lua plugin)*
+### `grep` {#grep}
 
 Search file contents using regex.
 
@@ -114,7 +115,7 @@ Search file contents using regex.
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Regex pattern |
 
-### `index` *(lua plugin)*
+### `index` {#index}
 
 Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
 
@@ -122,7 +123,7 @@ Return a compact overview of a source file: imports, type definitions, function 
 |-----------|------|----------|-------------|
 | `path` | string | yes | Absolute path to the file |
 
-### `view_image` *(lua plugin)*
+### `view_image` {#view_image}
 
 View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
 
@@ -132,7 +133,7 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ## Execution & Control
 
-### `batch` *(lua plugin)*
+### `batch` {#batch}
 
 Executes multiple independent tool calls concurrently to reduce round-trips.
 
@@ -140,16 +141,16 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 |-----------|------|----------|-------------|
 | `tool_calls` | array | yes | Array of tool calls to execute in parallel |
 
-### `code_execution` *(lua plugin)*
+### `code_execution` {#code_execution}
 
-Execute Python code in a sandboxed interpreter with tools as callable functions.
+Execute Python in a sandbox where every tool is an async function.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await asyncio.gather(...)` for concurrency. |
+| `code` | string | yes |  | Python code. Tools return strings, not objects, and you MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. |
 | `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
-### `question` *(lua plugin)*
+### `question` {#question}
 
 Use this tool when you need to ask the user questions during execution. This allows you to:
 - Gather user preferences or requirements
@@ -163,7 +164,7 @@ Use this tool when you need to ask the user questions during execution. This all
 
 ## Agent & Knowledge
 
-### `task` *(lua plugin)*
+### `task` {#task}
 
 Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
@@ -174,8 +175,9 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
 
-### `todo_write` *(lua plugin)*
+### `todo_write` {#todo_write}
 
 Create or update a structured todo list to track tasks.
 
@@ -183,7 +185,7 @@ Create or update a structured todo list to track tasks.
 |-----------|------|----------|-------------|
 | `todos` | array | yes | The updated todo list |
 
-### `memory` *(lua plugin)*
+### `memory` {#memory}
 
 Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
 
@@ -194,7 +196,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
-### `skill` *(lua plugin)*
+### `skill` {#skill}
 
 Load a skill that provides instructions and workflows for specific tasks.
 
@@ -204,7 +206,7 @@ Load a skill that provides instructions and workflows for specific tasks.
 
 ## Web
 
-### `webfetch` *(lua plugin)*
+### `webfetch` {#webfetch}
 
 Fetch a URL and return its contents.
 
@@ -214,7 +216,7 @@ Fetch a URL and return its contents.
 | `timeout` | integer | no | 30, max 120 | Timeout in seconds |
 | `url` | string | yes |  | URL to fetch (http:// or https://) |
 
-### `websearch` *(lua plugin)*
+### `websearch` {#websearch}
 
 Search the web for real-time information using Exa AI.
 

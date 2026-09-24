@@ -35,6 +35,10 @@ pub struct FnDoc {
     pub returns: &'static str,
     /// Lua snippet rendered as a fenced code block, or "" when absent.
     pub example: &'static str,
+    /// Manifest key of the plugin permission gating this function, from the
+    /// `guard =` attribute. Rendered into the docs so the reference can
+    /// never drift from the actual gate.
+    pub guard: Option<&'static str>,
 }
 
 pub struct ParamDoc {
@@ -49,8 +53,10 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
     use crate::api;
     vec![
         &api::util::setup::DOCS,
+        &api::pack::DOCS,
         &api::tool::DOCS,
         &api::autocmd::DOCS,
+        &api::plan::DOCS,
         &api::slot::DOCS,
         &api::agent::DOCS,
         &api::agent::SESSION_DOCS,
@@ -68,8 +74,12 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::json::VALIDATOR_DOCS,
         &api::keymap::DOCS,
         &api::log::DOCS,
+        &api::model::DOCS,
         &api::net::DOCS,
         &api::session::DOCS,
+        &api::top::DOCS,
+        &api::top::TIMER_DOCS,
+        &api::task::DOCS,
         &api::text::DOCS,
         &api::treesitter::DOCS,
         &api::treesitter::language::DOCS,
@@ -108,10 +118,19 @@ mod tests {
     }
 
     fn table_keys(table: &Table) -> BTreeSet<String> {
-        table
+        let mut keys: BTreeSet<String> = table
             .pairs::<String, Value>()
             .map(|pair| pair.unwrap().0)
-            .collect()
+            .collect();
+        // `maki.notify` is stashed in the `__index` table (see
+        // `create_maki_global`), so the drift check has to see through the
+        // metatable to consider it registered.
+        if let Some(mt) = table.metatable()
+            && let Ok(idx) = mt.get::<Table>("__index")
+        {
+            keys.extend(idx.pairs::<String, Value>().map(|p| p.unwrap().0));
+        }
+        keys
     }
 
     /// Docs and registration live side by side; this test keeps them equal so
@@ -122,6 +141,7 @@ mod tests {
         let (ui_tx, _ui_rx) = flume::unbounded();
         let maki = create_maki_global(
             &lua,
+            Arc::default(),
             Arc::default(),
             Arc::from("docs-test"),
             Some(ui_tx),
@@ -150,11 +170,23 @@ mod tests {
                 .insert(key);
         }
 
+        // Documented here but attached by the runtime rather than by
+        // `create_maki_global`, so the table built for this test has none of
+        // it. `setup` is attached only when a config store is present.
+        const RUNTIME_ATTACHED: [&str; 1] = ["setup"];
+
         for (name, mut expected) in documented {
+            if RUNTIME_ATTACHED
+                .iter()
+                .any(|only| name == format!("maki.{only}"))
+            {
+                continue;
+            }
             let actual = table_keys(&resolve_table(&maki, name));
             if name == "maki" {
-                // Documented here, but injected later by the runtime.
-                expected.remove("setup");
+                for only in RUNTIME_ATTACHED {
+                    expected.remove(only);
+                }
             }
             let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(

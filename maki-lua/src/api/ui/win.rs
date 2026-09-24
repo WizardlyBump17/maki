@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::time::Duration;
 
+use maki_agent::UiWaker;
 use maki_lua_macro::{lua_class, lua_fn};
 use mlua::{AnyUserData, Lua, Result as LuaResult, Table};
 
@@ -8,7 +9,39 @@ use super::{parse_footer, try_parse_dimension};
 use crate::api::util::command::{
     Anchor, Border, FloatConfigPatch, Split, TitlePos, WinCommand, WinEvent,
 };
+use crate::api::util::convert::opt_bool;
 use crate::docs::{FnDoc, ParamDoc};
+
+/// A window's command channel that also wakes the UI. The UI drains these on a
+/// tick, so without the wake a popup redrawn on every keystroke would lag the
+/// typing by up to a whole poll.
+#[derive(Clone)]
+pub(crate) struct WinSender {
+    tx: flume::Sender<WinCommand>,
+    waker: Option<UiWaker>,
+}
+
+impl WinSender {
+    pub fn new(tx: flume::Sender<WinCommand>, waker: Option<UiWaker>) -> Self {
+        Self { tx, waker }
+    }
+
+    /// False once the UI side has gone.
+    pub fn send(&self, cmd: WinCommand) -> bool {
+        let sent = !matches!(
+            self.tx.try_send(cmd),
+            Err(flume::TrySendError::Disconnected(_))
+        );
+        if let Some(waker) = &self.waker {
+            waker.wake();
+        }
+        sent
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        self.tx.is_disconnected()
+    }
+}
 
 /// All mutable state is in `Cell`s so every Lua method takes a shared
 /// borrow and `recv` never needs to re-borrow mutably after waking.
@@ -16,7 +49,7 @@ use crate::docs::{FnDoc, ParamDoc};
 /// additionally must not hold any borrow across its await; see below.
 pub(crate) struct WinHandle {
     event_rx: flume::Receiver<WinEvent>,
-    cmd_tx: flume::Sender<WinCommand>,
+    cmd_tx: WinSender,
     closed: Cell<bool>,
     visible: Cell<bool>,
     init_width: u16,
@@ -26,7 +59,7 @@ pub(crate) struct WinHandle {
 impl WinHandle {
     pub fn new(
         event_rx: flume::Receiver<WinEvent>,
-        cmd_tx: flume::Sender<WinCommand>,
+        cmd_tx: WinSender,
         init_width: u16,
         init_height: u16,
         visible: bool,
@@ -45,11 +78,11 @@ impl WinHandle {
         if self.closed.replace(true) {
             return;
         }
-        let _ = self.cmd_tx.try_send(WinCommand::Close);
+        self.cmd_tx.send(WinCommand::Close);
     }
 
     fn send(&self, cmd: WinCommand) {
-        if let Err(flume::TrySendError::Disconnected(_)) = self.cmd_tx.try_send(cmd) {
+        if !self.cmd_tx.send(cmd) {
             self.closed.set(true);
         }
     }
@@ -71,7 +104,7 @@ fn event_table(lua: &Lua, event: WinEvent) -> LuaResult<Table> {
     match event {
         WinEvent::Key { key } => {
             let tbl = tagged(lua, "key")?;
-            tbl.set("key", key)?;
+            tbl.set("key", key.notation())?;
             Ok(tbl)
         }
         WinEvent::Resize { width, height } => {
@@ -98,7 +131,9 @@ const recv__doc: FnDoc = FnDoc {
         channel disconnects. Pass {timeout_ms} to also get `{type=\"timeout\"}` \
         events so your plugin can animate while idle.\n\n\
         Event tables by type:\n\
-        - `{type=\"key\", key}` -- keypress. Key is a string like \"q\", \"j\", or \"esc\".\n\
+        - `{type=\"key\", key}` -- keypress. {key} is in canonical \
+        `maki.keymap` notation: `\"q\"`, `\"<CR>\"`, `\"<Esc>\"`, `\"<C-n>\"`, \
+        `\"<S-Tab>\"`.\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\
@@ -109,7 +144,8 @@ const recv__doc: FnDoc = FnDoc {
         desc: "Max milliseconds to wait before a timeout event is returned.",
     }],
     returns: "(table|nil) Event table, or nil if the window has closed.",
-    example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"j\" then\n    -- move cursor down\n  end\nend\nwin:close()",
+    guard: None,
+    example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"<Down>\" then\n    -- move cursor down\n  end\nend\nwin:close()",
 };
 
 // recv() blocks until the next event; recv(timeout_ms) additionally
@@ -170,7 +206,7 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - title_pos (string): title alignment, "left", "center", or "right".
 ///   - footer (table): key-hint pairs `{{key, label}, ...}` shown in the bottom border.
 ///   - border (string): "rounded", "single", "double", or "none".
-///   - anchor (string): corner origin, "NW", "NE", "SW", or "SE".
+///   - anchor (string): corner origin, "NW", "NE", "SW", "SE", or "input_caret".
 ///   - width (integer|string): new width; integer or "N%".
 ///   - height (integer|string): new height; integer or "N%".
 ///   - zindex (integer): stacking order.
@@ -208,9 +244,7 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(z) = opts.get::<u16>("zindex") {
         patch.zindex = Some(z);
     }
-    if let Ok(Some(cl)) = opts.get::<Option<bool>>("cursor_line") {
-        patch.cursor_line = Some(cl);
-    }
+    patch.cursor_line = opt_bool(&opts, "cursor_line");
     if let Ok(rt) = opts.get::<usize>("reserved_top") {
         patch.reserved_top = Some(rt);
     }
@@ -220,11 +254,13 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(o) = opts.get::<u16>("order") {
         patch.order = Some(o);
     }
-    if let Ok(Some(ni)) = opts.get::<Option<bool>>("needs_input") {
-        patch.needs_input = Some(ni);
-    }
+    patch.needs_input = opt_bool(&opts, "needs_input");
     patch.width = try_parse_dimension(&opts, "width");
     patch.height = try_parse_dimension(&opts, "height");
+    // A missing key leaves the window where it is. Lua has no way to say
+    // "clear this back to the centre", since a table cannot hold a nil.
+    patch.row = opts.get::<Option<i16>>("row")?.map(Some);
+    patch.col = opts.get::<Option<i16>>("col")?.map(Some);
     this.send(WinCommand::SetConfig(patch));
     Ok(())
 }
@@ -292,6 +328,9 @@ fn show(_lua: &Lua, this: &WinHandle) -> LuaResult<()> {
 /// Hides the window without closing it. The window keeps its state
 /// and buffer contents. Call `show()` to bring it back.
 ///
+/// A hidden window of any kind takes no space, draws nothing and claims no
+/// keys. It still accepts commands and reports events.
+///
 /// @return
 /// @example
 /// win:hide()
@@ -347,6 +386,9 @@ lua_class! {
 mod tests {
     use super::*;
     use crate::api::util::command::FloatConfig;
+    use crate::key::Key;
+
+    const NOT_WOKEN: &str = "a command the UI only reads on a tick has to wake it";
 
     fn make_channels() -> (
         flume::Sender<WinEvent>,
@@ -355,7 +397,7 @@ mod tests {
     ) {
         let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-        let handle = WinHandle::new(event_rx, cmd_tx, 80, 24, true);
+        let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, None), 80, 24, true);
         (event_tx, cmd_rx, handle)
     }
 
@@ -390,11 +432,28 @@ mod tests {
     fn close_does_not_panic_when_receiver_dropped() {
         let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
         let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
-        let handle = WinHandle::new(event_rx, cmd_tx, 80, 24, true);
+        let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, None), 80, 24, true);
         drop(cmd_rx);
         handle.close();
         assert!(handle.closed.get());
         drop(event_tx);
+    }
+
+    #[test]
+    fn every_command_wakes_the_ui_once_until_it_looks() {
+        let (_event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+        let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+        let (waker, wake_rx) = UiWaker::new();
+        let handle = WinHandle::new(event_rx, WinSender::new(cmd_tx, Some(waker)), 80, 24, true);
+
+        handle.send(WinCommand::SetVisible(false));
+        handle.send(WinCommand::SetVisible(true));
+        assert!(wake_rx.try_recv().is_ok(), "{NOT_WOKEN}");
+        assert!(wake_rx.try_recv().is_err(), "two commands are one frame");
+        assert_eq!(cmd_rx.len(), 2);
+
+        handle.close();
+        assert!(wake_rx.try_recv().is_ok(), "{NOT_WOKEN}");
     }
 
     #[test]
@@ -421,7 +480,7 @@ mod tests {
         let (event_tx, _cmd_rx, handle) = make_channels();
         event_tx
             .try_send(WinEvent::Key {
-                key: "enter".into(),
+                key: Key::parse("<CR>").unwrap(),
             })
             .unwrap();
         lua.globals().set("win", handle).unwrap();
@@ -430,7 +489,7 @@ mod tests {
                 .eval_async(),
         )
         .unwrap();
-        assert_eq!(got, "key:enter");
+        assert_eq!(got, "key:<CR>");
     }
 
     #[test]
@@ -449,7 +508,9 @@ mod tests {
             }
             lua.load("win:set_cursor(3)").exec_async().await.unwrap();
             event_tx
-                .send_async(WinEvent::Key { key: "x".into() })
+                .send_async(WinEvent::Key {
+                    key: Key::parse("x").unwrap(),
+                })
                 .await
                 .unwrap();
             assert_eq!(recv_task.await.unwrap(), "key");

@@ -1,5 +1,33 @@
 local M = {}
 
+local LF = "\n"
+local CRLF = "\r\n"
+
+-- A tie stays LF, so the answer never depends on which ending the file happens
+-- to show first.
+local function dominant_ending(content)
+  local _, crlf = content:gsub(CRLF, "")
+  local _, lf = content:gsub(LF, "")
+  return crlf > lf - crlf and CRLF or LF
+end
+
+-- The `read` tool strips `\r`, so the model can only ever hand back LF text.
+-- Applied straight to a CRLF file, an edit rewrites the lines it touches as LF
+-- and leaves the rest alone, so the file ends up with both endings in it. Every
+-- edit tool runs its transform on LF content here, and the file goes back out
+-- with the ending it came with.
+function M.preserve_line_endings(content, transform)
+  local ending = dominant_ending(content)
+  local result, err = transform((content:gsub(CRLF, LF)))
+  if not result then
+    return nil, err
+  end
+  if ending == LF then
+    return result
+  end
+  return (result:gsub(CRLF, LF):gsub(LF, ending))
+end
+
 local function split_lines(s)
   if s:sub(-1) == "\n" then
     s = s:sub(1, -2)
@@ -43,6 +71,15 @@ function M.replace_lines(content, start_line, end_line, new_string)
 
   local joined = table.concat(result, "\n")
   return trailing_nl and joined .. "\n" or joined
+end
+
+-- Insert `new_string` after line `after_line` and check arguments.
+function M.insert_after(content, after_line, new_string)
+  local lines = split_lines(content)
+  if after_line < 0 or after_line > #lines then
+    return nil, string.format("after line %d out of range (0-%d)", after_line, #lines)
+  end
+  return M.replace_lines(content, after_line + 1, nil, new_string)
 end
 
 return M

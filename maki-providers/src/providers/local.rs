@@ -11,11 +11,12 @@ use maki_config::providers::Protocol;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
+use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyPool, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 pub(crate) struct LocalEndpointConfig {
     pub slug: &'static str,
@@ -27,7 +28,7 @@ pub(crate) struct LocalEndpointConfig {
     pub cloud_fallback_url: Option<&'static str>,
     pub discovery_mode: DiscoveryMode,
     pub compat: OpenAiCompatConfig,
-    pub thinking_budget_field: bool,
+    pub thinking_fallback: ThinkingFallback,
 }
 
 fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {
@@ -42,7 +43,7 @@ pub(crate) struct LocalEndpoint {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
-    thinking_budget_field: bool,
+    thinking_fallback: ThinkingFallback,
     discovery_mode: DiscoveryMode,
     protocol: Option<Protocol>,
 }
@@ -76,7 +77,7 @@ impl LocalEndpoint {
             auth,
             key_pool: None,
             system_prefix: None,
-            thinking_budget_field: cfg.thinking_budget_field,
+            thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
             protocol: resolve_protocol_for_local(cfg.slug),
         }
@@ -111,15 +112,13 @@ impl LocalEndpoint {
             None => Vec::new(),
         };
         let compat_config = &cfg.compat;
+        let auth = ResolvedAuth::new(cfg.slug, headers)?.with_base_url(Some(base_url));
         Ok(Self {
             compat: OpenAiCompatProvider::new(compat_config, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth {
-                base_url: Some(base_url),
-                headers,
-            })),
+            auth: Arc::new(Mutex::new(auth)),
             key_pool,
             system_prefix: None,
-            thinking_budget_field: cfg.thinking_budget_field,
+            thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
             protocol,
         })
@@ -161,9 +160,8 @@ impl Provider for LocalEndpoint {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
 
-            if self.thinking_budget_field {
-                opts.thinking.apply_local_thinking(&mut body, model);
-            }
+            opts.thinking
+                .apply_thinking(&mut body, model, self.thinking_fallback);
 
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
@@ -182,14 +180,12 @@ impl Provider for LocalEndpoint {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_headers(&self.auth, |key| {
-                    vec![("authorization".into(), format!("Bearer {key}"))]
-                })
-            }))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Bearer,
+        ))
     }
 }
 
@@ -285,6 +281,8 @@ impl LocalEndpoint {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
 
+        let props_vision = llamacpp_props_vision(&props, &mode);
+
         let mut models: Vec<crate::model::ModelInfo> = body
             .data
             .into_iter()
@@ -300,7 +298,9 @@ impl LocalEndpoint {
                     return None;
                 }
                 let context_window = llamacpp_extract_ctx_from_model(&m, &mode, props_n_ctx);
-                let supports_vision = arch.map(|a| a.input_modalities.iter().any(|m| m == "image"));
+                let supports_vision = arch
+                    .map(|a| a.input_modalities.iter().any(|m| m == "image"))
+                    .or(props_vision);
                 Some(crate::model::ModelInfo {
                     id: m.id,
                     context_window: Some(context_window),
@@ -360,6 +360,16 @@ fn llamacpp_extract_ctx_arg(args: &[String], flag: &str) -> Option<u32> {
     args.get(idx + 1)?.parse().ok()
 }
 
+fn llamacpp_props_vision(props: &Value, mode: &ServerMode) -> Option<bool> {
+    match mode {
+        // router props describe the router, not the individual models it serves
+        ServerMode::Router => None,
+        ServerMode::Single | ServerMode::Legacy => {
+            props.pointer("/modalities/vision").and_then(Value::as_bool)
+        }
+    }
+}
+
 // Ollama model discovery via POST /api/show
 
 #[derive(Deserialize)]
@@ -379,6 +389,15 @@ struct OllamaShowResponse {
     parameters: Option<String>,
     #[serde(default)]
     model_info: Option<serde_json::Map<String, Value>>,
+    /// e.g. `["completion", "vision", "tools"]`; absent on older Ollama servers.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+#[derive(Default)]
+struct OllamaModelDetails {
+    context_window: Option<u32>,
+    supports_vision: Option<bool>,
 }
 
 impl LocalEndpoint {
@@ -402,21 +421,21 @@ impl LocalEndpoint {
         let futures: Vec<_> = body
             .data
             .iter()
-            .map(|m| ollama_fetch_context_window(compat, auth, root, &m.id))
+            .map(|m| ollama_fetch_model_details(compat, auth, root, &m.id))
             .collect();
-        let context_windows = join_all(futures).await;
+        let details = join_all(futures).await;
 
         let mut models: Vec<crate::model::ModelInfo> = body
             .data
             .into_iter()
-            .zip(context_windows)
-            .map(|(m, context_window)| crate::model::ModelInfo {
+            .zip(details)
+            .map(|(m, d)| crate::model::ModelInfo {
                 id: m.id,
-                context_window,
+                context_window: d.context_window,
                 max_output_tokens: None,
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,
-                supports_vision: None,
+                supports_vision: d.supports_vision,
                 tier: None,
                 provider_info: None,
             })
@@ -426,15 +445,17 @@ impl LocalEndpoint {
     }
 }
 
-async fn ollama_fetch_context_window(
+async fn ollama_fetch_model_details(
     compat: &OpenAiCompatProvider,
     auth: &ResolvedAuth,
     root: &str,
     model_id: &str,
-) -> Option<u32> {
+) -> OllamaModelDetails {
     let show_url = format!("{root}/api/show");
     let body = json!({"model": model_id});
-    let json_body = serde_json::to_vec(&body).ok()?;
+    let Ok(json_body) = serde_json::to_vec(&body) else {
+        return OllamaModelDetails::default();
+    };
 
     let text = match compat
         .post_text(auth, &show_url, "application/json", &json_body)
@@ -443,30 +464,31 @@ async fn ollama_fetch_context_window(
         Ok(t) => t,
         Err(e) => {
             warn!(model = model_id, error = %e, "Ollama POST /api/show failed");
-            return None;
+            return OllamaModelDetails::default();
         }
     };
     let show: OllamaShowResponse = match serde_json::from_str(&text) {
         Ok(s) => s,
         Err(e) => {
             warn!(model = model_id, error = %e, "Failed to parse Ollama /api/show response");
-            return None;
+            return OllamaModelDetails::default();
         }
     };
 
-    if let Some(ref info) = show.model_info
-        && let Some(ctx) = ollama_extract_context_length(info)
-    {
-        return Some(ctx);
-    }
+    ollama_model_details(&show)
+}
 
-    if let Some(ref params) = show.parameters
-        && let Some(ctx) = ollama_extract_num_ctx(params)
-    {
-        return Some(ctx);
-    }
+fn ollama_model_details(show: &OllamaShowResponse) -> OllamaModelDetails {
+    let context_window = show
+        .model_info
+        .as_ref()
+        .and_then(ollama_extract_context_length)
+        .or_else(|| show.parameters.as_deref().and_then(ollama_extract_num_ctx));
 
-    None
+    OllamaModelDetails {
+        context_window,
+        supports_vision: ollama_extract_vision(show.capabilities.as_deref()),
+    }
 }
 
 fn ollama_extract_context_length(info: &serde_json::Map<String, Value>) -> Option<u32> {
@@ -482,6 +504,13 @@ fn ollama_extract_context_length(info: &serde_json::Map<String, Value>) -> Optio
         })
 }
 
+/// `None` when the server didn't report capabilities at all (older Ollama),
+/// so discovery falls back to the family default instead of claiming "no
+/// vision" for a model it never actually checked.
+fn ollama_extract_vision(capabilities: Option<&[String]>) -> Option<bool> {
+    capabilities.map(|caps| caps.iter().any(|c| c == "vision"))
+}
+
 fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
     for line in params.lines() {
         let line = line.trim();
@@ -495,8 +524,11 @@ fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
     None
 }
 
+const OLLAMA_SLUG: &str = "ollama";
+const LLAMACPP_SLUG: &str = "llama-cpp";
+
 pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
-    slug: "ollama",
+    slug: OLLAMA_SLUG,
     display_name: "Ollama",
     host_env: "OLLAMA_HOST",
     api_key_env: "OLLAMA_API_KEY",
@@ -505,18 +537,19 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: Some("https://ollama.com/v1"),
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
-        slug: "ollama",
+        slug: OLLAMA_SLUG,
         api_key_env: "",
         base_url: "http://localhost:11434/v1",
         max_tokens_field: "max_tokens",
         include_stream_usage: true,
         provider_name: "Ollama",
     },
-    thinking_budget_field: false,
+    // Ollama ignores the budget field, so effort is the only thing it hears.
+    thinking_fallback: ThinkingFallback::Dialect(&crate::dialect::OLLAMA),
 };
 
 pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
-    slug: "llama-cpp",
+    slug: LLAMACPP_SLUG,
     display_name: "LlamaCpp",
     host_env: "LLAMA_CPP_HOST",
     api_key_env: "LLAMA_CPP_API_KEY",
@@ -525,29 +558,34 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: None,
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
-        slug: "llama-cpp",
+        slug: LLAMACPP_SLUG,
         api_key_env: "",
         base_url: "http://localhost:8080/v1",
         max_tokens_field: "max_tokens",
         include_stream_usage: true,
         provider_name: "LlamaCpp",
     },
-    thinking_budget_field: true,
+    thinking_fallback: ThinkingFallback::BudgetField,
 };
 
 #[cfg(test)]
 mod tests {
+    use super::super::Timeouts;
     use super::*;
 
-    const TEST_TIMEOUTS: super::super::Timeouts = super::super::Timeouts {
-        connect: std::time::Duration::from_secs(10),
-        low_speed: std::time::Duration::from_secs(30),
-        stream: std::time::Duration::from_secs(300),
-    };
+    /// maki-config keeps its own list of the slugs whose thinking keys it lets
+    /// `providers.toml` set. A rename here would silently stop reading them and
+    /// start reporting them as dropped.
+    #[test]
+    fn local_slugs_read_their_declared_thinking_keys() {
+        for cfg in [OLLAMA, LLAMACPP] {
+            assert!(maki_config::providers::overlays_local_thinking(cfg.slug));
+        }
+    }
 
     #[test]
     fn from_env_without_host_or_api_key_errors() {
-        match LocalEndpoint::build(&OLLAMA, TEST_TIMEOUTS, None, None, None) {
+        match LocalEndpoint::build(&OLLAMA, Timeouts::default(), None, None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "OLLAMA_HOST not set");
             }
@@ -559,7 +597,7 @@ mod tests {
     fn from_env_with_host_builds_auth() {
         let ep = LocalEndpoint::build(
             &OLLAMA,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -573,7 +611,8 @@ mod tests {
     #[test]
     fn from_env_with_api_key_uses_cloud_for_ollama() {
         let pool = KeyPool::from_keys(vec!["test-key".into()]);
-        let ep = LocalEndpoint::build(&OLLAMA, TEST_TIMEOUTS, Some(pool), None, None).unwrap();
+        let ep =
+            LocalEndpoint::build(&OLLAMA, Timeouts::default(), Some(pool), None, None).unwrap();
         let auth = ep.auth.lock().unwrap();
         assert_eq!(auth.base_url.as_deref(), Some("https://ollama.com/v1"));
         assert_eq!(auth.headers.len(), 1);
@@ -585,7 +624,7 @@ mod tests {
         let pool = KeyPool::from_keys(vec!["test-key".into()]);
         let ep = LocalEndpoint::build(
             &OLLAMA,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             Some(pool),
             Some("http://local:1234".into()),
             None,
@@ -599,7 +638,7 @@ mod tests {
 
     #[test]
     fn llamacpp_without_host_errors() {
-        match LocalEndpoint::build(&LLAMACPP, TEST_TIMEOUTS, None, None, None) {
+        match LocalEndpoint::build(&LLAMACPP, Timeouts::default(), None, None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "LLAMA_CPP_HOST not set");
             }
@@ -611,7 +650,7 @@ mod tests {
     fn llamacpp_with_host_builds_auth() {
         let ep = LocalEndpoint::build(
             &LLAMACPP,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -625,7 +664,7 @@ mod tests {
     #[test]
     fn llamacpp_no_cloud_fallback() {
         let pool = KeyPool::from_keys(vec!["key".into()]);
-        match LocalEndpoint::build(&LLAMACPP, TEST_TIMEOUTS, Some(pool), None, None) {
+        match LocalEndpoint::build(&LLAMACPP, Timeouts::default(), Some(pool), None, None) {
             Err(AgentError::Config { message }) => {
                 assert_eq!(message, "LLAMA_CPP_HOST not set");
             }
@@ -637,7 +676,7 @@ mod tests {
     fn ollama_uses_ollama_discovery() {
         let ep = LocalEndpoint::build(
             &OLLAMA,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -650,7 +689,7 @@ mod tests {
     fn llamacpp_uses_llamacpp_discovery() {
         let ep = LocalEndpoint::build(
             &LLAMACPP,
-            TEST_TIMEOUTS,
+            Timeouts::default(),
             None,
             Some("http://x:1234".into()),
             None,
@@ -885,6 +924,86 @@ mod tests {
                 "8".into(),
             ];
             assert_eq!(llamacpp_extract_ctx_arg(&args, "--ctx-size"), Some(16384));
+        }
+    }
+
+    mod llamacpp_props_vision {
+        use super::super::*;
+
+        #[test]
+        fn reads_vision_from_modalities() {
+            let props = json!({"modalities": {"vision": true, "audio": false}});
+            assert_eq!(
+                llamacpp_props_vision(&props, &ServerMode::Single),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn returns_false_when_vision_disabled() {
+            let props = json!({"modalities": {"vision": false, "audio": false}});
+            assert_eq!(
+                llamacpp_props_vision(&props, &ServerMode::Single),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn returns_none_without_modalities() {
+            let props = json!({"total_slots": 4});
+            assert_eq!(llamacpp_props_vision(&props, &ServerMode::Single), None);
+        }
+
+        #[test]
+        fn ignores_props_in_router_mode() {
+            let props = json!({"role": "router", "modalities": {"vision": true}});
+            assert_eq!(llamacpp_props_vision(&props, &ServerMode::Router), None);
+        }
+    }
+
+    mod ollama_show_response {
+        use test_case::test_case;
+
+        use super::super::*;
+
+        const PARSE_FAILED: &str = "failed to parse /api/show body";
+        const CAPABILITIES_PLACEHOLDER: &str = "__CAPABILITIES__";
+        const CONTEXT_LENGTH: u32 = 128_000;
+
+        /// Shaped like a real Ollama `POST /api/show` body, so a rename or a
+        /// nesting change of any field discovery reads breaks these tests.
+        const SHOW_BODY: &str = r##"{
+  "license": "Apache License Version 2.0, January 2004",
+  "modelfile": "# Modelfile generated by \"ollama show\"\nFROM /root/.ollama/blobs/sha256-abc",
+  "parameters": "stop \"<|im_start|>\"\nnum_ctx 2048",
+  "template": "{{ .Prompt }}",
+  "details": {
+    "parent_model": "",
+    "format": "gguf",
+    "family": "qwen25vl",
+    "families": ["qwen25vl", "clip"],
+    "parameter_size": "8.3B",
+    "quantization_level": "Q4_K_M"
+  },
+  "model_info": {
+    "general.architecture": "qwen25vl",
+    "qwen25vl.context_length": 128000,
+    "qwen25vl.embedding_length": 3584
+  },
+  __CAPABILITIES__
+  "modified_at": "2026-01-01T12:00:00.000000000-05:00"
+}"##;
+
+        #[test_case(r#""capabilities": ["completion", "vision"],"#, Some(true)  ; "vision_capability")]
+        #[test_case(r#""capabilities": ["completion", "tools"],"#, Some(false) ; "no_vision_capability")]
+        #[test_case("", None ; "capabilities_omitted_by_old_server")]
+        fn parses_details(capabilities_field: &str, expected_vision: Option<bool>) {
+            let body = SHOW_BODY.replace(CAPABILITIES_PLACEHOLDER, capabilities_field);
+            let show: OllamaShowResponse = serde_json::from_str(&body).expect(PARSE_FAILED);
+
+            let details = ollama_model_details(&show);
+            assert_eq!(details.supports_vision, expected_vision);
+            assert_eq!(details.context_window, Some(CONTEXT_LENGTH));
         }
     }
 

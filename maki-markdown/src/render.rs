@@ -8,8 +8,9 @@ use std::borrow::Cow;
 use std::iter;
 use std::mem;
 
-use maki_highlight::CodeHighlighter;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use maki_highlight::{CodeHighlighter, SegmentColor, StyledSegment};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     Block, BlockKind, Emphasis, InlineSpan, LineBlock, SpanKind, block_prefix, parse, parse_inline,
@@ -19,7 +20,7 @@ pub const CODE_BAR: &str = "│ ";
 pub const CODE_BAR_WRAP: &str = "│";
 /// Lines longer than this get truncated with `...` to protect the parser
 /// and terminal from runaway output.
-pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 500;
+pub const TOOL_OUTPUT_MAX_LINE_BYTES: usize = 1_500;
 const HR_CHAR: char = '─';
 const MIN_COL_WIDTH: usize = 5;
 const LONG_LINE_SUFFIX: &str = "...";
@@ -30,10 +31,10 @@ const LONG_LINE_SUFFIX: &str = "...";
 pub enum StyleToken {
     Text,
     InlineCode,
-    /// Syntax-highlighted token. Carries resolved rgb + modifiers so the
+    /// Syntax-highlighted token. Carries the resolved color + modifiers so the
     /// consumer doesn't need to know the language.
     Highlight {
-        fg: (u8, u8, u8),
+        fg: SegmentColor,
         bold: bool,
         italic: bool,
         underline: bool,
@@ -106,17 +107,18 @@ impl Line {
 }
 
 pub fn render(text: &str, width: u16) -> Vec<Line> {
-    Renderer::new().render(text, width, 0)
+    Renderer::new().render(text, width)
 }
 
 /// Reuses highlighter and table-width caches across calls so streaming
 /// (successive prefixes of a growing message) doesn't re-highlight completed
-/// code lines. Bump `theme_gen` to flush caches after a theme change.
+/// code lines. Caches are flushed automatically when the syntax theme changes.
 pub struct Renderer {
     highlighters: Vec<CodeHighlighter>,
     table_col_widths: Vec<Vec<usize>>,
     theme_gen: u64,
     wrap_paragraphs: bool,
+    incremental: bool,
 }
 
 impl Default for Renderer {
@@ -124,8 +126,9 @@ impl Default for Renderer {
         Self {
             highlighters: Vec::new(),
             table_col_widths: Vec::new(),
-            theme_gen: 0,
+            theme_gen: maki_highlight::theme_generation(),
             wrap_paragraphs: true,
+            incremental: false,
         }
     }
 }
@@ -144,7 +147,18 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, text: &str, width: u16, theme_gen: u64) -> Vec<Line> {
+    /// For successive prefixes of one growing message: keeps per-block
+    /// highlighter state so a new token costs one line, not one block.
+    pub fn streaming() -> Self {
+        Self {
+            wrap_paragraphs: false,
+            incremental: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn render(&mut self, text: &str, width: u16) -> Vec<Line> {
+        let theme_gen = maki_highlight::theme_generation();
         if theme_gen != self.theme_gen {
             self.highlighters.clear();
             self.theme_gen = theme_gen;
@@ -157,6 +171,7 @@ impl Renderer {
             table_idx: 0,
             highlighters: &mut self.highlighters,
             table_col_widths: &mut self.table_col_widths,
+            incremental: self.incremental,
         };
         let ctx = RenderCtx {
             width,
@@ -184,6 +199,23 @@ struct RenderState<'a> {
     table_idx: usize,
     highlighters: &'a mut Vec<CodeHighlighter>,
     table_col_widths: &'a mut Vec<Vec<usize>>,
+    incremental: bool,
+}
+
+impl RenderState<'_> {
+    /// A streaming block keeps growing, so it advances its own highlighter and
+    /// pays only for the lines that just arrived. Everyone else renders text
+    /// that is already finished, where the shared content cache turns a
+    /// re-render at a new width into a lookup.
+    fn code_segments(&mut self, lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
+        if !self.incremental {
+            return maki_highlight::highlight_block(lang, code).as_ref().clone();
+        }
+        if self.code_idx >= self.highlighters.len() {
+            self.highlighters.push(CodeHighlighter::new(lang));
+        }
+        self.highlighters[self.code_idx].update(code).to_vec()
+    }
 }
 
 /// Streaming can split tokens differently than a oneshot render because the
@@ -223,10 +255,7 @@ fn render_block(
         }
         Block::Code { lang, code } => {
             ensure_blank_line(lines);
-            if state.code_idx >= state.highlighters.len() {
-                state.highlighters.push(CodeHighlighter::new(lang));
-            }
-            let segments: Vec<_> = state.highlighters[state.code_idx].update(code).to_vec();
+            let segments = state.code_segments(lang, code);
             let start = lines.len();
             for segs in segments {
                 let mut spans = vec![Span::new(CODE_BAR, StyleToken::CodeBar)];
@@ -392,16 +421,25 @@ fn ensure_blank_line(lines: &mut Vec<Line>) {
     }
 }
 
+/// Clusters, not chars: `⚠` + U+FE0F is two columns together but 1 + 0 apart,
+/// and callers charge back the width of the whole slice, so counting per char
+/// underflows their budget.
 fn fit_width(text: &str, max_width: usize) -> usize {
     let mut width = 0;
-    for (i, ch) in text.char_indices() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (i, cluster) in text.grapheme_indices(true) {
+        let cw = cluster.width();
         if width + cw > max_width {
             return i;
         }
         width += cw;
     }
     text.len()
+}
+
+/// Callers use this to force progress when nothing fits. Taking a whole
+/// cluster keeps a base character with its selector and combining marks.
+fn first_grapheme_len(text: &str) -> usize {
+    text.graphemes(true).next().map_or(1, str::len)
 }
 
 fn wrap_code_lines(lines: &mut Vec<Line>, start: usize, width: u16) {
@@ -450,13 +488,13 @@ fn split_line_with_bar(line: Line, width: usize) -> Vec<Line> {
                     remaining = cont_avail;
                     continue;
                 }
-                let ch_len = text.chars().next().map_or(1, char::len_utf8);
+                let head = first_grapheme_len(text);
                 current_spans.push(Span::with_emphasis(
-                    text[..ch_len].to_owned(),
+                    text[..head].to_owned(),
                     style.clone(),
                     emphasis,
                 ));
-                text = &text[ch_len..];
+                text = &text[head..];
                 result.push(Line {
                     kind: LineKind::Code,
                     spans: mem::take(&mut current_spans),
@@ -523,7 +561,7 @@ fn constrain_col_widths(col_widths: &mut [usize], available: usize) {
     }
 }
 
-/// Soft-break on spaces, hard-break on char boundaries for long runs.
+/// Soft-break on spaces, hard-break on cluster boundaries for long runs.
 fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
     if max_width == 0 {
         return vec![spans];
@@ -541,13 +579,13 @@ fn wrap_spans(spans: Vec<Span>, max_width: usize) -> Vec<Vec<Span>> {
             let fits = fit_width(text, remaining);
             if fits == 0 {
                 if current.is_empty() {
-                    let ch_len = text.chars().next().map_or(1, char::len_utf8);
+                    let head = first_grapheme_len(text);
                     current.push(Span::with_emphasis(
-                        text[..ch_len].to_owned(),
+                        text[..head].to_owned(),
                         style.clone(),
                         emphasis,
                     ));
-                    text = &text[ch_len..];
+                    text = &text[head..];
                 }
                 result.push(mem::take(&mut current));
                 remaining = max_width;
@@ -776,16 +814,68 @@ fn render_table_compact(rows: &[Vec<String>], header_end: usize, width: u16) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+    use syntect::highlighting::{Theme, ThemeSet};
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
+    const NARROW_WIDTH: u16 = 24;
+    const COLORED_THEME: &str = "base16-ocean.dark";
+
+    const WARNING_CLUSTER: &str = "\u{26a0}\u{fe0f}";
+    const WARNING_CELL: &str = "\u{26a0}\u{fe0f} partly";
+    /// Narrower than this and a two column table drops the box layout.
+    const TABLE_MIN_WIDTH: u16 = 17;
+    const TABLE_MAX_WIDTH: u16 = 48;
+
+    const RAGGED_TABLE: &str = "every table line must be exactly as wide as the widest one";
+    const OVER_BUDGET: &str = "nothing may exceed the width it was wrapped to";
+    const CLUSTER_SPLIT: &str = "wrapping must not split a grapheme cluster";
+
+    /// The code bodies wrap at [`NARROW_WIDTH`], so the reuse tests below can
+    /// interleave widths and mean it.
+    const SAME_BODY_AS_RUST: &str = "```rust\nfn x() { let y = 1; let z = y + 2; }\n```";
+    const SAME_BODY_AS_PYTHON: &str = "```python\nfn x() { let y = 1; let z = y + 2; }\n```";
+    const LONG_RUST_BLOCK: &str =
+        "```rust\nfn a() { let a = 1; let b = 2; }\nfn b() {}\nlet c = 3;\n```";
+    const SHORT_RUST_BLOCK: &str = "```rust\nlet c = 3;\n```";
+    const STREAMED_CODE: &str = "```rust\nfn main() {\n    let x = 1;\n}\n```";
+
+    const AGREEMENT_CORPUS: &[&str] = &[
+        "hello world\n# heading\n\npara",
+        "| H1 | H2 |\n| --- | --- |\n| a | b |\n| c | d |",
+        "## title with `code`\n\n- one\n- two\n- three\n\n```py\nx=1\ny=2\n```\nend",
+        "```notalang\nplain body\nsecond line\n```",
+        "```\n```",
+        "```rust\nlet a = 1;\n\nlet b = 2;   \n```",
+        "- item\n\n  ```rust\n  fn nested() {}\n  ```\n\n- next",
+        "text\n\n```python\ndef f():\n    return 1\n```\n\ntail",
+        "```rust\nfn a() {}\nlet x = 1;\n```\n\n```python\nx = 1\n```",
+    ];
+
+    /// The syntax theme is a process global. Nextest gives every test its own
+    /// process, `cargo test` does not, so a test holds this for as long as it
+    /// cares about the palette and no sibling's swap lands mid output.
+    fn exclusive_theme() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    const STALE_REUSE: &str = "a reused renderer must render like a fresh one";
+    const INDISTINGUISHABLE: &str =
+        "the two renders must differ, otherwise the assertion below cannot fail";
 
     fn lines_text(lines: &[Line]) -> Vec<String> {
         lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()
+    }
+
+    fn joined(rows: &[Vec<Span>]) -> String {
+        rows.iter().flatten().map(|s| s.text.as_str()).collect()
     }
 
     fn find_span<'a>(lines: &'a [Line], text: &str) -> Option<&'a Span> {
@@ -944,12 +1034,11 @@ mod tests {
     #[test]
     fn renderer_caches_table_column_widths_across_calls() {
         let mut r = Renderer::new();
-        r.render("| A | B |\n| --- | --- |\n| hi | there |", 120, 0);
+        r.render("| A | B |\n| --- | --- |\n| hi | there |", 120);
         let widths_before = r.table_col_widths[0].clone();
         r.render(
             "| A | B |\n| --- | --- |\n| hi | there |\n| longer | x |",
             120,
-            0,
         );
         for (i, (&old, &new)) in widths_before.iter().zip(&r.table_col_widths[0]).enumerate() {
             assert!(new >= old, "table width shrank at col {i}: {old} -> {new}");
@@ -992,31 +1081,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_matches_oneshot() {
-        const CORPUS: &[&str] = &[
-            "hello world\n# heading\n\npara",
-            "```rust\nfn main() {}\n```",
-            "| H1 | H2 |\n| --- | --- |\n| a | b |\n| c | d |",
-            "## title with `code`\n\n- one\n- two\n- three\n\n```py\nx=1\ny=2\n```\nend",
-        ];
-        const WIDTHS: &[u16] = &[20, 40, 80];
-        for text in CORPUS {
-            for &w in WIDTHS {
-                let oneshot = Renderer::new().render(text, w, 0);
-                let mut streamer = Renderer::new();
-                for end in 1..text.len() {
-                    if !text.is_char_boundary(end) {
-                        continue;
-                    }
-                    let _ = streamer.render(&text[..end], w, 0);
-                }
-                let final_streamed = streamer.render(text, w, 0);
-                assert_eq!(final_streamed, oneshot, "mismatch text={text:?} width={w}");
-            }
-        }
-    }
-
-    #[test]
     fn finalize_lines_collapses_consecutive_blanks() {
         let para = |t| Line {
             kind: LineKind::Paragraph,
@@ -1040,21 +1104,10 @@ mod tests {
     }
 
     #[test]
-    fn theme_gen_change_clears_highlighter_cache() {
-        let mut r = Renderer::new();
-        let code = "```rust\nlet x = 42;\n```";
-        r.render(code, TEST_WIDTH, 0);
-        assert_eq!(r.highlighters.len(), 1);
-        r.render(code, TEST_WIDTH, 1);
-        assert_eq!(r.theme_gen, 1);
-        assert_eq!(r.highlighters.len(), 1);
-    }
-
-    #[test]
     fn unwrapped_mode_skips_paragraph_wrap_but_wraps_code() {
         let long_para = "word ".repeat(50);
         let mut r = Renderer::unwrapped();
-        let para_lines = r.render(long_para.trim(), 30, 0);
+        let para_lines = r.render(long_para.trim(), 30);
         assert_eq!(
             para_lines
                 .iter()
@@ -1065,7 +1118,7 @@ mod tests {
 
         let long_code = "a".repeat(60);
         let input = format!("```\n{long_code}\n```");
-        let code_lines = r.render(&input, 20, 0);
+        let code_lines = r.render(&input, 20);
         assert!(
             code_lines
                 .iter()
@@ -1088,16 +1141,129 @@ mod tests {
         );
     }
 
+    /// The default theme paints every scope the same color, and
+    /// `coalesce_adjacent_spans` then merges a whole line into one span, so a
+    /// language mixup would render byte-identical and the reuse assertions
+    /// below could not see it.
+    fn use_colored_theme() {
+        maki_highlight::set_theme(ThemeSet::load_defaults().themes[COLORED_THEME].clone());
+    }
+
+    /// A `Renderer` that is not `streaming()` is reused across every message and
+    /// every width in the transcript. Its `highlighters` are keyed by block
+    /// position, so that path would reuse block 0's highlighter under a new
+    /// language and, through `CodeHighlighter::update`, replay the previous
+    /// longer spans for a shorter body. The empty `highlighters` pins that only
+    /// the content cache is in play, and that cache ignores width, so revisiting
+    /// a width must not hand back the wrapping of the one in between.
+    #[test_case(SAME_BODY_AS_RUST, SAME_BODY_AS_PYTHON; "language_changes_at_the_same_block_index")]
+    #[test_case(LONG_RUST_BLOCK, SHORT_RUST_BLOCK; "code_body_shrinks_at_the_same_block_index")]
+    fn a_reused_renderer_renders_each_text_like_a_fresh_one(first: &str, second: &str) {
+        let _theme = exclusive_theme();
+        use_colored_theme();
+        let fresh = |text: &str, width| Renderer::unwrapped().render(text, width);
+        assert_ne!(
+            fresh(first, TEST_WIDTH),
+            fresh(second, TEST_WIDTH),
+            "{INDISTINGUISHABLE}"
+        );
+        assert!(
+            fresh(first, NARROW_WIDTH).len() > fresh(first, TEST_WIDTH).len(),
+            "the code must actually wrap at the narrow width"
+        );
+
+        let mut reused = Renderer::unwrapped();
+        for (text, width) in [
+            (first, TEST_WIDTH),
+            (second, NARROW_WIDTH),
+            (first, NARROW_WIDTH),
+            (second, TEST_WIDTH),
+            (first, TEST_WIDTH),
+        ] {
+            assert_eq!(
+                reused.render(text, width),
+                fresh(text, width),
+                "{STALE_REUSE}: text={text:?} width={width}"
+            );
+        }
+        assert!(
+            reused.highlighters.is_empty(),
+            "the non-incremental path must use the content cache, not position-keyed highlighters"
+        );
+    }
+
+    /// A message goes through the streaming renderer while it arrives and
+    /// through the cached path forever after, so any disagreement shows up as a
+    /// flicker the moment it goes static. Nothing streams through a wrapping
+    /// renderer, so this is the only convergence that has to hold.
+    #[test]
+    fn streamed_prefixes_end_where_the_cached_path_starts() {
+        const WIDTHS: &[u16] = &[20, 40, TEST_WIDTH];
+        let _theme = exclusive_theme();
+        use_colored_theme();
+        let wrapping_block = format!("```rust\nlet x = [{}];\n```", "\"aa\", ".repeat(40));
+        let corpus = AGREEMENT_CORPUS
+            .iter()
+            .copied()
+            .chain(iter::once(wrapping_block.as_str()));
+
+        for text in corpus {
+            for &width in WIDTHS {
+                let mut streamer = Renderer::streaming();
+                for end in 1..text.len() {
+                    if text.is_char_boundary(end) {
+                        let _ = streamer.render(&text[..end], width);
+                    }
+                }
+                assert_eq!(
+                    streamer.render(text, width),
+                    Renderer::unwrapped().render(text, width),
+                    "{STALE_REUSE}: text={text:?} width={width}"
+                );
+            }
+        }
+    }
+
+    /// A theme change lands while a message is still arriving. Adopting the new
+    /// generation is not enough: the highlighter still holds `completed_lines`
+    /// of segments in the old palette, and unless the flush really drops them
+    /// the user watches two-colored code until the message ends.
+    #[test]
+    fn a_mid_stream_theme_change_repaints_already_streamed_lines() {
+        let _theme = exclusive_theme();
+        maki_highlight::set_theme(Theme::default());
+        let under_old_theme = Renderer::streaming().render(STREAMED_CODE, TEST_WIDTH);
+
+        let mut streamer = Renderer::streaming();
+        let switch_at = STREAMED_CODE.len() / 2;
+        for end in 1..STREAMED_CODE.len() {
+            if !STREAMED_CODE.is_char_boundary(end) {
+                continue;
+            }
+            if end == switch_at {
+                use_colored_theme();
+            }
+            let _ = streamer.render(&STREAMED_CODE[..end], TEST_WIDTH);
+        }
+
+        let under_new_theme = Renderer::streaming().render(STREAMED_CODE, TEST_WIDTH);
+        assert_ne!(under_old_theme, under_new_theme, "{INDISTINGUISHABLE}");
+        assert_eq!(
+            streamer.render(STREAMED_CODE, TEST_WIDTH),
+            under_new_theme,
+            "already streamed lines must be repainted with the current theme"
+        );
+    }
+
     #[test]
     fn multiple_code_blocks_get_separate_highlighters() {
-        let mut r = Renderer::new();
+        let mut r = Renderer::streaming();
         r.render(
             "```rust\nfn a() {}\n```\n\n```python\nx = 1\n```",
             TEST_WIDTH,
-            0,
         );
         assert_eq!(r.highlighters.len(), 2);
-        r.render("```rust\nfn a() {}\n```", TEST_WIDTH, 0);
+        r.render("```rust\nfn a() {}\n```", TEST_WIDTH);
         assert_eq!(r.highlighters.len(), 1);
     }
 
@@ -1162,13 +1328,75 @@ mod tests {
         let long_word = "x".repeat(30);
         let wrapped = wrap_spans(vec![Span::new(long_word.clone(), StyleToken::Text)], 10);
         assert!(wrapped.len() >= 3);
-        let reassembled: String = wrapped
-            .iter()
-            .flat_map(|row| row.iter())
-            .map(|s| s.text.as_str())
-            .collect();
-        assert_eq!(reassembled, long_word);
+        assert_eq!(joined(&wrapped), long_word);
         assert!(wrapped.iter().all(|row| spans_width(row) <= 10));
+    }
+
+    #[test_case(WARNING_CELL ; "emoji_presentation_sequence")]
+    #[test_case("\u{2714}\u{fe0f} yes" ; "text_default_symbol_with_selector")]
+    #[test_case("\u{1f1fa}\u{1f1f8} flag" ; "regional_indicator_pair")]
+    #[test_case("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f466} family" ; "zwj_sequence")]
+    #[test_case("\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}" ; "cjk")]
+    #[test_case("cafe\u{301} cre\u{301}me" ; "combining_marks")]
+    #[test_case("plain ascii cell" ; "ascii")]
+    fn table_lines_all_share_one_width(cell: &str) {
+        let text = format!("| Col1 | Col2 |\n| --- | --- |\n| x {cell} tail | plain |");
+        for width in TABLE_MIN_WIDTH..=TABLE_MAX_WIDTH {
+            let widths: Vec<usize> = render(&text, width)
+                .iter()
+                .filter(|l| matches!(l.kind, LineKind::TableBorder | LineKind::TableRow))
+                .map(Line::width)
+                .collect();
+            let max = widths.iter().copied().max().unwrap_or(0);
+            assert!(
+                widths.iter().all(|w| *w == max),
+                "{RAGGED_TABLE} (cell={cell:?}, width={width}): {widths:?}"
+            );
+            assert!(
+                max <= width as usize,
+                "{OVER_BUDGET} (cell={cell:?}, width={width}): {max}"
+            );
+        }
+    }
+
+    #[test_case(WARNING_CLUSTER, 1, 0 ; "sequence_does_not_fit_in_one_column")]
+    #[test_case(WARNING_CLUSTER, 2, WARNING_CLUSTER.len() ; "sequence_fits_in_two_columns")]
+    #[test_case("a\u{26a0}\u{fe0f}", 2, 1 ; "stops_before_sequence")]
+    #[test_case("\u{2705}", 1, 0 ; "wide_emoji_needs_two")]
+    #[test_case("abc", 2, 2 ; "ascii_counts_columns")]
+    fn fit_width_measures_grapheme_clusters(text: &str, max_width: usize, expected: usize) {
+        assert_eq!(fit_width(text, max_width), expected);
+    }
+
+    #[test_case(WARNING_CLUSTER ; "emoji_presentation_sequence")]
+    #[test_case("cafe\u{301}" ; "combining_marks")]
+    #[test_case("\u{1f1fa}\u{1f1f8}" ; "regional_indicator_pair")]
+    fn wrap_spans_never_splits_a_cluster(cluster: &str) {
+        let text = format!("word {cluster} word");
+        for max_width in cluster.width()..=text.width() + 1 {
+            let rows = wrap_spans(vec![Span::new(text.clone(), StyleToken::Text)], max_width);
+            assert!(
+                rows.iter().all(|row| spans_width(row) <= max_width),
+                "{OVER_BUDGET} (max_width={max_width})"
+            );
+            let reassembled = joined(&rows);
+            assert!(
+                reassembled.contains(cluster),
+                "{CLUSTER_SPLIT} (max_width={max_width}): {reassembled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_wrapping_fits_emoji_clusters() {
+        let text = format!("```rust\nlet warn = \"{WARNING_CELL}\"; let tail = 1;\n```");
+        for width in 4..=NARROW_WIDTH {
+            let lines = render(&text, width);
+            assert!(
+                lines.iter().all(|l| l.width() <= width as usize),
+                "{OVER_BUDGET} (code block, width={width})"
+            );
+        }
     }
 
     #[test]
@@ -1183,7 +1411,7 @@ mod tests {
         let long_cell = "A".repeat(500);
         let text = format!("| What | Why |\n| --- | --- |\n| Short cell | {long_cell} |");
 
-        let full = Renderer::unwrapped().render(&text, 120, 0);
+        let full = Renderer::unwrapped().render(&text, 120);
         assert!(
             full.iter().any(|l| l.kind == LineKind::TableBorder),
             "full text must parse as a table"
@@ -1192,7 +1420,7 @@ mod tests {
         let truncated = truncate_long_lines_at(&text, 500);
         assert_ne!(truncated.as_ref(), text, "truncation must modify the text");
 
-        let trunc = Renderer::unwrapped().render(&truncated, 120, 0);
+        let trunc = Renderer::unwrapped().render(&truncated, 120);
         assert!(
             trunc.iter().any(|l| l.kind == LineKind::TableBorder),
             "table detection survives truncation (parser is lenient about missing closing |)"

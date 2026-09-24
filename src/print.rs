@@ -10,23 +10,28 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{HeadlessHandle, HeadlessParams};
+use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
+use maki_agent::permissions::PluginRuleStore;
+use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConfig};
-use maki_config::ModelPolicy;
-use maki_lua::EventHandle;
+use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
+use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
+use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
-use maki_providers::{StopReason, TokenUsage};
+use maki_providers::{TokenUsage, add_cost};
+use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
-const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_LINE_PREFIX: &str = "session: ";
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -58,7 +63,7 @@ struct PrintResult {
     duration_ms: u128,
     num_turns: u32,
     result: String,
-    stop_reason: Option<StopReason>,
+    stop_reason: Option<DoneReason>,
     session_id: SessionRef,
     total_cost_usd: f64,
     usage: TokenUsage,
@@ -135,22 +140,50 @@ impl VerboseOutput {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    model: &Model,
-    prompt_arg: Option<String>,
-    image_paths: Vec<PathBuf>,
-    format: OutputFormat,
-    verbose: bool,
-    config: AgentConfig,
-    permissions_config: PermissionsConfig,
-    timeouts: maki_providers::Timeouts,
-    lua_handle: EventHandle,
-    fast: bool,
-    workflow: bool,
-    model_policy: Arc<ModelPolicy>,
-) -> Result<()> {
-    let prompt = match prompt_arg {
+pub struct PrintParams {
+    pub model: Model,
+    pub prompt: Option<String>,
+    pub image_paths: Vec<PathBuf>,
+    pub format: OutputFormat,
+    pub verbose: bool,
+    pub config: AgentConfig,
+    pub permissions_config: PermissionsConfig,
+    pub timeouts: maki_providers::Timeouts,
+    pub lua_handle: EventHandle,
+    pub defaults: SessionDefaults,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
+    pub project_config: ProjectConfig,
+    /// Which session this run continues and writes under, and where. Resolved
+    /// by the caller from the same flags every other entry point reads.
+    pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken when it was
+    /// resolved and held for the whole run.
+    pub claim: SessionClaim,
+    pub storage: StateDir,
+}
+
+pub fn run(params: PrintParams) -> Result<()> {
+    let PrintParams {
+        model,
+        prompt,
+        image_paths,
+        format,
+        verbose,
+        config,
+        permissions_config,
+        timeouts,
+        lua_handle,
+        defaults,
+        model_policy,
+        plugin_rules,
+        project_config,
+        resumed,
+        claim,
+        storage,
+    } = params;
+
+    let prompt = match prompt {
         Some(p) => p,
         None => {
             let mut buf = String::new();
@@ -164,12 +197,15 @@ pub fn run(
     let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(
+        &cwd,
+        project_config.clone(),
+    ));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
-    let handle = maki_agent::headless::spawn(HeadlessParams {
+    let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
         config,
         permissions_config,
@@ -180,13 +216,16 @@ pub fn run(
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
-        fast,
-        workflow,
+        resumed,
+        claim,
+        storage,
+        defaults,
         model_policy,
+        plugin_rules,
+        project_config,
     });
 
     let HeadlessHandle {
-        event_rx,
         tool_names,
         session_id,
         cwd,
@@ -200,24 +239,52 @@ pub fn run(
         _ => None,
     };
 
-    if let Some(out) = &mut verbose_out {
-        out.emit(&InitEvent {
+    match &mut verbose_out {
+        Some(out) => out.emit(&InitEvent {
             event_type: "system",
             subtype: "init",
             cwd: &cwd,
             session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
-        })?;
+        })?,
+        // Text mode never says which session it wrote, and a later `-r`
+        // needs it. On stderr so a pipe reading the answer is unaffected.
+        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
     }
 
     let mut result_text = String::new();
     let mut is_error = false;
     let mut num_turns: u32 = 0;
     let mut usage = TokenUsage::default();
-    let mut stop_reason: Option<StopReason> = None;
+    // Summed as the turns land: rates move mid-run, and only a turn knows the
+    // rate it paid.
+    let mut cost = None;
+    let mut stop_reason: Option<DoneReason> = None;
 
-    while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+    let snapshot = HeadlessSnapshot::default();
+    snapshot.install(
+        &lua_handle,
+        HeadlessMeta {
+            id: session_id.to_string(),
+            cwd: cwd.clone(),
+            model: model.spec(),
+        },
+        // `maki -p` always runs the agent in build mode
+        // (`headless::spawn` hardcodes `AgentMode::Build`).
+        || MODE_BUILD,
+    );
+
+    while let Some(envelope) = smol::block_on(events.next()) {
+        // Folded in first, so a plugin handling `TurnEnd` finds the finished
+        // totals when it calls `maki.session.read()`.
+        snapshot.observe(&envelope);
+        maki_lua::agent_autocmd::dispatch(
+            &lua_handle,
+            &session_id,
+            &envelope,
+            envelope.subagent.is_some(),
+        );
         let Envelope {
             ref event,
             ref subagent,
@@ -237,8 +304,9 @@ pub fn run(
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
-            | AgentEvent::AutoCompacting
-            | AgentEvent::CompactionDone
+            | AgentEvent::QueueDrained
+            | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
@@ -246,7 +314,8 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. } => {}
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::StreamClosed => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -264,6 +333,7 @@ pub fn run(
                 }
             }
             AgentEvent::TurnComplete(tc) => {
+                add_cost(&mut cost, tc.cost);
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
@@ -296,11 +366,16 @@ pub fn run(
             AgentEvent::Done {
                 usage: u,
                 num_turns: turns,
-                stop_reason: sr,
+                reason,
+                cost: dcost,
+                ..
             } => {
                 num_turns = *turns;
                 usage = *u;
-                stop_reason = *sr;
+                // The agent's own ledger also counts compaction spend, which
+                // summing the turns misses.
+                cost = (*dcost).or(cost);
+                stop_reason = Some(*reason);
                 break;
             }
             AgentEvent::Error { message } => {
@@ -310,15 +385,12 @@ pub fn run(
             }
         }
     }
-    smol::block_on(async {
-        futures_lite::future::or(task, async {
-            smol::Timer::after(AGENT_SHUTDOWN_TIMEOUT).await;
-        })
-        .await;
-    });
+    smol::block_on(headless::await_shutdown(task));
+    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
 
     let duration_ms = start.elapsed().as_millis();
-    let total_cost_usd = usage.cost(&model.pricing, fast);
+    // Zero on an unpriced model, which is what its turns reported too.
+    let total_cost_usd = cost.unwrap_or_default();
 
     match format {
         OutputFormat::Text => {
@@ -386,7 +458,7 @@ mod tests {
             duration_ms: 1234,
             num_turns: 2,
             result: "done".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(DoneReason::EndTurn),
             session_id: SessionRef::generate(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),

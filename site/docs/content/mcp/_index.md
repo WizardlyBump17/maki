@@ -14,7 +14,11 @@ Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** tra
 Add servers under `[mcp.*]` in your MCP config:
 
 - **Global**: `~/.config/maki/mcp.toml`
-- **Project**: `.maki/mcp.toml` (project config wins when both set a value)
+- **Project**: `.maki/mcp.toml` in the active Git checkout, or in the working
+  directory outside Git (project config wins when both set a value)
+
+Servers in the project file start only after you trust that folder, see
+[Folder Trust](/docs/folder-trust/).
 
 ### Stdio
 
@@ -34,8 +38,12 @@ enabled = false
 ```toml
 [mcp.analytics]
 url = "https://mcp.example.com/mcp"
-headers = { Authorization = "Bearer tok123" }
+headers = { Authorization = "Bearer ${ANALYTICS_TOKEN}" }
 ```
+
+`headers` and `environment` values expand `${VAR}` from the environment. A
+referenced variable that is unset or empty fails that server with the variable
+named in its status, instead of sending a dangling `Bearer ` and getting a 401.
 
 Some HTTP servers need OAuth but have no dynamic client registration. For those, give Maki a static client:
 
@@ -51,8 +59,8 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 |-------|------|---------|-------|
 | `command` | array | | Stdio: program + args |
 | `url` | string | | HTTP: server URL |
-| `environment` | map | | Stdio only |
-| `headers` | map | | HTTP only |
+| `environment` | map | | Stdio only. Values expand `${VAR}` from the environment |
+| `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
 | `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |

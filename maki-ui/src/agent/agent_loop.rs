@@ -5,26 +5,42 @@ use maki_agent::agent;
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{
-    DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
-};
+use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
+    RunContext, RunContextBuilder, RunLedger, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model, TokenUsage};
+use maki_providers::{AgentError, ContextGauge, Message, Model};
 use maki_storage::id::SessionRef;
-use serde_json::Value;
 use tracing::error;
 
 use super::ModelSlot;
-use super::cancel_map::RunCancelMap;
-use super::shared_queue::{QueueItem, QueueReceiver};
+use super::run_cancels::RunCancels;
+use super::shared_queue::{self, QueueReceiver, QueueRun};
+
+fn base_tools(
+    vars: &Vars,
+    model: &Model,
+    config: &AgentConfig,
+    has_mcp: bool,
+    workflow: bool,
+) -> RequestTools {
+    RequestTools::build(
+        ToolRegistry::global(),
+        vars,
+        model,
+        config,
+        &[],
+        workflow,
+        has_mcp,
+    )
+}
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -32,20 +48,20 @@ pub(super) struct AgentLoop {
     tool_output_lines: ToolOutputLines,
     vars: Vars,
     instructions: Instructions,
-    tools: Value,
     mcp: Option<McpSession>,
     history: History,
+    /// Owned beside `history` because it describes that transcript and outlives
+    /// every run over it, so the provider's own counts pile up between turns.
+    gauge: ContextGauge,
     btw_system: Arc<ArcSwap<String>>,
-    cancel_map: Arc<RunCancelMap>,
-    init_cancel: CancelToken,
+    cancels: Arc<RunCancels>,
     permissions: Arc<PermissionManager>,
-    file_tracker: Arc<FileReadTracker>,
-    min_run_id: u64,
+    file_access: Arc<FileAccess>,
     agent_tx: flume::Sender<Envelope>,
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
-    session_id: Option<SessionRef>,
-    mailbox: Option<SessionMailbox>,
+    session_id: SessionRef,
+    mailbox: SessionMailbox,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -58,7 +74,7 @@ impl AgentLoop {
         model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
-        initial_history: Vec<Message>,
+        resumed: Resumed,
         shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
@@ -66,35 +82,31 @@ impl AgentLoop {
         agent_tx: flume::Sender<Envelope>,
         answer_rx: flume::Receiver<String>,
         queue: Arc<QueueReceiver>,
-        cancel_map: Arc<RunCancelMap>,
-        init_cancel: CancelToken,
-        session_id: Option<SessionRef>,
-        mailbox: Option<SessionMailbox>,
+        cancels: Arc<RunCancels>,
+        mailbox: SessionMailbox,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
         model_policy: Arc<ModelPolicy>,
     ) -> Self {
-        let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
+        let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
         Self {
+            session_id: resumed.id,
             model_slot,
             config,
             tool_output_lines,
             vars: Vars::default(),
             instructions: Instructions::default(),
-            tools: Value::Null,
             mcp,
-            history: History::restored(initial_history).with_mirror(shared_history),
+            history: History::restored(resumed.history).with_mirror(shared_history),
+            gauge: ContextGauge::restored(resumed.context_size),
             btw_system,
-            cancel_map,
-            init_cancel,
+            cancels,
             permissions,
-            file_tracker: FileReadTracker::fresh(),
-            min_run_id: 0,
+            file_access: FileAccess::fresh(),
             agent_tx,
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
-            session_id,
             mailbox,
             timeouts,
             lua_handle,
@@ -109,62 +121,101 @@ impl AgentLoop {
         }
 
         while let Ok(()) = self.queue.recv_notify().await {
-            while let Some(entry) = self.queue.pop() {
-                if entry.run_id() < self.min_run_id {
+            let mut last_run_id = None;
+            while let Some(mut run) = self.queue.pop_run() {
+                let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
                     continue;
-                }
-                self.process_entry(entry).await;
+                };
+                last_run_id = Some(run_id);
+                self.process_run(run, run_id).await;
+            }
+            if let Some(run_id) = last_run_id {
+                let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+                self.queue
+                    .publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained));
             }
         }
     }
 
-    async fn process_entry(&mut self, entry: QueueItem) {
-        let run_id = entry.run_id();
-        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+    async fn process_run(&mut self, run: QueueRun, run_id: u64) {
+        let live = self.cancels.start(run_id);
+        let result = self.dispatch_run(run, run_id, live.token()).await;
+        // A `tool_use_id` only names work inside the run that issued the call,
+        // so the run ending is what stops whatever still hangs off one, rather
+        // than a group emptying out.
+        self.subagent_cancels.cancel_all();
 
-        let result = match entry {
-            QueueItem::Message {
-                text,
-                image_count,
-                input,
-                displayed,
-                ..
-            } => {
-                if !displayed {
-                    let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
-                }
-                self.do_agent_run(input, event_tx, run_id).await
-            }
-            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
-        };
-
+        // A cancel arrives here as `Ok`, since esc is what the user asked for.
+        // As an error it would draw a second "Cancelled." bubble under the one
+        // the app already drew, leave the status bar red and fail the exit
+        // under `--exit-on-done`.
         if let Err(e) = result {
             self.emit_error(run_id, e);
         }
     }
 
+    async fn dispatch_run(
+        &mut self,
+        run: QueueRun,
+        run_id: u64,
+        cancel: &CancelToken,
+    ) -> Result<(), AgentError> {
+        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+        match run {
+            QueueRun::Compact(compaction) => {
+                self.do_compact(&event_tx, compaction.instructions.as_deref(), cancel)
+                    .await?;
+            }
+            QueueRun::Messages(messages) => {
+                let inputs = messages
+                    .into_iter()
+                    .map(|queued| {
+                        if !queued.displayed {
+                            let _ = event_tx.send(AgentEvent::QueueItemConsumed {
+                                text: queued.text,
+                                images: queued.input.images.clone(),
+                            });
+                        }
+                        queued.input
+                    })
+                    .collect();
+                if let Some(input) = shared_queue::merge_inputs(inputs) {
+                    self.do_agent_run(input, event_tx, cancel).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Startup belongs to the loop, not to any run, so it watches teardown. Esc
+    /// only means the user gave up on a prompt, and ending the loop over that
+    /// would leave the session on screen with nothing to serve it.
     async fn initialize(&mut self) -> bool {
+        let teardown = self.cancels.teardown().clone();
         self.vars = template::env_vars();
         self.reload_instructions().await;
-        if self.init_cancel.is_cancelled() {
+        if teardown.is_cancelled() {
             return false;
         }
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
-        let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model, false);
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
             // startup must still carry the MCP tools.
-            if self.init_cancel.race(mcp.ready()).await.is_err() {
+            if teardown.race(mcp.ready()).await.is_err() {
                 return false;
             }
             spawn_oauth_for_needs_auth(mcp);
         }
-        !self.init_cancel.is_cancelled()
+        !teardown.is_cancelled()
     }
 
-    async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
+    async fn do_compact(
+        &mut self,
+        event_tx: &EventSender,
+        instructions: Option<&str>,
+        cancel: &CancelToken,
+    ) -> Result<DoneReason, AgentError> {
         let slot = self.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
@@ -172,12 +223,26 @@ impl AgentLoop {
             self.timeouts,
             &self.model_policy,
         );
+        // Compaction resizes the gauge, and the gauge has to describe the whole
+        // next prompt. A standalone `/compact` has no mode of its own, so this
+        // is the same Build-mode prompt `publish_btw_system` builds from the
+        // vars, instructions and slots a run would use.
+        let system = self.system_prompt(&self.lua_handle.collect_prompt_slots_async().await);
+        let base = base_tools(&self.vars, &model, &self.config, self.mcp.is_some(), false);
+        let tools = agent::request_tools(&base, self.mcp.as_ref());
         agent::compact(
             &*provider,
             &model,
             &mut self.history,
+            &mut self.gauge,
+            &system,
+            &tools,
             event_tx,
+            cancel,
             &self.config,
+            instructions,
+            Some(&self.session_id),
+            self.timeouts.retry,
         )
         .await
     }
@@ -186,16 +251,13 @@ impl AgentLoop {
         &mut self,
         mut input: AgentInput,
         event_tx: EventSender,
-        run_id: u64,
-    ) -> Result<(), AgentError> {
-        let slot = self.model_slot.load();
-
+        cancel: &CancelToken,
+    ) -> Result<DoneReason, AgentError> {
         let old_cwd = self.vars.apply("{cwd}").into_owned();
         self.vars = template::env_vars();
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        self.rebuild_tools(&slot.model, input.workflow);
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -225,17 +287,22 @@ impl AgentLoop {
             }
         }
 
-        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
-        let system = agent::build_system_prompt(
-            &self.vars,
-            &input.mode,
-            &self.instructions.text,
-            &prompt_slots,
-            &slot.model,
-        );
+        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
+        let vars = self.vars.clone();
+        let instructions = self.instructions.text.clone();
+        let slots = Arc::clone(&prompt_slots);
+        let config = self.config.clone();
+        let has_mcp = self.mcp.is_some();
+        let run_builder: RunContextBuilder = Arc::new(move |model, mode, workflow| RunContext {
+            system: agent::build_system_prompt(&vars, mode, &instructions, &slots, model),
+            tools: base_tools(&vars, model, &config, has_mcp, workflow),
+        });
+        // Read after the awaits above, not before: a switch can land while the
+        // run is still starting up, and prompt, tools and request all have to
+        // name the model that is current now.
+        let slot = self.model_slot.load();
+        let RunContext { system, tools } = run_builder(&slot.model, &input.mode, input.workflow);
         self.publish_btw_system(&prompt_slots);
-        let (trigger, cancel) = CancelToken::new();
-        self.set_cancel_trigger(run_id, trigger);
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
@@ -246,56 +313,36 @@ impl AgentLoop {
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
-                session_id: self.session_id.clone(),
-                mailbox: self.mailbox.clone(),
+                session_id: Some(self.session_id.clone()),
+                task_id: None,
+                mailbox: Some(self.mailbox.clone()),
                 timeouts: self.timeouts,
-                file_tracker: Arc::clone(&self.file_tracker),
-                prompt_slots: Arc::new(prompt_slots),
+                file_access: Arc::clone(&self.file_access),
+                prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
+                ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {
                 history: &mut self.history,
+                gauge: &mut self.gauge,
                 system,
                 event_tx,
-                tools: self.tools.clone(),
+                tools,
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
-        .with_cancel(cancel)
+        .with_cancel(cancel.clone())
+        .with_model_sync(Arc::clone(&self.model_slot), run_builder)
         .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;
         drop(agent);
-
-        self.clear_cancel_trigger(run_id);
-
-        if matches!(result, Err(AgentError::Cancelled)) {
-            self.min_run_id = run_id + 1;
-        }
-
         result
-    }
-
-    /// Base tools only. MCP definitions are injected per request by
-    /// `Agent::request_tools`; baking them here would freeze the catalog.
-    fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        self.tools = self.build_tools(model, workflow);
-    }
-
-    fn build_tools(&self, model: &Model, workflow: bool) -> Value {
-        let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, model, &[]);
-        let ctx = DescriptionContext {
-            filter: &filter,
-            audience: ToolAudience::MAIN,
-            workflow,
-        };
-        ToolRegistry::global().definitions(&self.vars, &ctx, examples)
     }
 
     async fn reload_instructions(&mut self) {
@@ -303,47 +350,30 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
-    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
-    /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        let slot = self.model_slot.load();
-        let system = agent::build_system_prompt(
+        self.btw_system
+            .store(Arc::new(self.system_prompt(prompt_slots)));
+    }
+
+    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
+    /// the model, and a gauge sizing this only cares about the length. Everything else matches
+    /// the live prompt.
+    fn system_prompt(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) -> String {
+        agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
-            &slot.model,
-        );
-        self.btw_system.store(Arc::new(system));
-    }
-
-    fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
-        // One trigger per run, and `clear_cancel_trigger` drops the whole
-        // key, so the slot is not worth carrying around.
-        let _ = self.cancel_map.insert(run_id, trigger);
-    }
-
-    fn clear_cancel_trigger(&self, run_id: u64) {
-        self.cancel_map.remove(&run_id);
+            &self.model_slot.load().model,
+        )
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {
+        error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        match error {
-            AgentError::Cancelled => {
-                let _ = event_tx.send(AgentEvent::Done {
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
-                    stop_reason: None,
-                });
-            }
-            e => {
-                error!(error = %e, "agent error");
-                let _ = event_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
-            }
-        }
+        let _ = event_tx.send(AgentEvent::Error {
+            message: error.user_message(),
+        });
     }
 }
 

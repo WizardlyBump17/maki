@@ -1,15 +1,24 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use mlua::RegistryKey;
+use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
+use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, try_pair};
+use crate::key::Key;
+
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
-const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+
+const ROW_REFINE: &str = "refine";
+const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
+const ROW_IMPLEMENT: &str = "implement";
 
 #[derive(Clone)]
 pub struct LuaCommandInfo {
@@ -89,11 +98,14 @@ impl HintReader {
         Self(Arc::new(ArcSwap::from_pointee(HintSnapshot::default())))
     }
 
-    pub fn load(&self) -> arc_swap::Guard<Arc<HintSnapshot>> {
-        self.0.load()
+    /// Full `Arc` rather than a `Guard`: the UI keeps the last one alive to
+    /// compare identity against the next, which is how it notices a publish.
+    pub fn load_full(&self) -> Arc<HintSnapshot> {
+        self.0.load_full()
     }
 }
 
+/// Publishing end of a plugin's status hints, owned by the Lua thread.
 pub(crate) struct HintWriter {
     store: Arc<ArcSwap<HintSnapshot>>,
     generation: AtomicU64,
@@ -165,6 +177,9 @@ pub enum Anchor {
     NE,
     SW,
     SE,
+    /// The cell the chat input caret is drawn in. Named after the widget,
+    /// because a window can hold a caret of its own.
+    InputCaret,
 }
 
 impl Anchor {
@@ -173,6 +188,7 @@ impl Anchor {
             "NE" => Self::NE,
             "SW" => Self::SW,
             "SE" => Self::SE,
+            "input_caret" => Self::InputCaret,
             _ => Self::NW,
         }
     }
@@ -305,6 +321,15 @@ pub struct FloatConfig {
     pub order: u16,
     pub visible: bool,
     pub needs_input: bool,
+    /// Opt in to corner stacking: the UI offsets this window past the other
+    /// stacked windows sharing its anchor. Open time only, so no patch field.
+    pub stack: bool,
+    /// The keys this window takes while it is on screen without being
+    /// focused, parsed from the same notation `maki.keymap.set` reads. A
+    /// focused window is handed every key and declares none. Open time only,
+    /// so no patch field: the list the user sees in the footer is the list
+    /// the window opened with, and it dies with the window.
+    pub keys: Vec<Key>,
 }
 
 impl Default for FloatConfig {
@@ -327,6 +352,8 @@ impl Default for FloatConfig {
             order: 50,
             visible: true,
             needs_input: false,
+            stack: false,
+            keys: Vec::new(),
         }
     }
 }
@@ -385,7 +412,7 @@ pub struct FloatConfigPatch {
 }
 
 pub enum WinEvent {
-    Key { key: String },
+    Key { key: Key },
     Resize { width: u16, height: u16 },
     Paste { text: String },
     Close,
@@ -402,21 +429,175 @@ pub enum SessionRequest {
     List,
     Live,
     Current,
-    New { prompt: Option<String>, focus: bool },
-    Prompt { id: Option<String>, text: String },
-    Focus { id: String },
-    Delete { id: String },
-    SetTitle { id: String, title: String },
+    /// UI-mode fallback for `maki.session.read` when no snapshot slot is
+    /// installed — the UI resolves the id and returns a `session_snapshot_json`
+    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
+    /// so `read` doesn't need a UI.
+    Read {
+        id: Option<String>,
+    },
+    New {
+        prompt: Option<String>,
+        focus: bool,
+    },
+    Prompt {
+        id: Option<String>,
+        text: String,
+    },
+    Focus {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    /// Plan or build, for the live session {id} names: a plan form row fires
+    /// for the session its plan belongs to, which is not always the focused
+    /// one.
+    SetMode {
+        id: Option<String>,
+        mode: String,
+    },
+    SetTitle {
+        id: String,
+        title: String,
+    },
 }
 
-pub type SessionReply = Result<serde_json::Value, String>;
+pub enum TaskRequest {
+    List,
+    Focus { id: String },
+}
+
+pub enum ModelRequest {
+    Get,
+    Available,
+    Set {
+        spec: Option<String>,
+        thinking: Option<String>,
+        fast: Option<bool>,
+    },
+}
+
+/// The plan surface `maki.plan` drives. Plan state is per session, so every
+/// request names one, and `None` means the focused session.
+pub enum PlanRequest {
+    /// Snapshot of the current plan: `{ mode, path, content, ready }`.
+    Read { session: Option<String> },
+}
+
+impl PlanRequest {
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Read { session } => session.as_deref(),
+        }
+    }
+}
+
+/// The built-in outcome a plan form row names, which only the host can run.
+/// A row may carry one, a plugin handler, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRowAction {
+    Refine,
+    ClearAndImplement,
+    Implement,
+}
+
+impl PlanRowAction {
+    /// The `action` tag a row carries in Lua.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Refine => ROW_REFINE,
+            Self::ClearAndImplement => ROW_CLEAR_AND_IMPLEMENT,
+            Self::Implement => ROW_IMPLEMENT,
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            ROW_REFINE => Some(Self::Refine),
+            ROW_CLEAR_AND_IMPLEMENT => Some(Self::ClearAndImplement),
+            ROW_IMPLEMENT => Some(Self::Implement),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the plan form menu. The host proposes its built-in rows and the
+/// `ui.plan_form.actions` chain hands back the list the form draws.
+///
+/// `id` is what a layer targets a row by, so reordering or relabelling a row
+/// never moves its handler. A row with a `plugin` runs that plugin's handler
+/// first, and its `action` after, unless the handler said otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFormRow {
+    pub id: String,
+    pub label: String,
+    pub desc: String,
+    /// The host outcome the row falls through to, if any.
+    pub action: Option<PlanRowAction>,
+    /// The plugin whose handler is stashed for this row, `None` on a pure
+    /// host row. Picking one names it, so its jobs and its log lines land on
+    /// the plugin that wrote it.
+    pub plugin: Option<Arc<str>>,
+}
+
+/// What became of a pick on a plan form row that carries a plugin handler.
+/// A veto says nothing to the user, while a failure is the user pressing a
+/// key and getting neither the handler nor the built-in outcome the row
+/// promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanActionOutcome {
+    /// The handler ran, and the row's built-in action follows.
+    Proceed,
+    /// The handler ran and answered `false`, so the action is deliberately
+    /// dropped.
+    Vetoed,
+    /// The handler failed, ran out of its window, or was never reached at
+    /// all.
+    Failed,
+}
+/// The menu one draft's chain answered with. The form echoes `generation`
+/// back on a pick, so a chain that resumes late and installs its handlers
+/// over a menu already on screen cannot have a pick routed to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanMenu {
+    pub generation: u64,
+    pub rows: Vec<PlanFormRow>,
+}
+
+/// Offsets are flat byte counts into the whole input, newlines counted as one
+/// byte each, because Lua indexes strings by byte.
+#[derive(Default)]
+pub struct InputEdit {
+    pub start: usize,
+    pub stop: usize,
+    pub text: String,
+    /// Where to leave the cursor, the end of {text} when absent.
+    pub cursor: Option<usize>,
+    /// The value counter the reader was handed. Required, because an optional
+    /// guard makes the shortest call the unguarded one.
+    pub version: u64,
+    /// The tab the offsets were read from, refused once another is focused.
+    /// Required for the same reason as {version}.
+    pub session_id: String,
+    /// Rides along on the `InputChanged` this edit fires, so one input plugin
+    /// can tell another's writes from its own.
+    pub plugin: Arc<str>,
+}
+
+pub enum InputRequest {
+    Read,
+    Edit(InputEdit),
+}
+
+pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
 /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
 /// `auto_scroll` is true while the transcript follows streaming output.
 pub struct WinView {
-    pub scroll_top: u16,
-    pub line_count: u16,
+    pub scroll_top: u32,
+    pub line_count: u32,
     pub height: u16,
     pub auto_scroll: bool,
 }
@@ -428,7 +609,6 @@ pub struct WinView {
 pub enum BuiltinAction {
     FilePicker,
     Search,
-    Tasks,
     Help,
     PlanToggle,
     PlanEditor,
@@ -436,6 +616,7 @@ pub enum BuiltinAction {
     PopQueue,
     PrevChat,
     NextChat,
+    ModelPicker,
 }
 
 pub enum UiAction {
@@ -447,35 +628,115 @@ pub enum UiAction {
         cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
+    SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<SessionReply>,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Model {
+        req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Plan {
+        req: PlanRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Input {
+        req: InputRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Task {
+        req: TaskRequest,
+        reply_tx: flume::Sender<UiReply>,
     },
     WinSaveView {
         reply_tx: flume::Sender<WinView>,
     },
     WinRestView {
-        scroll_top: u16,
+        scroll_top: u32,
     },
     Builtin(BuiltinAction),
+    /// `reply_tx` answers whether {cmdline} resolved to a known command, not
+    /// how the command itself went: `/compact` streams for a minute, and the
+    /// Lua caller must not park for that long.
+    RunCommand {
+        cmdline: String,
+        depth: u8,
+        reply_tx: flume::Sender<Result<(), String>>,
+    },
 }
 
-/// Hand an action to the UI event loop. A full or closed channel means the
-/// same thing as a missing sender: nobody is there to run it.
+/// Whether an event loop is draining `UiAction`. The channel cannot answer
+/// that, because the runtime keeps a receiver of its own alive for the whole
+/// process and `try_send` would go on succeeding long after the loop that
+/// sends the replies is gone.
+#[derive(Clone)]
+pub struct UiAttachment(Arc<AtomicBool>);
+
+impl Default for UiAttachment {
+    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
+    /// sender at all, so the bit only ever describes a loop that went away.
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl UiAttachment {
+    /// Called by every event loop generation, so the UI comes back after a
+    /// `/reload` rebuilt the stack around the same handles.
+    pub fn attach(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn detach(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+
+    fn is_attached(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+// Lives on the Lua thread so `ui_send` can consult it without threading a
+// handle through every `#[ctx]` sender.
+thread_local! {
+    static UI_ATTACHMENT: RefCell<Option<UiAttachment>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn install_ui_attachment(attachment: UiAttachment) {
+    UI_ATTACHMENT.with_borrow_mut(|slot| *slot = Some(attachment));
+}
+
+/// A thread with no handle installed (unit tests, embedders driving Lua
+/// themselves) counts as attached: only a host that detached knows better.
+fn ui_attached() -> bool {
+    UI_ATTACHMENT.with_borrow(|slot| slot.as_ref().is_none_or(UiAttachment::is_attached))
+}
+
+/// Hand an action to the UI event loop. A detached UI, a full or closed
+/// channel and a missing sender all mean the same thing: nobody is there to
+/// run it.
 pub(crate) fn ui_send(
     tx: Option<&flume::Sender<UiAction>>,
     action: UiAction,
 ) -> Result<(), &'static str> {
+    if !ui_attached() {
+        return Err(NO_UI_ERR);
+    }
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
 /// Send an action carrying a reply channel and await the answer. Only
 /// works from a callback: the loop drains `UiAction` between frames, so a
 /// call at config load time would wait forever.
+///
+/// No deadline on purpose: the loop legitimately stops answering for a long
+/// time (`open_editor` holds it for as long as the editor is up). Teardown
+/// detaches the UI instead, which fails the send outright.
 pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
@@ -483,6 +744,19 @@ pub(crate) async fn ui_roundtrip<T>(
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
     reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+}
+
+/// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua
+/// expects. Never reaching the UI and the UI refusing both land in the error
+/// slot.
+pub(crate) async fn ui_json_roundtrip(
+    lua: &Lua,
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<UiReply>) -> UiAction,
+) -> LuaResult<Pair<Value>> {
+    let reply = try_pair!(ui_roundtrip(tx, action).await);
+    let value = try_pair!(reply);
+    Ok((Some(json_to_lua(lua, &value)?), None))
 }
 
 #[cfg(test)]
@@ -554,6 +828,30 @@ mod tests {
         assert_eq!(reader.load().generation, 2);
     }
 
+    /// The loop's receiver is a clone and the runtime keeps another one for
+    /// the whole process, so the channel never disconnects: without the bit a
+    /// roundtrip would park on a reply nobody is left to send.
+    #[test]
+    fn ui_roundtrip_fails_once_the_loop_detaches() {
+        let (tx, rx) = flume::unbounded();
+        let attachment = UiAttachment::default();
+        install_ui_attachment(attachment.clone());
+
+        attachment.detach();
+        let detached = smol::block_on(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
+            reply_tx,
+        }));
+        assert_eq!(detached.err(), Some(NO_UI_ERR));
+        assert!(
+            !rx.is_disconnected(),
+            "the send has to fail on the bit, not on the channel"
+        );
+
+        // `/reload` builds a new loop around the same handles.
+        attachment.attach();
+        assert!(ui_send(Some(&tx), UiAction::WinRestView { scroll_top: 0 }).is_ok());
+    }
+
     #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]
     #[test_case(Dimension::Percent(50), 200 => 100 ; "percent_half")]
     #[test_case(Dimension::Percent(100), 80 => 80 ; "percent_full")]
@@ -568,6 +866,7 @@ mod tests {
     #[test_case("NE" => Anchor::NE ; "ne")]
     #[test_case("SW" => Anchor::SW ; "sw")]
     #[test_case("SE" => Anchor::SE ; "se")]
+    #[test_case("input_caret" => Anchor::InputCaret ; "input_caret")]
     #[test_case("garbage" => Anchor::NW ; "unknown_defaults_nw")]
     fn anchor_parse(s: &str) -> Anchor {
         Anchor::parse(s)
@@ -688,14 +987,14 @@ mod tests {
     #[test]
     fn hint_snapshot_publish_and_read() {
         let (writer, reader) = HintWriter::new();
-        assert!(reader.load().entries.is_empty());
+        assert!(reader.load_full().entries.is_empty());
 
         writer.publish(vec![(
             Arc::from("plugA"),
             vec![(" 2/4 ".into(), "fg".into())],
         )]);
 
-        let snap = reader.load();
+        let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.generation, 1);
     }

@@ -1,32 +1,31 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
+use maki_config::project::{self, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
-use maki_providers::{copilot_auth, dynamic, openai_auth};
+use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
-    delete_provider_credentials, load_provider_credentials, save_provider_credentials,
+    delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
+        Some("xai") => xai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => {
             let slug = slugify(slug);
@@ -411,6 +410,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
+        "xai" => xai_auth::logout(storage)?,
         "copilot" => copilot_auth::logout(storage)?,
         _ => {
             let mut config = ProvidersConfig::load();
@@ -439,7 +439,9 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         let def = config.get(b.slug);
         let display = resolve_display_name(b.slug, def);
 
-        if let Some(creds) = load_provider_credentials(storage, b.slug) {
+        if load_tokens(storage, b.slug).is_some() {
+            println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
+        } else if let Some(creds) = load_provider_credentials(storage, b.slug) {
             let plan_info = def
                 .and_then(|d| d.plan.as_deref())
                 .map(|p| format!(" ({})", p))
@@ -533,13 +535,16 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
+    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-    let config = load_effective_config(&host, no_plugins, &cwd)?;
+    let mut refresh_failure = None;
+    if refresh {
+        match maki_providers::refresh_catalog() {
+            Ok(()) => eprintln!("models.dev catalog has been refreshed"),
+            Err(e) => refresh_failure = Some(e),
+        }
+    }
 
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
@@ -553,36 +558,17 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
         },
         None,
     ));
+
+    if let Some(e) = refresh_failure {
+        bail!("catalog refresh failed, keeping existing cache: {e}");
+    }
     Ok(())
 }
 
-fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
-    host.load_init_files_or_skip(no_plugins, cwd)
-        .context("load init.lua files")?
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")
-}
-
-pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
-
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-
-    let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")?;
-    config.permissions = load_permissions(&cwd);
-
-    host.load_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
+    // Load-bearing binding: `index` is a Lua builtin, and dropping the host
+    // stops the Lua thread the tool runs on.
+    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -605,10 +591,12 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
+pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
     smol::block_on(async {
         let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let (config, _) = mcp_config::load_config(&cwd);
+        let trust = project::resolve(storage, &cwd, trust_mode);
+        super::report_warnings(trust.notices());
+        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
         let raw = config
             .mcp
             .get(server)
@@ -649,6 +637,7 @@ pub fn prompt(
     names: bool,
     no_plugins: bool,
     no_jit: bool,
+    trust_mode: TrustMode,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
@@ -661,28 +650,17 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    load_env_files(&cwd);
+    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
-    let config = raw_config
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")?;
-    host.load_builtins(&config.plugins)
-        .context("load builtin plugins")?;
 
     if tools {
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {
@@ -700,8 +678,8 @@ pub fn prompt(
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy();
-    let instructions = load_instruction_text(&cwd_str);
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let instructions = load_instruction_text(&cwd.to_string_lossy());
     let slots = host.event_handle().collect_prompt_slots();
 
     let output = match variant {

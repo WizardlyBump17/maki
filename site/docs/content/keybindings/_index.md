@@ -15,12 +15,11 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Ctrl+C` | Quit / clear input |
 | `Ctrl+H` | Show keybindings |
-| `Ctrl+N` / `Ctrl+P` | Next / previous task chat |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
-| `Ctrl+X` | Open tasks |
+| `Ctrl+M` | Model picker |
 
 ## Editing
 
@@ -35,6 +34,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+A` | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
 | `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
+| `PageUp` / `PageDown` | Scroll page up / down |
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+B` | Scroll to bottom |
@@ -73,7 +73,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Esc` | Close |
 | `Type` | Filter |
 | `PageUp` / `PageDown` | Scroll page up / down |
-| `Ctrl+U` / `Ctrl+D` | Scroll page up / down |
+| `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
 
 ## Context-Specific
 
@@ -87,12 +87,26 @@ Some pickers add extra bindings on top of the defaults:
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
+| Thinking Picker | `↑`/`↓` | Move between effort levels |
+| Thinking Picker | `0`-`9` | Type a token budget |
+| Thinking Picker | `Enter` | Apply and close |
+| Thinking Picker | `Esc` | Close without changing anything |
+
+## Plugins
+
+Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+P` | Browse sessions |
+| `Ctrl+X` | Open tasks |
+| `Alt+T` | Thinking effort |
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 
@@ -100,24 +114,24 @@ Plugins and `init.lua` can rebind keys at runtime with `maki.keymap.set` and `ma
 
 Precedence, high to low:
 
-1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.
+1. **Suspend** (`Ctrl+Z`, Unix). Always wins.
 2. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
-3. **Lua overrides** from `maki.keymap.set`. Last set wins; binding the same key twice warns.
-4. **Built-in defaults.** An override on the same key shadows them; `maki.keymap.del` lifts the override so the default returns. Suspend is the only binding outside this layer, so every key is remappable except `Ctrl+Z`.
+3. **Lua overrides** from `maki.keymap.set`. The last set wins. Shadowing another plugin's binding logs a warning, and the shadowed binding returns when the plugin on top deletes it or unloads.
+4. **Built-in defaults.** Any override on the same key shadows them, and the default returns once every override on it is gone. A plugin's `maki.keymap.del` only removes its own binding.
 
-Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
+`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 
 The `/help` modal and the splash show default labels, not live overrides, but pressing the key still runs the override.
 
 ### Recovering from a bad keymap
 
-If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without user `init.lua`:
+If an override leaves Maki stuck (a modal that does not close, a plugin that throws on load), boot without user `init.lua`:
 
 ```bash
 maki --no-plugins
 ```
 
-Skips user `init.lua` files (global and project) but keeps the Lua host and builtin plugins running, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
+Skips user `init.lua` files (global and project) but keeps the Lua host and builtin plugins running, so tools still work. Custom commands and skills still load, and the project permission rules and env file follow [folder trust](/docs/folder-trust/).
 
 The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 

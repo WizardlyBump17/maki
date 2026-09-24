@@ -1,6 +1,6 @@
 mod agent_loop;
-mod cancel_map;
-mod command_router;
+mod model_slots;
+mod run_cancels;
 pub(crate) mod shared_queue;
 
 use std::mem;
@@ -9,43 +9,32 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors, McpHandle,
+    McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
-use self::cancel_map::new_run_cancel_map;
-use maki_providers::provider::Provider;
-use maki_providers::{Message, Model};
+use self::run_cancels::RunCancels;
+use maki_providers::Message;
 use tracing::{info, warn};
 
 use crate::app::App;
 
 use self::agent_loop::AgentLoop;
-use self::command_router::spawn_command_router;
+pub(crate) use self::model_slots::ModelSlots;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
+pub(crate) use maki_agent::ModelSlot;
 
-pub(crate) struct ModelSlot {
-    pub(crate) model: Model,
-    pub(crate) provider: Arc<dyn Provider>,
-}
-
-pub(crate) enum AgentCommand {
-    Cancel { run_id: u64 },
-    CancelAll,
-    CancelSubagent { tool_use_id: String },
-}
-
-/// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
-/// loop can never steal new input. The output channel (`agent_tx`/`agent_rx`)
-/// is per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
+/// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
+/// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
+/// per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
 /// restore reply, a click, an old agent winding down) can always deliver.
 /// Stale events are filtered by `run_id`, not by killing the channel.
 pub(crate) struct AgentHandles {
-    pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
@@ -55,8 +44,10 @@ pub(crate) struct AgentHandles {
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
     pub(crate) timeouts: maki_providers::Timeouts,
+    cancels: Arc<RunCancels>,
+    subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
-    mailbox: Option<SessionMailbox>,
+    mailbox: SessionMailbox,
     task: smol::Task<()>,
 }
 
@@ -66,11 +57,10 @@ impl AgentHandles {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
-        initial_history: Vec<Message>,
+        resumed: Resumed,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
-        session_id: Option<SessionRef>,
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
@@ -80,13 +70,12 @@ impl AgentHandles {
         spawn_agent_internal(
             flume::unbounded(),
             model_slot,
-            initial_history,
+            resumed,
             config,
             tool_output_lines,
             permissions,
             mcp_handle,
             mcp_config_errors,
-            session_id,
             timeouts,
             lua_handle,
             model_policy,
@@ -102,7 +91,6 @@ impl AgentHandles {
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
-        app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
@@ -114,8 +102,19 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn cancel(self) {
-        let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
+    /// Esc: stops {run_id} and everything queued behind it.
+    pub(crate) fn cancel_run(&self, run_id: u64) {
+        self.cancels.cancel(run_id);
+    }
+
+    pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
+        self.subagent_cancels.cancel(tool_use_id);
+    }
+
+    /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
+    pub(crate) fn cancel_all(&self) {
+        self.cancels.cancel_all();
+        self.subagent_cancels.cancel_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -125,10 +124,7 @@ impl AgentHandles {
     }
 
     pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
-        self.mailbox
-            .as_ref()
-            .map(SessionMailbox::claim_wake)
-            .unwrap_or_default()
+        self.mailbox.claim_wake()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -153,13 +149,19 @@ impl AgentHandles {
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
-            history,
+            Resumed {
+                id: SessionRef::from(app.state.session.id),
+                history,
+                // A respawn carries the app's last reported count across, so
+                // the next request is not left guessing at its own prompt.
+                context_size: app.state.context_size,
+                session: None,
+            },
             config,
             tool_output_lines,
             permissions,
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
-            Some(SessionRef::from(app.state.session.id)),
             self.timeouts,
             lua_handle,
             Arc::clone(&self.model_policy),
@@ -169,7 +171,11 @@ impl AgentHandles {
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
         app.flush_restored_queue();
-        old.cancel();
+        old.cancel_all();
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
     }
 
     /// Hand back the agent task, dropping every channel so the loop can
@@ -211,18 +217,16 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
 fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
-    initial_history: Vec<Message>,
+    resumed: Resumed,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
-    session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
 ) -> AgentHandles {
-    let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     let queue_rx = Arc::new(queue_rx);
@@ -231,24 +235,15 @@ fn spawn_agent_internal(
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
-    let (init_trigger, init_cancel) = CancelToken::new();
-    let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
+    let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let mailbox = session_id
-        .as_ref()
-        .map(|session_id| SessionMailbox::register(session_id.id()));
-
-    spawn_command_router(
-        cmd_rx,
-        Arc::clone(&cancel_map),
-        Arc::clone(&subagent_cancels),
-    );
+    let mailbox = SessionMailbox::register(resumed.id.id());
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
         config,
         tool_output_lines,
-        initial_history,
+        resumed,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
         mcp_handle.clone(),
@@ -256,20 +251,17 @@ fn spawn_agent_internal(
         agent_tx.clone(),
         answer_rx,
         queue_rx,
-        cancel_map,
-        init_cancel,
-        session_id,
+        Arc::clone(&cancels),
         mailbox.clone(),
         timeouts,
         lua_handle,
-        subagent_cancels,
+        Arc::clone(&subagent_cancels),
         Arc::clone(&model_policy),
     );
 
     let task = smol::spawn(agent_loop.run());
 
     AgentHandles {
-        cmd_tx,
         agent_rx,
         agent_tx,
         answer_tx,
@@ -279,6 +271,8 @@ fn spawn_agent_internal(
         mcp_config_errors,
         queue: queue_tx,
         timeouts,
+        cancels,
+        subagent_cancels,
         model_policy,
         mailbox,
         task,
@@ -287,14 +281,17 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use maki_agent::AgentEvent;
-    use maki_config::PermissionsConfig;
-    use maki_providers::provider::BoxFuture;
-    use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use maki_agent::{AgentEvent, AgentInput, AgentMode};
+    use maki_config::{PermissionsConfig, ProjectConfig};
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{
+        AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+    };
 
+    use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
 
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
@@ -302,6 +299,15 @@ mod tests {
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
+    const MODEL_A: &str = "model-a";
+    const MODEL_B: &str = "model-b";
+    const FIRST_PROMPT: &str = "first-turn";
+    const SECOND_PROMPT: &str = "second-turn";
+    const RECORDER_TOOL: &str = "recording-provider";
+    const TURN_OVER: &str = "model recorded, nothing left to stream";
+    const NO_CALL: &str = "the agent never reached the provider";
+    const NO_TURN_END: &str = "the run never reported that it was over";
+    const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
 
     struct StubProvider;
 
@@ -343,24 +349,36 @@ mod tests {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
         }));
+        let (handles, permissions) = spawn_on(&model_slot, initial_history);
+        (handles, model_slot, permissions)
+    }
+
+    fn spawn_on(
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        initial_history: Vec<Message>,
+    ) -> (AgentHandles, Arc<PermissionManager>) {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
+            Arc::default(),
         ));
         let handles = AgentHandles::spawn(
-            &model_slot,
-            initial_history,
+            model_slot,
+            Resumed {
+                history: initial_history,
+                ..Resumed::fresh()
+            },
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            None,
             maki_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
             None,
             McpConfigErrors::new(PathBuf::new()),
             Arc::new(ModelPolicy::default()),
         );
-        (handles, model_slot, permissions)
+        (handles, permissions)
     }
 
     fn respawn(
@@ -377,6 +395,188 @@ mod tests {
             permissions,
             app,
             EventHandle::disconnected_for_test(),
+        );
+    }
+
+    /// Reports which model the agent handed it, then ends the turn with a
+    /// non-retryable error so no stream has to be faked. `gate` parks a call in
+    /// flight until the test lets it go, one permit per call.
+    struct RecordingProvider {
+        calls: flume::Sender<String>,
+        gate: Option<flume::Receiver<()>>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let id = model.id.clone();
+            Box::pin(async move {
+                let _ = self.calls.send(id);
+                if let Some(ref gate) = self.gate {
+                    gate.recv_async().await.expect(GATE_CLOSED);
+                }
+                Err(AgentError::Tool {
+                    tool: RECORDER_TOOL.into(),
+                    message: TURN_OVER.into(),
+                })
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<String>) {
+        let (calls, reported) = flume::unbounded();
+        (Arc::new(RecordingProvider { calls, gate: None }), reported)
+    }
+
+    fn gated_recorder() -> (
+        Arc<dyn Provider>,
+        flume::Receiver<String>,
+        flume::Sender<()>,
+    ) {
+        let (calls, reported) = flume::unbounded();
+        let (release, gate) = flume::unbounded();
+        (
+            Arc::new(RecordingProvider {
+                calls,
+                gate: Some(gate),
+            }),
+            reported,
+            release,
+        )
+    }
+
+    fn slot(model_id: &str, provider: &Arc<dyn Provider>) -> Arc<ModelSlot> {
+        Arc::new(ModelSlot {
+            model: Model {
+                id: model_id.into(),
+                ..crate::components::test_model()
+            },
+            provider: Arc::clone(provider),
+        })
+    }
+
+    fn push_prompt(handles: &AgentHandles, run_id: u64, text: &str) {
+        handles.queue.push(QueueItem::Message(QueuedInput {
+            text: text.into(),
+            input: AgentInput {
+                message: text.into(),
+                mode: AgentMode::default(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: ThinkingConfig::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+            },
+            run_id,
+            displayed: true,
+        }));
+    }
+
+    /// The failed turn's `Error` is what says the run is over. Queue the next
+    /// prompt before it and the running turn swallows it as an interrupt, so
+    /// the second request never happens.
+    fn await_turn_end(handles: &AgentHandles) {
+        loop {
+            let envelope = handles
+                .agent_rx
+                .recv_timeout(LONG_TIMEOUT)
+                .expect(NO_TURN_END);
+            if matches!(envelope.event, AgentEvent::Error { .. }) {
+                return;
+            }
+        }
+    }
+
+    fn drive_turn(
+        handles: &AgentHandles,
+        reported: &flume::Receiver<String>,
+        run_id: u64,
+        text: &str,
+    ) -> String {
+        push_prompt(handles, run_id, text);
+        let model_id = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        await_turn_end(handles);
+        model_id
+    }
+
+    /// The regression the per-runtime cell fixed. With one process-wide slot,
+    /// picking a model in one tab dragged every other tab onto it.
+    #[test]
+    fn a_model_swap_in_one_tab_leaves_the_other_tab_alone() {
+        let (provider_one, reported_one) = recorder();
+        let (provider_two, reported_two) = recorder();
+        let cell_one = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_one)));
+        let cell_two = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_two)));
+        let (handles_one, _permissions_one) = spawn_on(&cell_one, Vec::new());
+        let (handles_two, _permissions_two) = spawn_on(&cell_two, Vec::new());
+
+        cell_one.store(slot(MODEL_B, &provider_one));
+
+        assert_eq!(
+            drive_turn(&handles_one, &reported_one, 1, FIRST_PROMPT),
+            MODEL_B
+        );
+        assert_eq!(
+            drive_turn(&handles_two, &reported_two, 1, SECOND_PROMPT),
+            MODEL_A,
+            "a swap on one runtime's cell must not move another runtime's model"
+        );
+    }
+
+    /// `respawn` hands the new loop the cell, not the model inside it. Captured
+    /// by value, a `/model` pick after a `/new` or a session load would be
+    /// ignored until something respawned the agent again.
+    #[test]
+    fn a_swap_after_respawn_still_reaches_the_new_agent() {
+        let (provider, reported) = recorder();
+        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (mut handles, permissions) = spawn_on(&cell, Vec::new());
+        let mut app = crate::app::tests::test_app();
+        respawn(&mut handles, &cell, &permissions, &mut app);
+
+        cell.store(slot(MODEL_B, &provider));
+        assert_eq!(
+            drive_turn(&handles, &reported, app.run_id, FIRST_PROMPT),
+            MODEL_B
+        );
+    }
+
+    /// The loop reads its cell at the start of every run rather than keeping
+    /// the model it spawned with, so a pick made mid-flight leaves the running
+    /// turn alone and still shows up on the next one.
+    #[test]
+    fn a_swap_during_a_turn_only_applies_to_the_following_turn() {
+        let (provider, reported, release) = gated_recorder();
+        let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
+        let (handles, _permissions) = spawn_on(&cell, Vec::new());
+
+        push_prompt(&handles, 1, FIRST_PROMPT);
+        let in_flight = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        cell.store(slot(MODEL_B, &provider));
+        release.send(()).expect(GATE_CLOSED);
+        await_turn_end(&handles);
+        assert_eq!(in_flight, MODEL_A);
+
+        push_prompt(&handles, 2, SECOND_PROMPT);
+        let next = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
+        release.send(()).expect(GATE_CLOSED);
+        await_turn_end(&handles);
+        assert_eq!(
+            next, MODEL_B,
+            "a swap stored mid-flight must still land on the next turn"
         );
     }
 

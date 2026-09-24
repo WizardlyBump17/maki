@@ -1,10 +1,17 @@
 use crate::render_worker::RenderWorker;
+use crate::repaint::Dirty;
+use crate::terminal_image::InlineImage;
+use crate::theme;
+use crate::wrap;
+use maki_providers::ImageSource;
+use std::sync::Arc;
 
 use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
 use std::cell::Cell;
+use std::mem;
+use std::ops::Range;
 
 const INST_SUFFIX: &str = "__inst";
 
@@ -29,12 +36,17 @@ struct CachedHeight {
 #[derive(Default, PartialEq, Eq)]
 struct HighlightKey {
     has_output: bool,
+    theme_gen: u64,
 }
 
 impl HighlightKey {
+    /// The generation is read here rather than passed in: a theme only swaps
+    /// from `update`, never mid-`view`, and a missed call site would silently
+    /// splice old-palette lines back in.
     fn from_request(hl: Option<&HighlightRequest>) -> Self {
         Self {
             has_output: hl.is_some_and(|h| h.output.is_some()),
+            theme_gen: theme::generation(),
         }
     }
 }
@@ -42,7 +54,7 @@ impl HighlightKey {
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
-    pub search_text: String,
+    pub images: Vec<InlineImage>,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking indicator has no tool_id to route by, so this is
@@ -57,6 +69,16 @@ pub(super) struct Segment {
     pub spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     pub content_indent: &'static str,
+    /// The lines were built for another width or theme, so code blocks and
+    /// tables are still wrapped to the old width and spans carry the old
+    /// palette. Only the content ages, never the height, so a segment the
+    /// reflow window never reaches merely looks dated; it cannot desync the
+    /// layout from what is painted.
+    ///
+    /// Cleared by `set_lines` (whole vector replaced) and up front by
+    /// `reflow_segment`; partial splices (`apply_highlight_result`) leave it
+    /// set so the segment still reflows later.
+    pub(super) stale: bool,
 }
 
 impl Segment {
@@ -74,14 +96,9 @@ impl Segment {
         }
     }
 
-    pub fn with_lines(
-        lines: Vec<Line<'static>>,
-        search_text: String,
-        msg_index: Option<usize>,
-    ) -> Self {
+    pub fn with_lines(lines: Vec<Line<'static>>, msg_index: Option<usize>) -> Self {
         Self {
             lines,
-            search_text,
             msg_index,
             ..Self::default()
         }
@@ -93,16 +110,54 @@ impl Segment {
 
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
+        self.stale = false;
         self.invalidate_height();
     }
 
+    /// Rows the lines take at `width`, measured at that width whatever
+    /// [`Self::stale`] says. Render, [`super::scroll::Layout`], the scrollbar
+    /// and the copy path all read this one number, so none of them can
+    /// disagree on how tall a segment is.
     pub fn height(&self, width: u16) -> u16 {
+        self.images
+            .iter()
+            .fold(self.text_height(width), |height, image| {
+                height.saturating_add(image.height())
+            })
+    }
+
+    pub fn set_images(
+        &mut self,
+        sources: impl Iterator<Item = (ImageSource, Option<&'static str>)>,
+    ) {
+        let mut previous = mem::take(&mut self.images).into_iter();
+        self.images = sources
+            .map(|(source, fallback)| {
+                previous
+                    .next()
+                    .filter(|image| Arc::ptr_eq(&image.source().data, &source.data))
+                    .unwrap_or_else(|| InlineImage::new(source, fallback))
+            })
+            .collect();
+    }
+
+    pub fn poll_images(&mut self) -> Dirty {
+        Dirty::any(self.images.iter_mut().map(InlineImage::poll))
+    }
+
+    pub fn release_images(&mut self) {
+        for image in &mut self.images {
+            image.release();
+        }
+    }
+
+    pub fn text_height(&self, width: u16) -> u16 {
         if let Some(c) = self.cached_height.get()
             && c.at_width == width
         {
             return c.height;
         }
-        let h = wrapped_line_count(&self.lines, width);
+        let h = wrap::total_rows(&self.lines, width);
         self.cached_height.set(Some(CachedHeight {
             at_width: width,
             height: h,
@@ -112,14 +167,19 @@ impl Segment {
 
     /// Maps a display row (after wrapping) back to the source line index.
     pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
-        let mut acc = 0u16;
-        for (i, line) in self.lines.iter().enumerate() {
-            acc = acc.saturating_add(wrapped_line_count(std::slice::from_ref(line), width));
-            if rel_row < acc {
-                return Some(i);
-            }
-        }
-        None
+        self.rows_from(rel_row, width).line()
+    }
+
+    /// A cursor parked on the source line that covers display row `start_row`.
+    pub fn rows_from(&self, start_row: u16, width: u16) -> RowWalk<'_> {
+        let mut walk = RowWalk {
+            lines: &self.lines,
+            measure: wrap::Measure::new(width),
+            next_line: 0,
+            row: 0,
+        };
+        walk.seek(start_row);
+        walk
     }
 
     /// Maps a source line to a 1-based row in the tool's live buffer, or 0
@@ -243,6 +303,57 @@ impl Segment {
     }
 }
 
+/// Cursor over a segment's display rows. It only moves forward and measures
+/// each source line once, so re-rendering a tall segment in pieces costs one
+/// measure of it, not one per piece.
+pub struct RowWalk<'a> {
+    lines: &'a [Line<'static>],
+    measure: wrap::Measure,
+    next_line: usize,
+    /// Display row the line at `next_line` starts on.
+    row: u16,
+}
+
+impl<'a> RowWalk<'a> {
+    /// The source line the cursor sits on, or `None` past the last row.
+    pub fn line(&self) -> Option<usize> {
+        (self.next_line < self.lines.len()).then_some(self.next_line)
+    }
+
+    /// The next source lines, covering `max_rows` display rows or the single
+    /// line that overshoots them, and the rows they cover. Wrapping is per
+    /// source line, so drawing this slice at `rows.start` draws exactly what
+    /// the whole segment would draw there.
+    ///
+    /// While a line is left one is always taken, so a loop over this moves and
+    /// ends even at `max_rows` of zero.
+    pub fn next_chunk(&mut self, max_rows: u16) -> Option<(&'a [Line<'static>], Range<u16>)> {
+        let (start, top) = (self.next_line, self.row);
+        while let Some(line) = self.lines.get(self.next_line) {
+            self.next_line += 1;
+            self.row = self.row.saturating_add(self.measure.rows(line));
+            // Rows are u16 everywhere above this, so nothing past the
+            // saturation point can be addressed, selected or copied anyway.
+            if self.row == u16::MAX || self.row - top >= max_rows {
+                break;
+            }
+        }
+        (self.next_line > start).then(|| (&self.lines[start..self.next_line], top..self.row))
+    }
+
+    /// Backs up to the start of the line covering `target`, or off the end.
+    fn seek(&mut self, target: u16) {
+        while let Some(line) = self.lines.get(self.next_line) {
+            let end = self.row.saturating_add(self.measure.rows(line));
+            if end > target {
+                break;
+            }
+            self.next_line += 1;
+            self.row = end;
+        }
+    }
+}
+
 pub(super) struct SegmentCache {
     segments: Vec<Segment>,
     msg_count: usize,
@@ -265,8 +376,16 @@ impl SegmentCache {
         self.segments.push(seg);
     }
 
-    pub fn insert(&mut self, pos: usize, seg: Segment) {
-        self.segments.insert(pos, seg);
+    /// Books the spacer and instruction slots a tool fills in later, when its
+    /// output finally arrives. Splicing them in at that point would shift
+    /// every segment after them, and plenty of things hold a segment index by
+    /// then: the scroll position, the search highlight, the scroll a search
+    /// restores, the anchors of a live selection. Empty segments take no rows,
+    /// so a pair nobody fills stays invisible.
+    pub fn reserve_instructions(&mut self, tool_id: &str) {
+        self.segments.push(Segment::default());
+        self.segments
+            .push(Segment::with_tool(instruction_id(tool_id)));
     }
 
     pub fn needs_rebuild(&self, msg_len: usize) -> bool {
@@ -279,22 +398,6 @@ impl SegmentCache {
 
     pub fn msg_count(&self) -> usize {
         self.msg_count
-    }
-
-    pub fn total_height(&self, width: u16) -> u32 {
-        self.segments.iter().map(|s| s.height(width) as u32).sum()
-    }
-
-    pub fn segment_at_row(&self, doc_row: u32, width: u16) -> Option<(usize, &Segment, u32)> {
-        let mut cumulative: u32 = 0;
-        for (i, seg) in self.segments.iter().enumerate() {
-            let seg_start = cumulative;
-            cumulative += seg.height(width) as u32;
-            if doc_row < cumulative {
-                return Some((i, seg, seg_start));
-            }
-        }
-        None
     }
 
     pub fn segments(&self) -> &[Segment] {
@@ -329,32 +432,19 @@ impl SegmentCache {
         }
     }
 
-    pub fn search_texts(&self) -> Vec<&str> {
-        self.segments
-            .iter()
-            .map(|s| s.search_text.as_str())
-            .collect()
+    pub fn mark_all_stale(&mut self) {
+        for seg in &mut self.segments {
+            seg.stale = true;
+        }
     }
-
-    pub fn invalidate_from_msg_count(&mut self) {
-        self.msg_count = 0;
-        self.segments.clear();
-    }
-}
-
-pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
-    }
-    Paragraph::new(lines.to_vec())
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const OTHER_THEME: &str = "dracula";
 
     fn seg_with_base(line_count: usize, base: Option<usize>) -> Segment {
         Segment {
@@ -386,6 +476,56 @@ mod tests {
         assert_eq!(seg.buf_row(2), 0, "pre-snapshot lines map outside the buf");
         assert_eq!(seg.buf_row(3), 1);
         assert_eq!(seg.buf_row(5), 3);
+    }
+
+    #[test]
+    fn reuse_highlight_keys_on_theme_not_width() {
+        use crate::components::code_view::RenderLimits;
+        use maki_agent::ToolOutput;
+        use std::sync::Arc;
+
+        let output = Arc::new(ToolOutput::ReadCode {
+            path: "f.rs".into(),
+            start_line: 1,
+            lines: vec!["fn main() {}".into()],
+            total_lines: 1,
+            instructions: None,
+        });
+        let key = || {
+            HighlightKey::from_request(Some(&HighlightRequest {
+                range: (1, 3),
+                input: None,
+                output: Some(Arc::clone(&output)),
+                limits: RenderLimits {
+                    script: 0,
+                    output: 0,
+                },
+            }))
+        };
+        let seg = Segment {
+            highlight_key: key(),
+            highlight_range: Some((1, 3)),
+            lines: vec![
+                Line::raw("h"),
+                Line::raw("a"),
+                Line::raw("b"),
+                Line::raw("t"),
+            ],
+            ..Segment::default()
+        };
+
+        // Highlighted lines are source lines, not wrapped rows (the worker
+        // job carries no width), so the key deliberately omits width.
+        assert!(
+            seg.reuse_highlight(&key(), (1, 3)).is_some(),
+            "reuse must fire across a width change; highlight lines are width-independent"
+        );
+
+        theme::set(theme::load_by_name(OTHER_THEME).unwrap());
+        assert!(
+            seg.reuse_highlight(&key(), (1, 3)).is_none(),
+            "theme mismatch must force a fresh highlight, not splice old-palette lines"
+        );
     }
 
     #[test_case(4, 6 ; "splice_grows")]

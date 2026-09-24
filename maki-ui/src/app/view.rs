@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
+use crate::components::input::{BORDER_ROWS, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -10,8 +11,9 @@ use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
+use maki_providers::RequestOptions;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
@@ -29,53 +31,92 @@ struct ViewLayout {
 }
 
 impl App {
-    pub fn view(&mut self, frame: &mut Frame) {
-        self.status_bar.clear_expired_hint();
+    fn prompt_open(&self) -> bool {
+        self.pack_review.is_open() || self.permission_prompt.is_open()
+    }
 
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
-        let layout = self.compute_layout(frame.area(), form_visible);
-        let render_chat = self.resolve_render_chat();
+    pub(super) fn form_visible(&self) -> bool {
+        self.prompt_open() || self.plan_form_active()
+    }
+
+    /// Whether the chat input is the widget the user's keys reach. It decides
+    /// the block cursor and the terminal cursor, never where the caret was
+    /// drawn.
+    fn input_has_keyboard(&self) -> bool {
+        !self.any_overlay_open()
+    }
+
+    /// Whether a plugin writing to the chat input would land in a box the
+    /// user can see: nothing covering it, the main chat in front, no form in
+    /// the bottom panel, and a {area} tall enough to leave the box a text
+    /// row. An overlay counts even when it only takes the keyboard, because
+    /// the user is reading it and not the draft.
+    ///
+    /// Worked out from state on every ask rather than recorded while
+    /// painting: a whole batch of wakes is handled between two frames, so a
+    /// permission prompt and a plugin's edit can arrive in the same one and
+    /// the edit has to meet the prompt that is already open.
+    pub(crate) fn input_live(&self, area: Rect) -> bool {
+        self.is_main_chat()
+            && !self.any_overlay_open()
+            && !self.plan_form_active()
+            && self.compute_layout(area).input_area.height > BORDER_ROWS
+    }
+
+    /// Returns the cell the terminal cursor belongs on, the cell the input box
+    /// reversed. An overlay owning the keyboard leaves none, so there is
+    /// nothing to park an IME on.
+    ///
+    /// Where the caret was drawn is a separate question, and a caret-anchored
+    /// float is placed from that: the caret outlives an overlay taking focus,
+    /// or a window on it would jump to the middle of the screen the moment it
+    /// started reading keys.
+    pub fn view(&mut self, frame: &mut Frame) -> Option<Position> {
+        let layout = self.compute_layout(frame.area());
+        let render_chat = self.active_chat;
 
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
-        self.render_bottom_panel(frame, &layout);
+        let caret = self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
         let mut overlay_rect = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
+        overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
+        caret.filter(|_| self.input_has_keyboard())
     }
 
-    fn compute_layout(&self, area: Rect, form_visible: bool) -> ViewLayout {
-        let permission_open = self.permission_prompt.is_open();
+    fn compute_layout(&self, area: Rect) -> ViewLayout {
+        let prompt_open = self.prompt_open();
 
         // Carve the full-width status bar first so the split carving below only
         // ever deals with the content region above it.
         let [content, status_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-        // The permission prompt owns the bottom area, so drop any `below` split
-        // here at the source. That keeps "prompt wins bottom" in one filter
-        // instead of needing a fix-up further down.
+        // A confirmation prompt owns the bottom area, so drop any `below` split
+        // here at the source instead of fixing it up further down.
         let reqs: Vec<_> = self
             .float_mgr
             .split_reqs(content)
             .into_iter()
-            .filter(|r| !(permission_open && r.split == Split::Below))
+            .filter(|r| !(prompt_open && r.split == Split::Below))
             .collect();
         let splits = carve(content, &reqs);
         let inner = splits.inner;
 
         let below_active = splits.rect(Split::Below).is_some();
-        let bottom_takeover = form_visible || below_active;
+        let bottom_takeover = self.form_visible() || below_active;
         let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
-        let bottom_height = if permission_open {
+        let bottom_height = if self.permission_prompt.is_open() {
             self.permission_prompt.height(inner.width).min(max_bottom)
+        } else if self.pack_review.is_open() {
+            self.pack_review.height(inner.width).min(max_bottom)
         } else if below_active {
             0
-        } else if form_visible {
-            self.plan_form.height().min(max_bottom)
+        } else if self.form_visible() {
+            self.plan_form.height(max_bottom).min(max_bottom)
         } else if self.is_main_chat() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
@@ -130,16 +171,6 @@ impl App {
         }
     }
 
-    fn resolve_render_chat(&self) -> usize {
-        if self.task_picker.is_open() {
-            self.task_picker
-                .selected_index()
-                .unwrap_or(self.active_chat)
-        } else {
-            self.active_chat
-        }
-    }
-
     fn render_background(&self, frame: &mut Frame) {
         let bg =
             Block::default().style(ratatui::style::Style::new().bg(theme::current().background));
@@ -149,12 +180,24 @@ impl App {
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
         let accent = self.effective_mode_color();
         self.chats[render_chat].set_accent(accent);
-        self.chats[render_chat].view(frame, layout.msg_area, self.selection_state.is_some());
+        let images_visible = !self.any_overlay_open();
+        self.chats[render_chat].view(
+            frame,
+            layout.msg_area,
+            self.selection_state.is_some(),
+            images_visible,
+        );
     }
 
-    fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
+    /// Returns the cell the input box drew its caret in, when it drew one at
+    /// all: a prompt, a form, a `below` split or a focused subagent chat all
+    /// take the box off screen, and a box scrolled off its own viewport draws
+    /// without a caret.
+    fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
+        } else if self.pack_review.is_open() {
+            self.pack_review.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
             let panel_reqs = self.float_mgr.panel_reqs();
             let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
@@ -192,21 +235,29 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let streaming = self.status == Status::Streaming;
+            let placeholder = if self.status == Status::Streaming {
+                Placeholder::Queue
+            } else if self.state.session.messages().is_empty() {
+                Placeholder::Suggestion
+            } else {
+                Placeholder::Blank
+            };
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
-            self.input_box.view(
+            let caret = self.input_box.view(
                 frame,
                 layout.input_area,
-                streaming,
+                placeholder,
                 self.separator_style(),
-                !self.any_overlay_open(),
+                self.input_has_keyboard(),
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
+            return caret;
         }
+        None
     }
 
     fn render_splits(&mut self, frame: &mut Frame, layout: &ViewLayout) {
@@ -225,14 +276,7 @@ impl App {
             overlay_rect = self.search_modal.view(frame, layout.msg_area);
         }
 
-        if self.task_picker.is_open() {
-            overlay_rect = self.task_picker.view(frame, full);
-        }
-
         if self.file_picker.is_open() {
-            if let Some(flash) = self.file_picker.tick() {
-                self.status_bar.flash(flash);
-            }
             overlay_rect = self.file_picker.view(frame, full);
         }
 
@@ -253,7 +297,14 @@ impl App {
         overlay_rect
     }
 
-    fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+    /// {caret} is the cell `render_bottom_panel` just drew the input caret in,
+    /// so a float anchored to it is placed against the frame being painted.
+    fn render_top_modals(
+        &mut self,
+        frame: &mut Frame,
+        mut overlay_rect: Rect,
+        caret: Option<Position>,
+    ) -> Rect {
         let full = frame.area();
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {
@@ -264,13 +315,13 @@ impl App {
             overlay_rect = r;
         }
         if self.usage_modal.is_open() {
-            let quota = self.usage_slot.load();
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
+                total_cost: self.state.cost,
+                total_list_cost: self.state.subsidised_list_cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
-                quota: quota.as_deref(),
                 clock_format: self.ui_config.clock_format,
             };
             let r = self.usage_modal.view(frame, full, &ctx);
@@ -278,7 +329,7 @@ impl App {
                 overlay_rect = r;
             }
         }
-        let r = self.float_mgr.view(frame, full);
+        let r = self.float_mgr.view(frame, full, caret);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -288,6 +339,10 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
+        let opts = chat.opts.unwrap_or(RequestOptions {
+            thinking: self.state.thinking,
+            fast: self.state.fast,
+        });
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {
             status: &self.status,
@@ -298,19 +353,22 @@ impl App {
                 .as_deref()
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
-                global_usage: &self.state.token_usage,
+                global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
-                pricing: &self.state.model.pricing,
+                list_cost: chat.list_cost,
+                subsidy_source: self.state.model.subsidised_by.clone(),
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
             retry_info: self.retry_info.as_ref(),
-            thinking_label: self.state.thinking.status_label(),
-            fast: self.state.fast,
+            thinking_label: opts.thinking.status_label(),
+            fast: opts.fast,
             workflow: self.state.workflow,
+            restricted: self.trust_question.is_some(),
+            yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
@@ -340,7 +398,7 @@ impl App {
 
         self.zones.push_overlay(layout.status_area);
 
-        if self.permission_prompt.is_open() || self.plan_form_active() {
+        if self.form_visible() {
             self.zones.push_overlay(layout.bottom_area);
         }
 
@@ -382,8 +440,7 @@ impl App {
         };
 
         let sel = state.sel();
-        let scroll = self.scroll_offset(sel.zone);
-        if let Some(screen_sel) = sel.to_screen(scroll) {
+        if let Some(screen_sel) = self.screen_selection(sel, render_chat) {
             selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
         }
         if state.is_pending_copy() {
@@ -396,8 +453,7 @@ impl App {
     /// input_area, splits)`.
     #[cfg(test)]
     pub(super) fn layout_geometry(&self, area: Rect) -> (Rect, Rect, Rect, Rect, SplitLayout) {
-        let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
-        let layout = self.compute_layout(area, form_visible);
+        let layout = self.compute_layout(area);
         (
             layout.msg_area,
             layout.bottom_area,
@@ -408,7 +464,7 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
-        let snap = self.hint_reader.load();
+        let snap = self.hints.get()?;
         if snap.entries.is_empty() {
             return None;
         }
@@ -425,14 +481,12 @@ impl App {
     #[cfg(test)]
     pub(super) fn active_keybind_contexts(&self) -> Vec<KeybindContext> {
         let mut contexts = vec![KeybindContext::General];
-        if self.plan_form_active() {
+        if self.pack_review.is_open() || self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
-        } else if self.task_picker.is_open() {
-            contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {

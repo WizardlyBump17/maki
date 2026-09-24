@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use flume::Sender;
 use hmac::{Hmac, Mac};
-use isahc::config::Configurable;
+use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{HttpClient, ReadResponseExt, Request};
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
@@ -171,6 +171,8 @@ fn fetch_container_credentials(
     let client = HttpClient::builder()
         .connect_timeout(CONTAINER_METADATA_TIMEOUT)
         .timeout(CONTAINER_METADATA_TIMEOUT)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
         .build()
         .map_err(|e| AgentError::Config {
             message: format!("container creds http client: {e}"),
@@ -464,7 +466,7 @@ fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), Agen
             "ValidationException" => 400,
             _ => 500,
         };
-        return Err(AgentError::Api { status, message });
+        return Err(AgentError::api(status, message));
     }
 
     let payload = if event_type.as_deref() == Some("chunk") && !payload_bytes.is_empty() {
@@ -676,7 +678,8 @@ impl Provider for Bedrock {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            let models: Vec<crate::model::ModelInfo> = shared::models()
+            let models: Vec<crate::model::ModelInfo> = super::SPEC
+                .models()
                 .iter()
                 .map(|entry| crate::model::ModelInfo::id_only(entry.prefixes[0].to_string()))
                 .collect();
@@ -874,7 +877,9 @@ mod tests {
         let frame = build_eventstream_frame(":exception-type", exc_type, msg.as_bytes());
         let err = decode_eventstream_frame(&frame).unwrap_err();
         match err {
-            AgentError::Api { status, message } => {
+            AgentError::Api {
+                status, message, ..
+            } => {
                 assert_eq!(status, expected_status);
                 assert_eq!(message, msg);
             }

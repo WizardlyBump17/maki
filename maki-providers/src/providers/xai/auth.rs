@@ -1,0 +1,679 @@
+use std::io;
+use std::path::PathBuf;
+use std::str;
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
+
+use isahc::ReadResponseExt;
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use maki_storage::StateDir;
+use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, now_millis, save_tokens};
+use serde::Deserialize;
+use tracing::{debug, error, warn};
+
+use crate::AgentError;
+use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
+use crate::providers::{KeyPool, ResolvedAuth, refreshed_tokens, urlenc};
+
+use super::catalog;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_TIMEOUT: Duration = Duration::from_secs(300);
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+const DEFAULT_EXPIRES_SECS: u64 = 3600;
+const GROK_CLI_DEFAULT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+const MS_THRESHOLD: f64 = 10_000_000_000.0;
+
+pub(crate) const PROVIDER: &str = super::SLUG;
+const DISPLAY_NAME: &str = "xAI";
+pub(crate) const API_KEY_ENV: &str = "XAI_API_KEY";
+pub(crate) const TOKEN_AUTH: &str = "xai-grok-cli";
+pub(crate) const AUTHENTICATE_RESPONSE: &str = "authenticate-response";
+pub(crate) const CLIENT_IDENTIFIER: &str = "maki";
+pub(crate) const CLI_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+
+const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const ISSUER: &str = "https://auth.x.ai";
+const AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
+const DEVICE_URL: &str = "https://auth.x.ai/oauth2/device/code";
+const TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const REDIRECT_HOST: &str = "127.0.0.1";
+const REDIRECT_PORT: u16 = 56121;
+const REDIRECT_PATH: &str = "/callback";
+const GROK_AUTH_REL: &str = ".grok/auth.json";
+const GROK_SCOPE_PREFIX: &str = "https://auth.x.ai::";
+const GROK_LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
+const DEVICE_DEFAULT_INTERVAL_SECS: u64 = 5;
+const DEVICE_MIN_INTERVAL_SECS: u64 = 1;
+const DEVICE_SLOW_DOWN_SECS: u64 = 5;
+const MAX_USER_CODE_LEN: usize = 128;
+const MAX_DEVICE_CODE_LEN: usize = 4096;
+const MAX_VERIFICATION_URI_LEN: usize = 2048;
+const MAX_DEVICE_EXPIRY_SECS: u64 = 24 * 60 * 60;
+
+const NOT_AUTHENTICATED: &str = "not authenticated, run `maki auth login xai` or set XAI_API_KEY";
+const DEVICE_TIMEOUT: &str = "xAI device authorization timed out";
+const DEVICE_DENIED: &str = "xAI device authorization was denied";
+const DEVICE_EXPIRED: &str = "xAI device authorization expired; run `maki auth login xai` again";
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DeviceTokenError {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+fn http_client(timeout: Duration) -> Result<isahc::HttpClient, AgentError> {
+    isahc::HttpClient::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .redirect_policy(RedirectPolicy::None)
+        // curl carries http2 for OTLP.
+        .version_negotiation(VersionNegotiation::http11())
+        .build()
+        .map_err(|e| AgentError::Config {
+            message: format!("http client: {e}"),
+        })
+}
+
+fn oauth_form_headers() -> Vec<(&'static str, String)> {
+    vec![
+        ("content-type", "application/x-www-form-urlencoded".into()),
+        ("accept", "application/json".into()),
+        ("user-agent", crate::providers::user_agent().into()),
+        ("x-grok-client-version", env!("CARGO_PKG_VERSION").into()),
+        ("x-grok-client-surface", "cli".into()),
+    ]
+}
+
+fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), AgentError> {
+    if url != TOKEN_URL && url != DEVICE_URL {
+        return Err(AgentError::Config {
+            message: "refusing to send xAI credentials to an untrusted endpoint".into(),
+        });
+    }
+    let client = http_client(timeout)?;
+    let mut builder = isahc::Request::builder().method("POST").uri(url);
+    for (key, value) in oauth_form_headers() {
+        builder = builder.header(key, value);
+    }
+    let request = builder.body(body.as_bytes().to_vec())?;
+    let mut resp = client.send(request).map_err(|e| AgentError::Config {
+        message: format!("xAI OAuth request: {e}"),
+    })?;
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    Ok((status, text))
+}
+
+fn into_oauth_tokens(
+    resp: TokenResponse,
+    fallback_refresh: Option<String>,
+) -> Result<OAuthTokens, AgentError> {
+    let refresh = resp
+        .refresh_token
+        .filter(|s| !s.is_empty())
+        .or(fallback_refresh)
+        .ok_or_else(|| AgentError::Config {
+            message: "xAI token response did not include a refresh token".into(),
+        })?;
+    let expires = now_millis() + resp.expires_in.unwrap_or(DEFAULT_EXPIRES_SECS) * 1000;
+    Ok(OAuthTokens {
+        access: resp.access_token,
+        refresh,
+        expires,
+        account_id: None,
+    })
+}
+
+pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
+    if tokens.refresh.is_empty() {
+        return Err(AgentError::Config {
+            message: "xAI credentials are expired and do not include a refresh token".into(),
+        });
+    }
+    debug!(expired = tokens.is_expired(), "refreshing xAI OAuth tokens");
+
+    let form_body = format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={}",
+        urlenc(&tokens.refresh),
+        urlenc(CLIENT_ID),
+    );
+    let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+    if status != 200 {
+        return Err(AgentError::Config {
+            message: format!("xAI token refresh failed ({status}): {body_text}"),
+        });
+    }
+    let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
+    into_oauth_tokens(token_resp, Some(tokens.refresh.clone()))
+}
+
+fn oauth_headers(access: &str) -> Vec<(String, String)> {
+    vec![
+        ("authorization".into(), format!("Bearer {access}")),
+        ("x-xai-token-auth".into(), TOKEN_AUTH.into()),
+        (
+            "x-authenticateresponse".into(),
+            AUTHENTICATE_RESPONSE.into(),
+        ),
+        ("x-grok-client-identifier".into(), CLIENT_IDENTIFIER.into()),
+        (
+            "x-grok-client-version".into(),
+            env!("CARGO_PKG_VERSION").into(),
+        ),
+        ("x-grok-client-mode".into(), client_mode().into()),
+    ]
+}
+
+fn client_mode() -> &'static str {
+    if io::IsTerminal::is_terminal(&io::stdin()) && io::IsTerminal::is_terminal(&io::stdout()) {
+        "interactive"
+    } else {
+        "headless"
+    }
+}
+
+pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
+    Ok(ResolvedAuth::new(PROVIDER, oauth_headers(&tokens.access))?
+        .with_base_url(Some(CLI_BASE_URL.into())))
+}
+
+pub(crate) fn is_oauth(dir: &StateDir) -> bool {
+    load_tokens(dir, PROVIDER).is_some()
+}
+
+pub fn resolve(dir: &StateDir) -> Result<ResolvedAuth, AgentError> {
+    if let Some(tokens) = load_tokens(dir, PROVIDER) {
+        if !tokens.is_expired() {
+            debug!("using xAI OAuth authentication");
+            return build_oauth_resolved(&tokens);
+        }
+        match refreshed_tokens(dir, PROVIDER, None, refresh_tokens) {
+            Ok(fresh) => {
+                debug!("using xAI OAuth authentication (refreshed)");
+                return build_oauth_resolved(&fresh);
+            }
+            Err(e) => {
+                warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
+                delete_tokens(dir, PROVIDER).ok();
+                catalog::invalidate();
+            }
+        }
+    }
+
+    if let Ok(pool) = KeyPool::resolve(PROVIDER, API_KEY_ENV) {
+        debug!("using xAI API key authentication");
+        return ResolvedAuth::bearer(PROVIDER, pool.current());
+    }
+
+    Err(AgentError::Config {
+        message: NOT_AUTHENTICATED.into(),
+    })
+}
+
+pub fn login(dir: &StateDir) -> Result<(), AgentError> {
+    if let Some(existing) = grok_cli_credentials() {
+        println!("Found official Grok CLI credentials in ~/.grok/auth.json.");
+        let answer = oauth_loopback::prompt("Use them instead of a new xAI OAuth login? [Y/n] ")?;
+        if answer.is_empty() || answer.to_ascii_lowercase().starts_with('y') {
+            match ensure_fresh(existing) {
+                Ok(tokens) => return finish_login(dir, tokens),
+                Err(e) => {
+                    warn!(error = %e, "existing Grok CLI credentials could not be refreshed");
+                    println!(
+                        "Existing credentials could not be refreshed. Starting a new login..."
+                    );
+                }
+            }
+        }
+    }
+
+    let method = oauth_loopback::select_login_method(DISPLAY_NAME)?;
+    let tokens = match method {
+        LoginMethod::Device => device_login()?,
+        LoginMethod::Browser => browser_login()?,
+    };
+    finish_login(dir, tokens)
+}
+
+pub fn logout(dir: &StateDir) -> Result<(), AgentError> {
+    catalog::invalidate();
+    if delete_tokens(dir, PROVIDER)? {
+        println!("Logged out of xAI.");
+    } else if maki_storage::auth::delete_provider_credentials(dir, PROVIDER)? {
+        println!("Removed saved xAI API key.");
+    } else {
+        println!("Not currently logged in to xAI.");
+    }
+    Ok(())
+}
+
+fn finish_login(dir: &StateDir, tokens: OAuthTokens) -> Result<(), AgentError> {
+    save_tokens(dir, PROVIDER, &tokens)?;
+    println!("Authenticated successfully.");
+    match catalog::refresh(&tokens.access) {
+        Ok(models) => {
+            println!("Loaded {} models from your xAI catalog.", models.len());
+        }
+        Err(e) => {
+            warn!(error = %e, "xAI catalog refresh failed after login");
+            println!(
+                "Login succeeded, but the model catalog could not be refreshed; using the curated fallback."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_fresh(tokens: OAuthTokens) -> Result<OAuthTokens, AgentError> {
+    if !tokens.is_expired() {
+        return Ok(tokens);
+    }
+    refresh_tokens(&tokens)
+}
+
+fn device_login() -> Result<OAuthTokens, AgentError> {
+    let device = request_device_code()?;
+    println!(
+        "Open this URL in your browser:\n\n  {}\n",
+        device.verification_uri
+    );
+    println!("Enter code: {}\n", device.user_code);
+    println!("Waiting for authorization...");
+    poll_device_token(&device).map_err(|e| {
+        error!(error = %e, "xAI device authorization failed");
+        e
+    })
+}
+
+fn request_device_code() -> Result<DeviceCodeResponse, AgentError> {
+    let form_body = format!(
+        "client_id={}&scope={}&referrer={}",
+        urlenc(CLIENT_ID),
+        urlenc(SCOPE),
+        urlenc(CLIENT_IDENTIFIER),
+    );
+    let (status, body_text) = post_form(DEVICE_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+    if status == 404 {
+        return Err(AgentError::Config {
+            message: "xAI device authorization is not available; choose browser login".into(),
+        });
+    }
+    if status != 200 {
+        return Err(AgentError::Config {
+            message: format!("xAI device authorization request failed ({status}): {body_text}"),
+        });
+    }
+    let device: DeviceCodeResponse = serde_json::from_str(&body_text)?;
+    validate_device_challenge(&device)?;
+    Ok(device)
+}
+
+fn validate_device_challenge(device: &DeviceCodeResponse) -> Result<(), AgentError> {
+    if device.device_code.is_empty() || device.device_code.len() > MAX_DEVICE_CODE_LEN {
+        return Err(AgentError::Config {
+            message: "xAI device authorization response had an invalid schema".into(),
+        });
+    }
+    if device.user_code.is_empty()
+        || device.user_code.len() > MAX_USER_CODE_LEN
+        || !device
+            .user_code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(AgentError::Config {
+            message: "xAI device authorization response had an invalid schema".into(),
+        });
+    }
+    if !valid_verification_uri(&device.verification_uri, &device.device_code) {
+        return Err(AgentError::Config {
+            message: "xAI device authorization response had an invalid schema".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn valid_verification_uri(uri: &str, device_code: &str) -> bool {
+    if uri.is_empty() || uri.len() > MAX_VERIFICATION_URI_LEN {
+        return false;
+    }
+    let Ok(parsed) = url_origin(uri) else {
+        return false;
+    };
+    if parsed != ISSUER && parsed != "https://accounts.x.ai" {
+        return false;
+    }
+    !uri.contains(device_code)
+}
+
+fn url_origin(uri: &str) -> Result<String, ()> {
+    let rest = uri.strip_prefix("https://").ok_or(())?;
+    let host = rest.split(['/', '?', '#']).next().ok_or(())?;
+    if host.is_empty() || host.contains('@') {
+        return Err(());
+    }
+    Ok(format!("https://{host}"))
+}
+
+fn poll_device_token(device: &DeviceCodeResponse) -> Result<OAuthTokens, AgentError> {
+    let mut interval = Duration::from_secs(
+        device
+            .interval
+            .unwrap_or(DEVICE_DEFAULT_INTERVAL_SECS)
+            .max(DEVICE_MIN_INTERVAL_SECS),
+    );
+    let timeout = Duration::from_secs(
+        device
+            .expires_in
+            .unwrap_or(POLL_TIMEOUT.as_secs())
+            .min(MAX_DEVICE_EXPIRY_SECS)
+            .min(POLL_TIMEOUT.as_secs()),
+    );
+    let deadline = Instant::now() + timeout;
+    let form_body = format!(
+        "grant_type={}&device_code={}&client_id={}",
+        urlenc(DEVICE_GRANT),
+        urlenc(&device.device_code),
+        urlenc(CLIENT_ID),
+    );
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(AgentError::Config {
+                message: DEVICE_EXPIRED.into(),
+            });
+        }
+        thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
+
+        let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+        if status == 200 {
+            let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
+            return into_oauth_tokens(token_resp, None);
+        }
+
+        let parsed: DeviceTokenError =
+            serde_json::from_str(&body_text).unwrap_or(DeviceTokenError {
+                error: None,
+                interval: None,
+            });
+        match parsed.error.as_deref() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => {
+                interval = Duration::from_secs(
+                    parsed
+                        .interval
+                        .unwrap_or(interval.as_secs() + DEVICE_SLOW_DOWN_SECS)
+                        .max(interval.as_secs() + DEVICE_SLOW_DOWN_SECS),
+                );
+            }
+            Some("access_denied" | "authorization_denied") => {
+                return Err(AgentError::Config {
+                    message: DEVICE_DENIED.into(),
+                });
+            }
+            Some("expired_token") => {
+                return Err(AgentError::Config {
+                    message: DEVICE_EXPIRED.into(),
+                });
+            }
+            Some(_) if status == 400 || status == 401 || status == 403 => {
+                return Err(AgentError::Config {
+                    message: format!("xAI device authorization failed ({status}): {body_text}"),
+                });
+            }
+            _ if status == 408 || status == 429 || status >= 500 => {}
+            _ => {
+                return Err(AgentError::Config {
+                    message: DEVICE_TIMEOUT.into(),
+                });
+            }
+        }
+    }
+}
+
+fn browser_login() -> Result<OAuthTokens, AgentError> {
+    let (verifier, challenge) = oauth_loopback::pkce_pair()?;
+    let state = oauth_loopback::random_token()?;
+    let nonce = oauth_loopback::random_token()?;
+    let server = Loopback {
+        port: REDIRECT_PORT,
+        fallback_to_ephemeral: true,
+        path: REDIRECT_PATH,
+        timeout: CALLBACK_TIMEOUT,
+        paste_fallback: true,
+    }
+    .bind()?;
+    let redirect_uri = format!("http://{REDIRECT_HOST}:{}{REDIRECT_PATH}", server.port());
+
+    let authorize_url = format!(
+        "{AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&nonce={}",
+        urlenc(CLIENT_ID),
+        urlenc(&redirect_uri),
+        urlenc(SCOPE),
+        urlenc(&challenge),
+        urlenc(&state),
+        urlenc(&nonce),
+    );
+
+    println!("Open this URL in your browser:\n\n  {authorize_url}\n");
+    if let Err(e) = open::that(&authorize_url) {
+        warn!(error = %e, "failed to open browser");
+    }
+    println!("Waiting for xAI OAuth callback on {redirect_uri}...");
+    println!("If the redirect cannot reach this process, paste the complete redirect URL below.");
+
+    let callback = server.wait(&state)?;
+    if let Some(error) = callback.error {
+        return Err(AgentError::Config {
+            message: format!("xAI authorization failed: {error}"),
+        });
+    }
+    let code = callback.code.ok_or_else(|| AgentError::Config {
+        message: "xAI authorization failed: no authorization code returned".into(),
+    })?;
+
+    let form_body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        urlenc(&code),
+        urlenc(&redirect_uri),
+        urlenc(CLIENT_ID),
+        urlenc(&verifier),
+    );
+    let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
+    if status != 200 {
+        return Err(AgentError::Config {
+            message: format!("xAI token exchange failed ({status}): {body_text}"),
+        });
+    }
+    let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
+    into_oauth_tokens(token_resp, None)
+}
+
+pub(crate) fn grok_cli_credentials() -> Option<OAuthTokens> {
+    let path = grok_auth_path()?;
+    let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    parse_grok_auth(&data)
+}
+
+fn grok_auth_path() -> Option<PathBuf> {
+    Some(maki_storage::paths::home()?.join(GROK_AUTH_REL))
+}
+
+pub(crate) fn parse_grok_auth(data: &serde_json::Value) -> Option<OAuthTokens> {
+    let scoped_key = format!("{GROK_SCOPE_PREFIX}{CLIENT_ID}");
+    if let Some(oidc) = data.get(&scoped_key).and_then(|v| v.as_object())
+        && let Some(tokens) = tokens_from_grok_object(oidc)
+    {
+        return Some(tokens);
+    }
+    if let Some(legacy) = data.get(GROK_LEGACY_SCOPE).and_then(|v| v.as_object())
+        && let Some(access) = first_string_field(legacy, &["key", "access_token", "token"])
+    {
+        return Some(OAuthTokens {
+            access,
+            refresh: String::new(),
+            expires: now_millis() + GROK_CLI_DEFAULT_TTL_MS,
+            account_id: None,
+        });
+    }
+    if let Some(access) = data
+        .get("access_token")
+        .or_else(|| data.get("token"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(OAuthTokens {
+            access: access.to_string(),
+            refresh: data
+                .get("refresh_token")
+                .or_else(|| data.get("refresh"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            expires: parse_expiry(data.get("expires_at").or_else(|| data.get("expires")))
+                .unwrap_or_else(|| now_millis() + GROK_CLI_DEFAULT_TTL_MS),
+            account_id: None,
+        });
+    }
+    None
+}
+
+fn tokens_from_grok_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<OAuthTokens> {
+    let access = first_string_field(obj, &["key", "access_token", "token"])?;
+    Some(OAuthTokens {
+        access,
+        refresh: first_string_field(obj, &["refresh_token", "refresh"]).unwrap_or_default(),
+        expires: parse_expiry(obj.get("expires_at"))
+            .unwrap_or_else(|| now_millis() + GROK_CLI_DEFAULT_TTL_MS),
+        account_id: None,
+    })
+}
+
+fn first_string_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| obj.get(*key).and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_expiry(value: Option<&serde_json::Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(n) = value.as_f64() {
+        return Some(normalize_epoch_ms(n));
+    }
+    let s = value.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some(normalize_epoch_ms(n));
+    }
+    s.parse::<jiff::Timestamp>()
+        .ok()
+        .map(|ts| u64::try_from(ts.as_millisecond()).unwrap_or(0))
+}
+
+fn normalize_epoch_ms(value: f64) -> u64 {
+    if value > MS_THRESHOLD {
+        value as u64
+    } else {
+        (value * 1000.0) as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test]
+    fn parse_grok_oidc_scope() {
+        let data = serde_json::json!({
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "key": "access-1",
+                "refresh_token": "refresh-1",
+                "expires_at": 9_999_999_999_000u64
+            }
+        });
+        let tokens = parse_grok_auth(&data).unwrap();
+        assert_eq!(tokens.access, "access-1");
+        assert_eq!(tokens.refresh, "refresh-1");
+        assert_eq!(tokens.expires, 9_999_999_999_000);
+    }
+
+    #[test]
+    fn parse_grok_legacy_scope() {
+        let data = serde_json::json!({
+            "https://accounts.x.ai/sign-in": { "key": "legacy-access" }
+        });
+        let tokens = parse_grok_auth(&data).unwrap();
+        assert_eq!(tokens.access, "legacy-access");
+        assert!(tokens.refresh.is_empty());
+    }
+
+    #[test]
+    fn parse_grok_top_level_tokens() {
+        let data = serde_json::json!({
+            "access_token": "top-access",
+            "refresh_token": "top-refresh",
+            "expires": "2000000000"
+        });
+        let tokens = parse_grok_auth(&data).unwrap();
+        assert_eq!(tokens.access, "top-access");
+        assert_eq!(tokens.refresh, "top-refresh");
+        assert_eq!(tokens.expires, 2_000_000_000_000);
+    }
+
+    #[test_case("https://auth.x.ai/device", "secret-code", true)]
+    #[test_case("https://accounts.x.ai/device", "secret-code", true)]
+    #[test_case("http://auth.x.ai/device", "secret-code", false)]
+    #[test_case("https://evil.example/device", "secret-code", false)]
+    #[test_case("https://auth.x.ai/device?code=secret-code", "secret-code", false)]
+    fn verification_uri_validation(uri: &str, secret: &str, expected: bool) {
+        assert_eq!(valid_verification_uri(uri, secret), expected);
+    }
+
+    #[test]
+    fn into_oauth_tokens_requires_refresh() {
+        let err = into_oauth_tokens(
+            TokenResponse {
+                access_token: "a".into(),
+                refresh_token: None,
+                expires_in: Some(60),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("refresh token"));
+    }
+}

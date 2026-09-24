@@ -2,15 +2,20 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
+local insert_after = require("edit_helpers").insert_after
+local preserve_line_endings = require("edit_helpers").preserve_line_endings
 
 local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 10
+
+local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr = "diff_old_line_nr" }
+local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
 
 local EDIT_LINES_DESCRIPTION =
   [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
 
 local INSERT_LINES_DESCRIPTION =
-  [[Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved. Do not use with the batch tool.]]
+  [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
 
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
@@ -97,11 +102,11 @@ end
 -- The one gutter builder both render passes share: the plain render and
 -- the async highlight rewrite must produce byte-identical gutters or the
 -- columns shift when highlights land.
-local function nr_span(fmt, start_nr, i)
-  return { string.format(fmt, start_nr and (start_nr + i - 1) or ""), "line_nr" }
+local function nr_span(fmt, start_nr, i, style)
+  return { string.format(fmt, start_nr and (start_nr + i - 1) or ""), style }
 end
 
-local function append_diff_lines(view, text, style, prefix, nr_fmt, start_nr, jobs)
+local function append_diff_lines(view, text, side, nr_fmt, start_nr, jobs)
   local lines = split_lines(text or "")
   if #lines == 0 then
     return
@@ -109,16 +114,16 @@ local function append_diff_lines(view, text, style, prefix, nr_fmt, start_nr, jo
   jobs[#jobs + 1] = {
     first = #view.all_lines + 1,
     text = table.concat(lines, "\n"),
-    style = style,
-    prefix = prefix,
+    side = side,
     start_nr = start_nr,
   }
   for i, line in ipairs(lines) do
     local spans = {}
     if nr_fmt then
-      spans[#spans + 1] = nr_span(nr_fmt, start_nr, i)
+      spans[#spans + 1] = nr_span(nr_fmt, start_nr, i, side.nr)
     end
-    spans[#spans + 1] = { prefix .. line, style }
+    spans[#spans + 1] = { side.prefix, side.sign }
+    spans[#spans + 1] = { line, side.style }
     view:append(spans)
   end
 end
@@ -128,7 +133,8 @@ end
 local function apply_highlights(view, fmt, jobs, ext)
   maki.async.run(function()
     for _, job in ipairs(jobs) do
-      local bg = maki.ui.theme_color(job.style)
+      local side = maki.ui.theme_style(job.side.style)
+      local bg = side and side.bg
       local highlighted = bg and maki.ui.highlight(job.text, ext)
       for i, hl_line in ipairs(highlighted or {}) do
         local idx = job.first + i - 1
@@ -137,9 +143,9 @@ local function apply_highlights(view, fmt, jobs, ext)
         end
         local spans = {}
         if fmt then
-          spans[#spans + 1] = nr_span(fmt, job.start_nr, i)
+          spans[#spans + 1] = nr_span(fmt, job.start_nr, i, job.side.nr)
         end
-        spans[#spans + 1] = { job.prefix, { bg = bg } }
+        spans[#spans + 1] = { job.side.prefix, job.side.sign }
         for _, seg in ipairs(hl_line) do
           local s = type(seg[2]) == "table" and seg[2] or {}
           s.bg = bg
@@ -162,16 +168,16 @@ local function diff_view(blocks, path)
   local w = gutter_width(blocks)
   local fmt = w > 0 and ("%" .. w .. "s ") or nil
   local jobs = {}
-  local function append(text, style, prefix, start_nr)
-    append_diff_lines(view, text, style, prefix, fmt, start_nr, jobs)
+  local function append(text, side, start_nr)
+    append_diff_lines(view, text, side, fmt, start_nr, jobs)
   end
   for i, block in ipairs(blocks) do
     if i > 1 then
       view:append({})
     end
     local has_old = (block.old or "") ~= ""
-    append(block.old, "diff_old", "- ", block.nr)
-    append(block.new, "diff_new", "+ ", not has_old and block.nr or nil)
+    append(block.old, DIFF_OLD, block.nr)
+    append(block.new, DIFF_NEW, not has_old and block.nr or nil)
   end
   view:finish()
   local ext = (path or ""):match("%.([^%.]+)$")
@@ -190,20 +196,15 @@ local function diff_restore(blocks_from)
   end
 end
 
-local function apply_edit(path, ctx, transform)
+local function apply_edit(path, transform)
   path = maki.fs.abspath(path)
-
-  local ok, err = ctx:check_before_edit(path)
-  if not ok then
-    return nil, err
-  end
 
   local before, read_err = maki.fs.read(path)
   if read_err then
     return nil, "read error: " .. tostring(read_err)
   end
 
-  local after, transform_err = transform(before)
+  local after, transform_err = preserve_line_endings(before, transform)
   if transform_err then
     return nil, transform_err
   end
@@ -212,8 +213,6 @@ local function apply_edit(path, ctx, transform)
   if write_err then
     return nil, "write error: " .. tostring(write_err)
   end
-
-  ctx:record_read(path)
 
   return {
     path = path,
@@ -234,7 +233,7 @@ end
 
 local opts = maki.api.register_options({
   multiedit = { default = true, desc = "Provide the `multiedit` tool." },
-  edit_lines = { default = false, desc = "Provide the opt-in `edit_lines` tool." },
+  edit_lines = { default = true, desc = "Provide the `edit_lines` tool." },
   insert_lines = { default = false, desc = "Provide the opt-in `insert_lines` tool." },
 })
 
@@ -248,6 +247,7 @@ maki.api.register_tool({
   name = "edit",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_DESCRIPTION,
@@ -283,8 +283,8 @@ maki.api.register_tool({
     return { { old = input.old_string, new = input.new_string } }
   end),
 
-  handler = function(input, ctx)
-    local result, err = apply_edit(input.path, ctx, function(content)
+  handler = function(input)
+    local result, err = apply_edit(input.path, function(content)
       return fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
     end)
     if not result then
@@ -299,6 +299,7 @@ register_tool_if(opts.multiedit, {
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   start_annotation = "edits",
   audiences = { "main", "general_sub", "interpreter" },
@@ -349,13 +350,13 @@ register_tool_if(opts.multiedit, {
     return blocks
   end),
 
-  handler = function(input, ctx)
+  handler = function(input)
     local edits = input.edits
     if #edits == 0 then
       return { llm_output = "provide at least one edit", is_error = true }
     end
 
-    local result, err = apply_edit(input.path, ctx, function(content)
+    local result, err = apply_edit(input.path, function(content)
       for i, edit in ipairs(edits) do
         local replaced, replace_err =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
@@ -385,6 +386,7 @@ register_tool_if(opts.edit_lines, {
   name = "edit_lines",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_LINES_DESCRIPTION,
@@ -421,8 +423,8 @@ register_tool_if(opts.edit_lines, {
     return { { new = input.new_string, nr = input.start } }
   end),
 
-  handler = function(input, ctx)
-    local result, err = apply_edit(input.path, ctx, function(content)
+  handler = function(input)
+    local result, err = apply_edit(input.path, function(content)
       return replace_lines(content, input.start, input["end"], input.new_string)
     end)
     if not result then
@@ -439,6 +441,7 @@ register_tool_if(opts.insert_lines, {
   name = "insert_lines",
   kind = "edit",
   mutable_path = "path",
+  permission = "fs_write",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = INSERT_LINES_DESCRIPTION,
@@ -454,7 +457,7 @@ register_tool_if(opts.insert_lines, {
       },
       line = {
         type = "integer",
-        description = "Line number to insert before (1-indexed). Use 1 to insert at the top.",
+        description = "Line number to insert after (1-indexed). Use 0 to insert at the top.",
         required = true,
       },
       new_string = {
@@ -467,16 +470,16 @@ register_tool_if(opts.insert_lines, {
 
   header = edit_header,
   restore = diff_restore(function(input)
-    return { { new = input.new_string, nr = input.line } }
+    return { { new = input.new_string, nr = input.line + 1 } }
   end),
 
-  handler = function(input, ctx)
-    local result, err = apply_edit(input.path, ctx, function(content)
-      return replace_lines(content, input.line, nil, input.new_string)
+  handler = function(input)
+    local result, err = apply_edit(input.path, function(content)
+      return insert_after(content, input.line, input.new_string)
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
-    return diff_result(result, string.format("inserted at line %d in %s", input.line, shorten_path(result.path)))
+    return diff_result(result, string.format("inserted after line %d in %s", input.line, shorten_path(result.path)))
   end,
 })

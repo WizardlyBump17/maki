@@ -1,51 +1,47 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use maki_storage::StateDir;
+use maki_storage::auth::lock_exclusive;
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use strum::IntoEnumIterator;
 use tracing::{debug, warn};
 
-use crate::manifest::ManifestRegistry;
 use crate::model::{Model, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, Provider};
+use crate::spec::{ProviderRegistry, ProviderSpec};
+use crate::types::ThinkingFields;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
-use super::anthropic::Anthropic;
-use super::copilot::Copilot;
-use super::deepseek::DeepSeek;
-use super::google::Google;
-use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
-use super::mistral::Mistral;
-use super::openai::OpenAi;
-use super::opencode::Opencode;
-use super::openrouter::OpenRouter;
-use super::synthetic::Synthetic;
-use super::tensorx::TensorX;
-use super::zai::Zai;
+use super::local::{LLAMACPP, OLLAMA};
+use super::openai;
 
 const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDERS_DIR: &str = "providers";
 const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";
+const THINKING_FIELDS_KEY: &str = "thinking_fields";
+const RELOAD_SUBCOMMAND: &str = "reload";
+/// The only bases whose codecs merge `thinking_fields` into the request body.
+/// Anywhere else the fields vanish without a trace, so `build_meta` warns.
+const THINKING_FIELDS_BASES: &[&str] = &[LLAMACPP.slug, OLLAMA.slug, openai::SLUG];
 
 struct DynamicProviderMeta {
     slug: String,
     display_name: String,
-    base: ProviderKind,
+    base: &'static ProviderSpec,
     system_prefix: Option<String>,
     has_auth: bool,
     script_path: PathBuf,
     models: Vec<ScriptModel>,
+    refresh_gate: RefreshGate,
 }
 
 #[derive(Deserialize)]
@@ -76,24 +72,37 @@ struct ScriptModel {
     context_window: u32,
     #[serde(default)]
     pricing: Option<ModelPricing>,
+    #[serde(default)]
+    thinking_fields: Option<ThinkingFields>,
 }
 
 impl ScriptModel {
-    fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
+    fn to_model(
+        &self,
+        slug: &str,
+        base: &'static ProviderSpec,
+        id: String,
+        tier: ModelTier,
+    ) -> Model {
         Model {
             id,
             provider: Arc::from(slug),
             tier,
-            family: base.family(),
+            family: base.family,
             supports_tool_examples_override: self.supports_tool_examples,
             thinking_override: ThinkingSupport::from_flags(
                 self.supports_thinking,
                 self.requires_thinking,
             ),
             supports_vision_override: self.supports_vision,
+            supports_fast_override: None,
             pricing: self.pricing.clone().unwrap_or_default(),
+            subsidised_by: None,
+            discovered_free: false,
             max_output_tokens: Some(self.max_output_tokens),
+            turn_output_tokens: None,
             context_window: self.context_window,
+            thinking_fields: self.thinking_fields.clone().map(Box::new),
         }
     }
 }
@@ -116,12 +125,10 @@ struct ScriptResolvedAuth {
     headers: HashMap<String, String>,
 }
 
-impl From<ScriptResolvedAuth> for ResolvedAuth {
-    fn from(s: ScriptResolvedAuth) -> Self {
-        Self {
-            base_url: s.base_url,
-            headers: s.headers.into_iter().collect(),
-        }
+impl ScriptResolvedAuth {
+    fn into_resolved(self, slug: &str) -> Result<ResolvedAuth, AgentError> {
+        Ok(ResolvedAuth::new(slug, self.headers.into_iter().collect())?
+            .with_base_url(self.base_url))
     }
 }
 
@@ -132,14 +139,16 @@ fn is_valid_slug(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// The slugs a script may not claim. Catalog-backed builtins are left out on
+/// purpose; reserving those too would change behaviour.
 fn builtin_slugs() -> Vec<String> {
-    ProviderKind::iter().map(|k| k.to_string()).collect()
+    ProviderRegistry::native_slugs()
+        .map(str::to_string)
+        .collect()
 }
 
 fn providers_dir() -> Option<PathBuf> {
-    maki_storage::paths::config_dir()
-        .ok()
-        .map(|d| d.join(PROVIDERS_DIR))
+    maki_storage::paths::find_config_path(PROVIDERS_DIR)
 }
 
 fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String, AgentError> {
@@ -198,7 +207,12 @@ fn run_script(path: &Path, subcommand: &str, timeout: Duration) -> Result<String
     })
 }
 
+/// Login writes a brand new token family, so it has to wait for an in flight
+/// refresh instead of racing it: the loser of that race would put the old
+/// family back on top of the new one, and the user would see the same auth
+/// error right after logging in.
 fn run_script_interactive(path: &Path, subcommand: &str) -> Result<(), AgentError> {
+    let _lock = lock_exclusive(path);
     let status = Command::new(path)
         .arg(subcommand)
         .stdin(std::process::Stdio::inherit())
@@ -218,12 +232,15 @@ fn run_script_interactive(path: &Path, subcommand: &str) -> Result<(), AgentErro
 }
 
 fn resolve_auth(meta: &DynamicProviderMeta) -> Result<ResolvedAuth, AgentError> {
+    // A script may refresh under `resolve` when the token is near expiry, and
+    // this runs on every `create`, so it takes the lock too.
+    let _lock = lock_exclusive(&meta.script_path);
     let stdout = run_script(&meta.script_path, "resolve", SCRIPT_TIMEOUT)?;
     let parsed: ScriptResolvedAuth =
         serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
             message: format!("{} resolve: invalid JSON: {e}", meta.script_path.display()),
         })?;
-    Ok(parsed.into())
+    parsed.into_resolved(&meta.slug)
 }
 
 /// `info` and `models` describe the script, not the world, so their output only
@@ -304,21 +321,55 @@ fn build_meta(
         }
     };
 
-    let base = match ProviderKind::from_str(&info.base) {
-        Ok(k) => k,
-        Err(_) => {
-            warn!(slug, base = info.base, "unknown base provider, skipping");
-            return None;
-        }
+    let Some(base) = ProviderRegistry::get(&info.base).filter(|s| s.is_native()) else {
+        warn!(slug, base = info.base, "unknown base provider, skipping");
+        return None;
     };
 
-    let models = match &described.models {
-        Some(json) => serde_json::from_str(json).unwrap_or_else(|e| {
-            warn!(slug, error = %e, "invalid models JSON, falling back to base models");
-            Vec::new()
-        }),
+    // Entry by entry, so one bad model never costs the whole list.
+    let models: Vec<ScriptModel> = match &described.models {
+        Some(json) => serde_json::from_str::<Vec<Value>>(json)
+            .unwrap_or_else(|e| {
+                warn!(slug, error = %e, "invalid models JSON, falling back to base models");
+                Vec::new()
+            })
+            .into_iter()
+            .filter_map(|mut entry| {
+                let error = match serde_json::from_value::<ScriptModel>(entry.clone()) {
+                    Ok(model) => return Some(model),
+                    Err(e) => e,
+                };
+                // Malformed thinking fields cost the field, not the model.
+                let without_fields = entry
+                    .as_object_mut()
+                    .is_some_and(|o| o.remove(THINKING_FIELDS_KEY).is_some())
+                    .then(|| serde_json::from_value::<ScriptModel>(entry).ok())
+                    .flatten();
+                match without_fields {
+                    Some(model) => {
+                        warn!(slug, error = %error, model = model.id, "invalid thinking_fields, dropping them");
+                        Some(model)
+                    }
+                    None => {
+                        warn!(slug, error = %error, "invalid model entry, skipping");
+                        None
+                    }
+                }
+            })
+            .collect(),
         None => Vec::new(),
     };
+
+    if !THINKING_FIELDS_BASES.contains(&base.slug)
+        && let Some(model) = models.iter().find(|m| m.thinking_fields.is_some())
+    {
+        warn!(
+            slug,
+            base = %info.base,
+            model = model.id,
+            "thinking_fields only applies to llama-cpp, ollama, and openai providers, ignoring"
+        );
+    }
 
     Some(DynamicProviderMeta {
         slug,
@@ -328,6 +379,7 @@ fn build_meta(
         has_auth: info.has_auth,
         script_path,
         models,
+        refresh_gate: RefreshGate::default(),
     })
 }
 
@@ -489,62 +541,21 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
     let resolved = resolve_auth(meta)?;
     let auth = Arc::new(Mutex::new(resolved));
 
-    let inner: Box<dyn Provider> = match meta.base {
-        ProviderKind::Anthropic => Box::new(
-            Anthropic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::OpenAi => Box::new(
-            OpenAi::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Google => Box::new(Google::with_auth(auth.clone(), timeouts)),
-        ProviderKind::Copilot => Box::new(
-            Copilot::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Ollama => Box::new(
-            LocalEndpoint::with_auth(&OLLAMA, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::LlamaCpp => Box::new(
-            LocalEndpoint::with_auth(&LLAMACPP, auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Mistral => Box::new(
-            Mistral::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Zai => Box::new(
-            Zai::with_auth(auth.clone(), timeouts).with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Synthetic => Box::new(
-            Synthetic::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::DeepSeek => Box::new(
-            DeepSeek::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::OpenRouter => Box::new(
-            OpenRouter::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::TensorX => Box::new(
-            TensorX::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
-        ProviderKind::Opencode => Box::new(
-            Opencode::with_auth(auth.clone(), timeouts)
-                .with_system_prefix(meta.system_prefix.clone()),
-        ),
+    // `build_meta` rejects a base that is not native, so this always resolves.
+    let Some(native) = meta.base.native else {
+        return Err(AgentError::Config {
+            message: format!("base provider '{}' has no constructor", meta.base.slug),
+        });
     };
+    let inner = (native.with_auth)(auth.clone(), timeouts, meta.system_prefix.clone());
 
     Ok(Box::new(DynamicProvider {
+        slug: &meta.slug,
         script_path: &meta.script_path,
         inner,
         auth,
         models: &meta.models,
+        refresh_gate: &meta.refresh_gate,
     }))
 }
 
@@ -557,10 +568,8 @@ pub fn dynamic_model_specs_for(slug: &str) -> Vec<String> {
         return Vec::new();
     };
     if meta.models.is_empty() {
-        let base_slug = meta.base.to_string();
-        ManifestRegistry::get(&base_slug)
-            .map(|m| m.models)
-            .unwrap_or(&[])
+        meta.base
+            .models()
             .iter()
             .flat_map(|entry| entry.prefixes.iter())
             .map(|prefix| format!("{slug}/{prefix}"))
@@ -577,7 +586,7 @@ pub fn discovered_slugs() -> Vec<&'static str> {
     discover().iter().map(|m| m.slug.as_str()).collect()
 }
 
-pub fn base_for_slug(slug: &str) -> Option<ProviderKind> {
+pub fn base_for_slug(slug: &str) -> Option<&'static ProviderSpec> {
     find_meta(slug).map(|m| m.base)
 }
 
@@ -598,32 +607,90 @@ pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
 }
 
 struct DynamicProvider {
+    slug: &'static str,
     script_path: &'static Path,
     inner: Box<dyn Provider>,
     auth: Arc<Mutex<ResolvedAuth>>,
     models: &'static [ScriptModel],
+    refresh_gate: &'static RefreshGate,
 }
 
-impl DynamicProvider {
-    fn run_auth_script(&self, subcommand: &'static str) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async move {
-            let script_path = self.script_path;
-            let auth = self.auth.clone();
-            smol::unblock(move || {
-                let stdout = run_script(script_path, subcommand, SCRIPT_TIMEOUT)?;
-                let parsed: ScriptResolvedAuth =
-                    serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
-                        message: format!(
-                            "{} {subcommand}: invalid JSON: {e}",
-                            script_path.display()
-                        ),
-                    })?;
-                *auth.lock().unwrap() = parsed.into();
-                Ok(())
-            })
-            .await
-        })
+/// Gate around the auth script's `refresh`. Every `create` mints a fresh
+/// `DynamicProvider`, so sub-agents running their own model would each spend
+/// the script's rotating refresh token, and a spent one taken twice costs the
+/// whole token family. They queue here instead, and the late arrival takes the
+/// credentials the winner brought back. That is why the gate hangs off the
+/// `'static` per-slug metadata rather than the provider.
+#[derive(Default)]
+struct RefreshGate {
+    lock: smol::lock::Mutex<()>,
+    winner: Mutex<Winner>,
+}
+
+/// A refresh can hand back byte-identical credentials, so the count, not the
+/// bytes, is what tells a parked caller the work is already done. Both live
+/// under one lock so they cannot be read apart.
+#[derive(Default, Clone)]
+struct Winner {
+    refreshes: u64,
+    auth: Option<ResolvedAuth>,
+}
+
+impl RefreshGate {
+    async fn refresh(
+        &self,
+        slug: &str,
+        script_path: &Path,
+        auth: &Arc<Mutex<ResolvedAuth>>,
+    ) -> Result<(), AgentError> {
+        let before = self.winner.lock().unwrap().refreshes;
+        let _guard = self.lock.lock().await;
+        let winner = self.winner.lock().unwrap().clone();
+        if winner.refreshes != before {
+            debug!("peer refreshed while we waited, skipping script run");
+            if let Some(fresh) = winner.auth {
+                *auth.lock().unwrap() = fresh;
+            }
+            return Ok(());
+        }
+        run_auth_script(slug, script_path, auth, "refresh").await?;
+        *self.winner.lock().unwrap() = Winner {
+            refreshes: before + 1,
+            auth: Some(auth.lock().unwrap().clone()),
+        };
+        Ok(())
     }
+}
+
+async fn run_auth_script(
+    slug: &str,
+    script_path: &Path,
+    auth: &Arc<Mutex<ResolvedAuth>>,
+    subcommand: &'static str,
+) -> Result<(), AgentError> {
+    let script_path = script_path.to_path_buf();
+    let auth = auth.clone();
+    let slug = slug.to_string();
+    smol::unblock(move || {
+        // `reload` only re-reads what a login wrote, so it spends no token and
+        // must not park the ui behind someone else's refresh.
+        let _lock = (subcommand != RELOAD_SUBCOMMAND).then(|| lock_exclusive(&script_path));
+        let stdout = run_script(&script_path, subcommand, SCRIPT_TIMEOUT)?;
+        let parsed: ScriptResolvedAuth =
+            serde_json::from_str(&stdout).map_err(|e| AgentError::Config {
+                message: format!("{} {subcommand}: invalid JSON: {e}", script_path.display()),
+            })?;
+        let mut fresh = parsed.into_resolved(&slug)?;
+        let mut guard = auth.lock().unwrap();
+        // A script that omits base_url keeps the resolved one; falling back to
+        // the provider's default origin would silently repoint the token.
+        if fresh.base_url.is_none() {
+            fresh.base_url = guard.base_url.take();
+        }
+        *guard = fresh;
+        Ok(())
+    })
+    .await
 }
 
 impl Provider for DynamicProvider {
@@ -637,8 +704,57 @@ impl Provider for DynamicProvider {
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        self.inner
-            .stream_message(model, messages, system, tools, event_tx, opts, session_id)
+        Box::pin(async move {
+            // First attempt streams through a counting relay: a 401 is only
+            // retried when it preceded every event. Replaying deltas onto a
+            // channel that already delivered part of the answer would
+            // duplicate text in the UI and, after a cancel, in the history.
+            let (tx, rx) = flume::unbounded();
+            let attempt = async {
+                let result = self
+                    .inner
+                    .stream_message(model, messages, system, tools, &tx, opts, session_id)
+                    .await;
+                drop(tx);
+                result
+            };
+            let forward = async move {
+                let mut forwarded = 0usize;
+                while let Ok(ev) = rx.recv_async().await {
+                    forwarded += 1;
+                    if event_tx.send_async(ev).await.is_err() {
+                        break;
+                    }
+                }
+                forwarded
+            };
+            let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
+            match result {
+                // The script mints credentials without the user, so an expired
+                // token costs one silent refresh instead of a re-login prompt.
+                Err(e) if e.is_auth_error() && forwarded == 0 => {
+                    debug!(error = %e, "auth error, refreshing script-backed credentials");
+                    match self
+                        .refresh_gate
+                        .refresh(self.slug, self.script_path, &self.auth)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.inner
+                                .stream_message(
+                                    model, messages, system, tools, event_tx, opts, session_id,
+                                )
+                                .await
+                        }
+                        Err(refresh_err) => {
+                            warn!(error = %refresh_err, "silent refresh failed, falling back to re-login");
+                            Err(e)
+                        }
+                    }
+                }
+                result => result,
+            }
+        })
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -664,11 +780,21 @@ impl Provider for DynamicProvider {
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.run_auth_script("refresh")
+        Box::pin(
+            self.refresh_gate
+                .refresh(self.slug, self.script_path, &self.auth),
+        )
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.run_auth_script("reload")
+        // Deliberately ungated: this runs under block_on on the ui thread, and
+        // parking it behind someone else's slow refresh script freezes the ui.
+        Box::pin(run_auth_script(
+            self.slug,
+            self.script_path,
+            &self.auth,
+            RELOAD_SUBCOMMAND,
+        ))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -689,6 +815,13 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
+    const TEST_SLUG: &str = "script-provider";
+
+    #[cfg(unix)]
+    const STALE_TOKEN: &str = "Bearer stale";
+    #[cfg(unix)]
+    const CONSTANT_TOKEN: &str = "Bearer constant";
+
     #[test_case("myslug", true ; "valid_simple")]
     #[test_case("my-slug", true ; "valid_hyphen")]
     #[test_case("my_slug", true ; "valid_underscore")]
@@ -706,16 +839,18 @@ mod tests {
     fn script_resolved_auth_deserialization() {
         let with_base =
             r#"{"base_url": "https://example.com", "headers": {"authorization": "Bearer tok"}}"#;
-        let resolved: ResolvedAuth = serde_json::from_str::<ScriptResolvedAuth>(with_base)
+        let resolved = serde_json::from_str::<ScriptResolvedAuth>(with_base)
             .unwrap()
-            .into();
+            .into_resolved(TEST_SLUG)
+            .unwrap();
         assert_eq!(resolved.base_url.as_deref(), Some("https://example.com"));
         assert_eq!(resolved.headers[0].1, "Bearer tok");
 
         let without_base = r#"{"headers": {"authorization": "Bearer x"}}"#;
-        let resolved: ResolvedAuth = serde_json::from_str::<ScriptResolvedAuth>(without_base)
+        let resolved = serde_json::from_str::<ScriptResolvedAuth>(without_base)
             .unwrap()
-            .into();
+            .into_resolved(TEST_SLUG)
+            .unwrap();
         assert!(resolved.base_url.is_none());
     }
 
@@ -735,12 +870,21 @@ mod tests {
 
     #[test]
     fn script_model_deserialization() {
-        let full = r#"{"id": "my-model", "tier": "strong", "supports_tool_examples": true, "max_output_tokens": 32000, "context_window": 200000, "pricing": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}}"#;
+        let full = r#"{"id": "my-model", "tier": "strong", "supports_tool_examples": true, "max_output_tokens": 32000, "context_window": 200000, "pricing": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}, "thinking_fields": {"adaptive": {"reasoning_effort": "medium"}, "low": {"reasoning_effort": "low"}}}"#;
         let model: ScriptModel = serde_json::from_str(full).unwrap();
         assert_eq!(model.id, "my-model");
         assert_eq!(model.tier, ModelTier::Strong);
         assert_eq!(model.supports_tool_examples, Some(true));
         assert!(model.pricing.is_some());
+        let base = ProviderRegistry::get(LLAMACPP.slug).unwrap();
+        let resolved = model.to_model("dynamic", base, model.id.clone(), model.tier);
+        let mut body = serde_json::json!({});
+        crate::ThinkingConfig::Adaptive.apply_thinking(
+            &mut body,
+            &resolved,
+            crate::types::ThinkingFallback::BudgetField,
+        );
+        assert_eq!(body, serde_json::json!({"reasoning_effort": "medium"}));
 
         let minimal: ScriptModel = serde_json::from_str(r#"{"id": "custom-v1"}"#).unwrap();
         assert_eq!(minimal.tier, ModelTier::Medium);
@@ -748,6 +892,26 @@ mod tests {
         assert_eq!(minimal.max_output_tokens, 16384);
         assert_eq!(minimal.context_window, 128_000);
         assert!(minimal.pricing.is_none());
+        assert!(minimal.thinking_fields.is_none());
+    }
+
+    #[test]
+    fn bad_thinking_fields_keeps_the_model() {
+        let described = ScriptDescription {
+            modified_ns: 0,
+            size: 0,
+            info: r#"{"display_name": "T", "base": "llama-cpp", "has_auth": false}"#.into(),
+            models: Some(
+                r#"[{"id": "typo", "thinking_fields": {"hight": {"reasoning_effort": "high"}}},
+                    {"id": "broken", "tier": 7},
+                    {"id": "good"}]"#
+                    .into(),
+            ),
+        };
+        let meta = build_meta("t".into(), PathBuf::new(), &described).unwrap();
+        let ids: Vec<&str> = meta.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["typo", "good"]);
+        assert!(meta.models[0].thinking_fields.is_none());
     }
 
     #[cfg(unix)]
@@ -777,7 +941,7 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].slug, "test-provider");
         assert_eq!(providers[0].display_name, "Test");
-        assert_eq!(providers[0].base, ProviderKind::Anthropic);
+        assert_eq!(providers[0].base.slug, "anthropic");
         assert!(providers[0].has_auth);
         assert!(providers[0].models.is_empty());
     }
@@ -817,6 +981,87 @@ esac
         assert_eq!(providers[0].models[0].tier, ModelTier::Strong);
     }
 
+    /// Writes a `refresh` script that counts its runs in `counter`. A rotating
+    /// script hands back a new token every run; a non-rotating one repeats the
+    /// same bytes, which is how we pin down that the gate trusts its counter and
+    /// not a diff of the credentials.
+    #[cfg(unix)]
+    fn write_counting_refresh_script(dir: &Path, counter: &Path, rotating: bool) -> PathBuf {
+        let path = dir.join("counting-provider");
+        let token = if rotating {
+            "Bearer refreshed-$n"
+        } else {
+            CONSTANT_TOKEN
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = refresh ] || exit 1\n\
+             n=$(( $(cat '{c}' 2>/dev/null || echo 0) + 1 ))\n\
+             echo \"$n\" > '{c}'\n\
+             printf '{{\"headers\": {{\"authorization\": \"%s\"}}}}' \"{token}\"\n",
+            c = counter.display()
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn script_runs(counter: &Path) -> u32 {
+        fs::read_to_string(counter).unwrap().trim().parse().unwrap()
+    }
+
+    /// Two auth slots, because sub-agents on one slug each build their own
+    /// provider and only the gate is shared. Both have to come out holding the
+    /// winner's token, since a second run would spend the rotating refresh
+    /// token again.
+    #[cfg(unix)]
+    #[test_case(true, "Bearer refreshed-2" ; "rotating_token")]
+    #[test_case(false, CONSTANT_TOKEN ; "unchanged_token")]
+    fn refresh_gate_single_flights_concurrent_callers(rotating: bool, final_token: &str) {
+        let tmp = TempDir::new().unwrap();
+        let counter = tmp.path().join("count");
+        let script = write_counting_refresh_script(tmp.path(), &counter, rotating);
+        let stale = || {
+            Arc::new(Mutex::new(ResolvedAuth::for_test(
+                None,
+                vec![("authorization".into(), STALE_TOKEN.into())],
+            )))
+        };
+        let (first, second) = (stale(), stale());
+        let gate = RefreshGate::default();
+
+        smol::block_on(async {
+            let (a, b) = futures_lite::future::zip(
+                gate.refresh(TEST_SLUG, &script, &first),
+                gate.refresh(TEST_SLUG, &script, &second),
+            )
+            .await;
+            a.unwrap();
+            b.unwrap();
+
+            assert_eq!(
+                script_runs(&counter),
+                1,
+                "concurrent 401s share one script run"
+            );
+            let winner = first.lock().unwrap().headers[0].1.clone();
+            assert_ne!(winner, STALE_TOKEN);
+            assert_eq!(second.lock().unwrap().headers[0].1, winner);
+
+            // The late caller snapshots the count before locking, so a refresh
+            // that overlaps nobody still runs the script.
+            gate.refresh(TEST_SLUG, &script, &first).await.unwrap();
+        });
+
+        assert_eq!(
+            script_runs(&counter),
+            2,
+            "a refresh that overlaps nobody runs the script again"
+        );
+        assert_eq!(first.lock().unwrap().headers[0].1, final_token);
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_script_error_on_bad_subcommand() {
@@ -833,19 +1078,20 @@ esac
     }
 
     #[cfg(unix)]
-    #[test_case("ollama", ProviderKind::Ollama ; "base_ollama")]
-    #[test_case("llama-cpp", ProviderKind::LlamaCpp ; "base_llama_cpp")]
-    #[test_case("mistral", ProviderKind::Mistral ; "base_mistral")]
-    #[test_case("zai", ProviderKind::Zai ; "base_zai")]
-    #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
-    #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
-    #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
-    fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
+    #[test_case("ollama" ; "base_ollama")]
+    #[test_case("llama-cpp" ; "base_llama_cpp")]
+    #[test_case("mistral" ; "base_mistral")]
+    #[test_case("zai" ; "base_zai")]
+    #[test_case("synthetic" ; "base_synthetic")]
+    #[test_case("deepseek" ; "base_deepseek")]
+    #[test_case("opencode" ; "base_opencode")]
+    #[test_case("xai" ; "base_xai")]
+    fn discover_accepts_all_bases(base: &str) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
         write_script(tmp.path(), "custom-test", &info);
         let providers = discover_in(tmp.path());
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].base, expected);
+        assert_eq!(providers[0].base.slug, base);
     }
 }

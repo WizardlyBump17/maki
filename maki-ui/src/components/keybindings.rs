@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::fmt::Write;
 use strum::EnumIter;
 use unicode_width::UnicodeWidthStr;
 
@@ -129,10 +128,19 @@ pub mod key {
 
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
-    pub const PREV_CHAT: Bind = ctrl_bind!('p');
-    pub const NEXT_CHAT: Bind = ctrl_bind!('n');
+    pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
+    pub const SCROLL_PAGE_UP: Bind = Bind {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        label: "PageUp",
+    };
+    pub const SCROLL_PAGE_DOWN: Bind = Bind {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        label: "PageDown",
+    };
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
@@ -143,7 +151,7 @@ pub mod key {
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const TASKS: Bind = ctrl_bind!('x');
+    pub const MODEL_PICKER: Bind = ctrl_bind!('m');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -164,7 +172,6 @@ pub enum KeybindContext {
     Streaming,
     Picker,
     FormInput,
-    TaskPicker,
     RewindPicker,
     ThemePicker,
     ModelPicker,
@@ -182,7 +189,6 @@ impl KeybindContext {
             Self::Streaming => "While Streaming",
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
-            Self::TaskPicker => "Task Picker",
             Self::RewindPicker => "Rewind Picker",
             Self::ThemePicker => "Theme Picker",
             Self::ModelPicker => "Model Picker",
@@ -195,8 +201,7 @@ impl KeybindContext {
 
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
-            Self::TaskPicker
-            | Self::RewindPicker
+            Self::RewindPicker
             | Self::ThemePicker
             | Self::ModelPicker
             | Self::QueueFocus
@@ -316,12 +321,6 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Alt(key::NEXT_CHAT.label, key::PREV_CHAT.label),
-        description: "Next / previous task chat",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
         label: KeyLabel::Single(key::SEARCH.label),
         description: "Search messages",
         context: KeybindContext::General,
@@ -346,8 +345,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::TASKS.label),
-        description: "Open tasks",
+        label: KeyLabel::Single(key::MODEL_PICKER.label),
+        description: "Model picker",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -423,6 +422,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
         description: "Scroll half page up / down",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
+        description: "Scroll page up / down",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -524,7 +529,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        description: "Scroll page up / down",
+        description: "Scroll half page up / down",
         context: KeybindContext::Picker,
         platform: Platform::All,
     },
@@ -553,64 +558,10 @@ pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
     KeybindContext::iter()
 }
 
-pub(crate) fn key_event_to_string(key: &KeyEvent) -> String {
-    let mut s = String::new();
-    let mods = key.modifiers;
-    let is_char = matches!(key.code, KeyCode::Char(_));
-    if mods.contains(KeyModifiers::CONTROL) {
-        s.push_str("ctrl+");
-    }
-    if mods.contains(KeyModifiers::ALT) {
-        s.push_str("alt+");
-    }
-    if mods.contains(KeyModifiers::SHIFT) && !is_char {
-        s.push_str("shift+");
-    }
-    match key.code {
-        KeyCode::Char(' ') => s.push_str("space"),
-        KeyCode::Char(c) => s.push(c),
-        KeyCode::Enter => s.push_str("enter"),
-        KeyCode::Esc => s.push_str("esc"),
-        KeyCode::Tab => s.push_str("tab"),
-        KeyCode::BackTab => {
-            if !s.contains("shift+") {
-                s.insert_str(0, "shift+");
-            }
-            s.push_str("tab");
-        }
-        KeyCode::Backspace => s.push_str("backspace"),
-        KeyCode::Delete => s.push_str("delete"),
-        KeyCode::Up => s.push_str("up"),
-        KeyCode::Down => s.push_str("down"),
-        KeyCode::Left => s.push_str("left"),
-        KeyCode::Right => s.push_str("right"),
-        KeyCode::Home => s.push_str("home"),
-        KeyCode::End => s.push_str("end"),
-        KeyCode::PageUp => s.push_str("pageup"),
-        KeyCode::PageDown => s.push_str("pagedown"),
-        KeyCode::F(n) => write!(s, "f{n}").unwrap(),
-        KeyCode::Insert => s.push_str("insert"),
-        _ => {}
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
-    use test_case::test_case;
-
-    #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]
-    #[test_case(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x")]
-    #[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), "shift+tab")]
-    #[test_case(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), "shift+tab")]
-    #[test_case(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), "space")]
-    #[test_case(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), "f5")]
-    #[test_case(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), "a")]
-    fn key_event_to_string_cases(input: KeyEvent, expected: &str) {
-        assert_eq!(key_event_to_string(&input), expected);
-    }
 
     #[test]
     fn bind_requires_exact_modifiers() {

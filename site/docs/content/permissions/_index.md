@@ -9,13 +9,23 @@ group = "Reference"
 
 Maki uses a permission system to decide what each tool is allowed to do and when to ask you first.
 
-Rules come from three layers, combined for resolution:
+Whether a project's `.maki` configuration loads at all is a separate question,
+answered once per folder. See [folder trust](/docs/folder-trust/).
+
+## Rule Layers
+
+Rules come from four layers, combined for resolution:
 
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
+4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/docs/lua-api/#maki-api-register_permission_rule)
 
-Any matching deny blocks the tool. No exceptions.
+Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
+
+A [`tool.<name>.input` hook](/docs/hooks/) runs before any of this. Rules are
+resolved against the call as the hook left it, so what the prompt shows you is
+what runs.
 
 ## Check Flow
 
@@ -36,7 +46,7 @@ plan file write?    ── yes ──►  runs
 default: prompt / allow / deny
 ```
 
-Deny rules are checked across all three layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow; this applies to the file-write tools only. All other tools, including MCP tools, follow the check flow below as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
@@ -47,9 +57,11 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `write` | `<cwd>/**` | Outside cwd requires permission |
 | `edit` | `<cwd>/**` | Outside cwd requires permission |
 | `multiedit` | `<cwd>/**` | Outside cwd requires permission |
-| `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
+| `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
+
+The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 
 These tools have no builtin allow rule, so they prompt (or follow your `default`) every time unless you add rules:
 
@@ -66,7 +78,11 @@ Container tools like `batch` and `code_execution` prompt for each inner tool ind
 There are two permission files:
 
 - **Global**: `~/.config/maki/permissions.toml`
-- **Project**: `.maki/permissions.toml` (takes precedence over global)
+- **Project**: `.maki/permissions.toml` in the active Git checkout, or in the
+  working directory outside Git (takes precedence over global)
+
+The project file's `deny` scopes always apply. The rest of it waits on
+[folder trust](/docs/folder-trust/).
 
 ```toml
 default = "deny"
@@ -109,7 +125,10 @@ allow = ["cargo *"]
 
 Here everything is denied by default, except `bash` which still prompts, and `cargo *` commands which are allowed.
 
-Project files **cannot** set `default = "allow"` (top-level, per-tool, or MCP). That value is ignored so a project cannot grant itself full access. Project **allow lists** still work. Put `default = "allow"` only in the global file.
+Project files **cannot** set `default = "allow"` (top-level, per-tool, or MCP).
+That value is ignored so a repository cannot grant itself full access. Project
+**allow lists** work once the folder is [trusted](/docs/folder-trust/). Put
+`default = "allow"` only in the global file.
 
 ## Scope Patterns
 
@@ -150,10 +169,18 @@ When a gated tool needs permission, Maki asks you.
 | `a` | Always allow for this project (confirm; saved to `.maki/permissions.toml`) |
 | `A` | Always allow globally (confirm; saved to `~/.config/maki/permissions.toml`) |
 | `n` | Open deny guidance editor (type optional guidance, then `Enter` to deny once; `Esc` cancels) |
-| `d` | Deny always for this project (confirm) |
+| `d` | Deny always for this project (confirm; saved to `.maki/permissions.toml`) |
 | `D` | Deny always globally (confirm) |
 
 Session and always-allow / always-deny choices need a second key (`Enter` or `y`) so a fat-finger does not rewrite your rules. Deny-once with `n` lets you type a short reason the agent will see.
+
+The keys are the same in a folder you have not
+[trusted](/docs/folder-trust/), where `a` and `d` last for the session instead
+of reaching `.maki/permissions.toml`.
+
+ACP clients offer the four options the protocol defines. "Allow always" lasts
+for the session, and "Reject always" is a project answer that follows folder
+trust like the TUI, reading "Reject for this session" in an untrusted folder.
 
 ### Scope Generalization
 
@@ -168,7 +195,7 @@ For MCP tools, both allow and deny decisions generalize to `*` (the entire tool)
 
 ## YOLO Mode
 
-To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. Tools that never declare permission scopes are unaffected (they never prompted).
+To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. The status bar shows `[yolo]` while it is on, and `/yolo` is stored with the session, so a resume comes back the same way. `--yolo` only sets the starting value for sessions you never toggled. Tools that never declare permission scopes are unaffected (they never prompted).
 
 To start in YOLO mode every time:
 
@@ -191,6 +218,19 @@ Some constructs are too complex to analyze statically, so they always trigger a 
 - Arithmetic expansion: `$((...))`
 
 Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when possible; they do not by themselves force a prompt the way substitutions do.
+
+## Plugin Permissions
+
+Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/docs/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+
+It runs after [folder trust](/docs/folder-trust/) has let the Lua file load, and
+limits which APIs the file reaches rather than sandboxing the file.
+
+## Network Addresses
+
+`webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
+
+To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
 ## Session Persistence
 

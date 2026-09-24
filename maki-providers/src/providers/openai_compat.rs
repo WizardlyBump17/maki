@@ -1,9 +1,12 @@
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use serde::Deserialize;
+use maki_storage::id::MakiId;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -13,6 +16,25 @@ use crate::{
 };
 
 const STREAM_DONE: &str = "[DONE]";
+/// `tool_calls[].index` comes straight off the wire; a bogus huge value must
+/// not size the accumulator vec.
+const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
+const UNNAMED_TOOL_ID_PREFIX: &str = "maki_unnamed_";
+/// How much of the `MakiId` ends up in every minted tool id. Taken off the
+/// tail, where the UUIDv7 keeps its random bytes (the head is the timestamp),
+/// and kept short so ids stay readable in logs.
+const PROCESS_TAG_LEN: usize = 8;
+/// The listing every OpenAI compatible API serves, relative to the base URL.
+/// Providers with a second catalog pass their own path instead.
+pub(crate) const MODELS_PATH: &str = "/models";
+static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
+/// Minted once per process: the counter alone restarts at 0 on every run, so a
+/// session resumed with `--continue` would mint ids that already exist in its
+/// own transcript.
+static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
+    let id = MakiId::generate().to_string();
+    id[id.len() - PROCESS_TAG_LEN..].to_owned()
+});
 
 pub(crate) struct OpenAiCompatConfig {
     pub slug: &'static str,
@@ -122,7 +144,7 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
-        if let Some(max_output) = model.max_output_tokens {
+        if let Some(max_output) = model.output_tokens() {
             body[self.config.max_tokens_field] = json!(max_output);
         }
         if self.config.include_stream_usage {
@@ -137,7 +159,7 @@ impl OpenAiCompatProvider {
     /// Effective base URL: an auth-supplied value (dynamic/custom providers)
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
-    fn base_url(&self, auth: &ResolvedAuth) -> String {
+    pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
         if let Some(explicit) = auth.base_url.as_deref() {
             return explicit.to_string();
         }
@@ -200,13 +222,16 @@ impl OpenAiCompatProvider {
         }
     }
 
+    /// Parses the `data` array served at `{base}{path}`, keeping the entries
+    /// `parse_fn` accepts. `path` is [`MODELS_PATH`] for most providers.
     pub async fn fetch_and_parse_models(
         &self,
         auth: &ResolvedAuth,
+        path: &str,
         parse_fn: impl Fn(&Value) -> Option<crate::model::ModelInfo>,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
         let base = self.base_url(auth);
-        let url = format!("{base}/models");
+        let url = format!("{base}{path}");
         let body_text = self.get_text(auth, &url).await?;
         let body: Value = serde_json::from_str(&body_text)?;
 
@@ -233,23 +258,20 @@ impl OpenAiCompatProvider {
             .as_array()
             .map(|mods| mods.iter().any(|v| v.as_str() == Some("image")));
         let pricing = m["pricing"].as_object().and_then(|p| {
-            Some(crate::model::ModelPricing {
-                input: p.get("prompt")?.as_str()?.parse().ok()?,
-                output: p.get("completion")?.as_str()?.parse().ok()?,
-                cache_write: p
-                    .get("cache_creation")?
+            Some(crate::model::ModelPricing::per_million(
+                p.get("prompt")?.as_str()?.parse().ok()?,
+                p.get("completion")?.as_str()?.parse().ok()?,
+                p.get("cache_creation")?
                     .as_str()?
                     .parse::<f64>()
                     .ok()
                     .unwrap_or(0.0),
-                cache_read: p
-                    .get("cache_read")?
+                p.get("cache_read")?
                     .as_str()?
                     .parse::<f64>()
                     .ok()
                     .unwrap_or(0.0),
-                fast: None,
-            })
+            ))
         });
         Some(crate::model::ModelInfo {
             id: id.to_string(),
@@ -267,7 +289,7 @@ impl OpenAiCompatProvider {
         &self,
         auth: &ResolvedAuth,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        self.fetch_and_parse_models(auth, Self::default_model_parser)
+        self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
 }
@@ -370,6 +392,17 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
     out
 }
 
+/// A tool can reach us without a usable `input_schema`. Dropping it would take
+/// the tool away from the model behind its back, and `{}` makes strict providers
+/// (MiniMax, Kimi) reject the whole request, so it ships a schema that takes no
+/// arguments.
+pub(crate) fn tool_parameters(tool: &Value) -> Value {
+    match tool.get("input_schema") {
+        Some(schema) if schema.is_object() => schema.clone(),
+        _ => json!({ "type": "object", "properties": {} }),
+    }
+}
+
 pub fn convert_tools(anthropic_tools: &Value) -> Value {
     let Some(tools) = anthropic_tools.as_array() else {
         return json!([]);
@@ -384,7 +417,7 @@ pub fn convert_tools(anthropic_tools: &Value) -> Value {
                     "function": {
                         "name": t.get("name")?,
                         "description": t.get("description")?,
-                        "parameters": t.get("input_schema")?,
+                        "parameters": tool_parameters(t),
                     }
                 }))
             })
@@ -466,6 +499,21 @@ struct ChunkUsage {
     /// DeepSeek reports cache hits here instead of `prompt_tokens_details`.
     #[serde(default)]
     prompt_cache_hit_tokens: u32,
+    /// What the request billed, which routers like OpenRouter attach to usage.
+    #[serde(default, deserialize_with = "lenient_cost")]
+    cost: Option<f64>,
+}
+
+/// No standard covers `cost`, so a gateway may quote it as a string or in a
+/// shape we have never seen. A chunk we cannot parse is dropped whole, and this
+/// is the chunk carrying the turn's token counts, so reading the price has to
+/// be allowed to fail on its own.
+fn lenient_cost<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.parse().ok(),
+        _ => None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -479,6 +527,28 @@ struct ToolAccumulator {
     id: String,
     name: String,
     arguments: String,
+}
+
+impl ToolAccumulator {
+    /// Plenty of providers never send a tool call id, so we hand out our own the
+    /// moment the call shows up instead of at the end of the stream, which is
+    /// what lets `ToolUseStart` carry an id the agent can match against the
+    /// finished call. The counter is process wide because a parent turn and a
+    /// subagent turn stream side by side, and numbering per response had both of
+    /// them mint `maki_unnamed_0`. The per-process tag extends that uniqueness
+    /// across runs, so resuming a session cannot re-mint an id its transcript
+    /// already carries.
+    fn new() -> Self {
+        Self {
+            id: format!(
+                "{UNNAMED_TOOL_ID_PREFIX}{}_{}",
+                *PROCESS_TAG,
+                NEXT_UNNAMED_TOOL_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+            name: String::new(),
+            arguments: String::new(),
+        }
+    }
 }
 
 pub async fn parse_sse(
@@ -531,6 +601,7 @@ pub async fn parse_sse(
                 output: u.completion_tokens,
                 cache_read: cached,
                 cache_creation: 0,
+                cost: u.cost,
             };
         }
 
@@ -618,20 +689,24 @@ pub async fn parse_sse(
 
         if let Some(tc_deltas) = delta.tool_calls {
             for tc in tc_deltas {
+                if tc.index >= MAX_TOOL_CALLS_PER_MESSAGE {
+                    warn!(index = tc.index, "ignoring out-of-range tool call index");
+                    continue;
+                }
                 while tool_accumulators.len() <= tc.index {
-                    tool_accumulators.push(ToolAccumulator {
-                        id: String::new(),
-                        name: String::new(),
-                        arguments: String::new(),
-                    });
+                    tool_accumulators.push(ToolAccumulator::new());
                 }
                 let acc = &mut tool_accumulators[tc.index];
                 let was_unnamed = acc.name.is_empty();
-                if let Some(id) = tc.id {
+                // An "" id off the wire is no id at all, and it must not wipe ours.
+                if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
                     acc.id = id;
                 }
+                // GLM-5.2 via Mistral sends "" names in subsequent chunks; skip to keep the accumulated name.
                 if let Some(func) = tc.function {
-                    if let Some(name) = func.name {
+                    if let Some(name) = func.name
+                        && !name.is_empty()
+                    {
                         acc.name = name;
                     }
                     if let Some(args) = func.arguments {
@@ -663,7 +738,7 @@ pub async fn parse_sse(
         content_blocks.push(ContentBlock::Text { text });
     }
 
-    for (idx, acc) in tool_accumulators.into_iter().enumerate() {
+    for acc in tool_accumulators {
         let input: Value = match serde_json::from_str(&acc.arguments) {
             Ok(v) => {
                 debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
@@ -674,19 +749,13 @@ pub async fn parse_sse(
                 Value::Object(Default::default())
             }
         };
-        let id = if acc.id.is_empty() {
-            warn!(raw_name = %acc.name, raw_args = %acc.arguments, "provider sent empty tool_use id; substituting placeholder");
-            format!("maki_unnamed_{idx}")
-        } else {
-            acc.id
-        };
         let name = if acc.name.is_empty() {
-            warn!(%id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
+            warn!(id = %acc.id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
             "maki_unknown_tool".to_owned()
         } else {
             acc.name
         };
-        content_blocks.push(ContentBlock::tool_use(id, name, input));
+        content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
     }
 
     Ok(StreamResponse {
@@ -707,6 +776,37 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const COUNTS_SURVIVE_A_BAD_COST: &str =
+        "a price we cannot read must not take the token counts down with it";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+    const RESPONSES: usize = 2;
+    const TOOLS_PER_RESPONSE: usize = 2;
+    const TWO_UNNAMED_TOOL_CALLS_SSE: &str = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}},{\"index\":1,\"function\":{\"name\":\"glob\",\"arguments\":\"{}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\
+\n\
+data: [DONE]\n";
+    const IDS_MUST_DIFFER: &str =
+        "two turns streaming at once must not land on the same synthetic id";
+    const PENDING_ID_MUST_MATCH: &str =
+        "the id streamed as the call starts must match the finished tool call";
+    const PREFIX_MUST_SURVIVE: &str = "everything that recognises a minted id keys off the prefix";
+    const TAG_MUST_BE_PER_PROCESS: &str =
+        "the tag separates runs of the same session, so it is stable within a process";
+
+    #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION}) ; "missing_schema")]
+    #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION, "input_schema": null}) ; "null_schema")]
+    fn convert_tools_defaults_missing_parameters(tool: Value) {
+        let function = &convert_tools(&json!([tool]))[0]["function"];
+        assert_eq!(function["name"], json!(TOOL_NAME), "{TOOL_MUST_SURVIVE}");
+        assert_eq!(
+            function["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
 
     #[test]
     fn default_model_parser_reads_context_and_output_length() {
@@ -782,6 +882,32 @@ data: [DONE]\n";
             assert_eq!(resp.usage.input, 20);
             assert_eq!(resp.usage.cache_read, 80);
             assert_eq!(resp.usage.output, 10);
+        })
+    }
+
+    /// OpenRouter quotes the bill on the same chunk as the token counts, so the
+    /// counts have to come through whatever it says the price is.
+    #[test_case(json!(0.00045), Some(0.00045)   ; "number")]
+    #[test_case(json!("0.00045"), Some(0.00045) ; "quoted_number")]
+    #[test_case(json!("free"), None             ; "unparsable_string")]
+    #[test_case(json!({"usd": 0.00045}), None   ; "unknown_shape")]
+    #[test_case(json!(null), None               ; "null")]
+    fn parse_sse_cost_from_usage(cost: Value, expected: Option<f64>) {
+        smol::block_on(async {
+            let chunk = json!({
+                "choices": [{"finish_reason": "stop", "delta": {}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10, "cost": cost},
+            });
+            let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
+            assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
+            assert_eq!(resp.usage.cost, expected);
         })
     }
 
@@ -986,7 +1112,9 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
                 .unwrap_err();
 
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Server overloaded");
                 }
@@ -1018,6 +1146,61 @@ data: [DONE]\n";
     }
 
     #[test]
+    fn parse_sse_unnamed_tool_ids_never_repeat() {
+        smol::block_on(async {
+            let mut minted = Vec::new();
+            for _ in 0..RESPONSES {
+                let (tx, rx) = flume::unbounded();
+                let resp = parse_sse(
+                    Cursor::new(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()),
+                    &tx,
+                    TEST_STREAM_TIMEOUT,
+                )
+                .await
+                .unwrap();
+
+                let ids: Vec<String> = resp
+                    .message
+                    .tool_uses()
+                    .map(|(id, _, _)| id.to_owned())
+                    .collect();
+                assert_eq!(ids.len(), TOOLS_PER_RESPONSE);
+                let started: Vec<String> = rx
+                    .drain()
+                    .filter_map(|e| match e {
+                        ProviderEvent::ToolUseStart { id, .. } => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(started, ids, "{PENDING_ID_MUST_MATCH}");
+                minted.extend(ids);
+            }
+
+            let total = minted.len();
+            minted.sort();
+            minted.dedup();
+            assert_eq!(minted.len(), total, "{IDS_MUST_DIFFER}");
+        })
+    }
+
+    #[test]
+    fn minted_tool_ids_differ_and_carry_the_process_tag() {
+        let first = ToolAccumulator::new().id;
+        let second = ToolAccumulator::new().id;
+
+        assert_ne!(first, second, "{IDS_MUST_DIFFER}");
+        for id in [&first, &second] {
+            let tail = id
+                .strip_prefix(UNNAMED_TOOL_ID_PREFIX)
+                .unwrap_or_else(|| panic!("{PREFIX_MUST_SURVIVE}: {id}"));
+            let (tag, counter) = tail.split_once('_').expect("minted ids carry a counter");
+            assert_eq!(tag, *PROCESS_TAG, "{TAG_MUST_BE_PER_PROCESS}");
+            assert_eq!(tag.len(), PROCESS_TAG_LEN, "{TAG_MUST_BE_PER_PROCESS}");
+            assert!(counter.parse::<u64>().is_ok(), "{IDS_MUST_DIFFER}");
+        }
+    }
+
+    #[test]
     fn parse_sse_malformed_tool_json_yields_empty_object() {
         smol::block_on(async {
             let sse = "\
@@ -1038,6 +1221,34 @@ data: [DONE]\n";
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].1, "bash");
             assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        })
+    }
+
+    #[test]
+    fn parse_sse_empty_name_in_subsequent_chunks_preserves_first_name() {
+        // GLM-5.2 via Mistral sends the tool name in the first chunk and "" in
+        // subsequent chunks. The accumulated name must not be overwritten.
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc_1\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"path\\\": \\\"/tmp\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"/file\\\"}\"}}]}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "read");
+            assert_eq!(tools[0].2["path"], "/tmp/file");
         })
     }
 

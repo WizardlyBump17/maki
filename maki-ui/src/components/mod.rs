@@ -13,6 +13,7 @@ pub(crate) mod mcp_picker;
 pub mod messages;
 pub(crate) mod modal;
 pub(crate) mod model_picker;
+pub(crate) mod pack_review;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
@@ -33,8 +34,11 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
-use maki_providers::{Message, ModelTier};
+use maki_lua::{PackCommand, PackPlan};
+use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
+
+pub(crate) use maki_providers::IMAGE_PLACEHOLDER;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 
@@ -48,6 +52,12 @@ pub(crate) trait Overlay {
     /// Modal overlays block mouse interaction behind them.
     fn is_modal(&self) -> bool {
         true
+    }
+    /// Override when the overlay draws something that moves on the clock
+    /// alone, like a spinner or a reveal. `App::cadence` asks every overlay,
+    /// so this is the only place one has to say so.
+    fn cadence(&self) -> crate::repaint::Cadence {
+        crate::repaint::Cadence::IDLE
     }
 }
 
@@ -65,13 +75,6 @@ pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<
         spans.push(Span::styled(format!(" {}", desc.as_ref()), t.tool_dim));
     }
     Line::from(spans)
-}
-
-pub(crate) fn visual_line_count(text_len: usize, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    text_len.div_ceil(width).max(1)
 }
 
 pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
@@ -146,6 +149,8 @@ impl ModalScroll {
             KeyCode::Down => self.scroll(-1),
             _ if key::SCROLL_HALF_UP.matches(key_event) => self.scroll(self.half_page()),
             _ if key::SCROLL_HALF_DOWN.matches(key_event) => self.scroll(-self.half_page()),
+            _ if key::SCROLL_PAGE_UP.matches(key_event) => self.scroll(self.page()),
+            _ if key::SCROLL_PAGE_DOWN.matches(key_event) => self.scroll(-self.page()),
             _ if key::SCROLL_LINE_UP.matches(key_event) => self.scroll(1),
             _ if key::SCROLL_LINE_DOWN.matches(key_event) => self.scroll(-1),
             _ if key::SCROLL_TOP.matches(key_event) => {
@@ -165,20 +170,20 @@ impl ModalScroll {
         (self.viewport_h / 2).max(1) as i32
     }
 
+    fn page(&self) -> i32 {
+        self.viewport_h.max(1) as i32
+    }
+
     fn clamp(&mut self) {
         self.offset = self.offset.min(self.max_offset);
     }
-}
-
-pub struct LoadedSession {
-    pub messages: Vec<Message>,
-    pub model_spec: String,
 }
 
 use std::path::PathBuf;
 
 pub enum Action {
     SendMessage(Box<AgentInput>),
+    ManualExit,
     ShellCommand {
         id: String,
         command: String,
@@ -190,8 +195,9 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
-    NewSession,
-    LoadSession(Box<LoadedSession>),
+    /// The history under this runtime changed (reset, load, rewind), so the
+    /// agent has to be respawned on it.
+    RestartAgent(Vec<Message>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,
@@ -200,29 +206,31 @@ pub enum Action {
     UnassignTier(String, ModelTier),
     RefreshModels,
     RefreshUsage,
-    Compact,
+    Compact(Option<String>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
     Btw(String),
+    PreparePack(PackCommand),
     Suspend,
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExitRequest {
     #[default]
     None,
     Success,
     Error,
     Reload,
+    Pack(PackPlan),
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success | Self::Reload => 0,
+            Self::None | Self::Success | Self::Reload | Self::Pack(_) => 0,
             Self::Error => 1,
         }
     }
@@ -276,6 +284,7 @@ pub enum ToolStatus {
 pub struct DisplayMessage {
     pub role: DisplayRole,
     pub text: String,
+    pub images: Vec<ImageSource>,
     pub tool_input: Option<Arc<ToolInput>>,
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
@@ -296,6 +305,7 @@ impl DisplayMessage {
         Self {
             role,
             text,
+            images: Vec::new(),
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
@@ -312,10 +322,23 @@ impl DisplayMessage {
         }
     }
 
+    pub fn with_images(role: DisplayRole, text: String, images: Vec<ImageSource>) -> Self {
+        let text = if text.trim().is_empty() && !images.is_empty() {
+            IMAGE_PLACEHOLDER.into()
+        } else {
+            text
+        };
+        Self {
+            images,
+            ..Self::new(role, text)
+        }
+    }
+
     pub fn plan(text: String, plan_path: String) -> Self {
         Self {
             role: DisplayRole::Assistant,
             text,
+            images: Vec::new(),
             tool_input: None,
             tool_raw_input: None,
             tool_output: None,
@@ -372,13 +395,7 @@ pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
 
 #[cfg(test)]
 pub(crate) fn test_pricing() -> ModelPricing {
-    ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 3.75,
-        cache_read: 0.30,
-        fast: None,
-    }
+    ModelPricing::per_million(3.0, 15.0, 3.75, 0.30)
 }
 
 #[cfg(test)]
@@ -391,10 +408,24 @@ pub(crate) fn test_model() -> maki_providers::Model {
         supports_tool_examples_override: None,
         thinking_override: None,
         supports_vision_override: Some(true),
+        supports_fast_override: None,
         pricing: test_pricing(),
+        subsidised_by: None,
+        discovered_free: false,
         max_output_tokens: Some(8192),
+        turn_output_tokens: None,
         context_window: TEST_CONTEXT_WINDOW,
+        thinking_fields: None,
     }
+}
+
+/// Every symbol in the buffer, row by row, for `assert!(screen.contains(..))`.
+#[cfg(test)]
+pub(crate) fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+    buf.content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect()
 }
 
 #[cfg(test)]
@@ -442,14 +473,6 @@ mod tests {
             SNAPSHOT_GEN + 1
         };
         msg.snapshot_is_stale(current_gen)
-    }
-
-    #[test_case(0, 80, 1 ; "empty_text")]
-    #[test_case(0, 0, 1 ; "zero_width")]
-    #[test_case(5, 5, 1 ; "exact_fit")]
-    #[test_case(6, 5, 2 ; "one_char_overflow")]
-    fn visual_line_count_cases(text_len: usize, width: usize, expected: usize) {
-        assert_eq!(visual_line_count(text_len, width), expected);
     }
 
     #[test_case(10, 3, 7   ; "scroll_up")]

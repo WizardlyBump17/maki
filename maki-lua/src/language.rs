@@ -5,6 +5,7 @@ pub enum Language {
     Rust,
     Python,
     TypeScript,
+    Tsx,
     JavaScript,
     Gleam,
     Go,
@@ -23,6 +24,7 @@ pub enum Language {
     Elixir,
     Markdown,
     Starlark,
+    V,
     Zig,
     Nix,
     Dart,
@@ -34,6 +36,7 @@ pub enum Language {
     Hcl,
     Json,
     Make,
+    Clojure,
 }
 
 impl Language {
@@ -42,6 +45,7 @@ impl Language {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
             "typescript" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
             "javascript" => Some(Self::JavaScript),
             "gleam" => Some(Self::Gleam),
             "go" => Some(Self::Go),
@@ -60,6 +64,7 @@ impl Language {
             "elixir" => Some(Self::Elixir),
             "markdown" => Some(Self::Markdown),
             "starlark" => Some(Self::Starlark),
+            "v" => Some(Self::V),
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
             "dart" => Some(Self::Dart),
@@ -71,6 +76,7 @@ impl Language {
             "hcl" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "make" => Some(Self::Make),
+            "clojure" => Some(Self::Clojure),
             _ => None,
         }
     }
@@ -79,8 +85,9 @@ impl Language {
         match ext {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
-            "ts" | "tsx" => Some(Self::TypeScript),
-            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "ts" => Some(Self::TypeScript),
+            "tsx" | "jsx" => Some(Self::Tsx),
+            "js" | "mjs" | "cjs" => Some(Self::JavaScript),
             "gleam" => Some(Self::Gleam),
             "go" => Some(Self::Go),
             "html" | "htm" => Some(Self::Html),
@@ -98,6 +105,7 @@ impl Language {
             "ex" | "exs" => Some(Self::Elixir),
             "md" | "markdown" => Some(Self::Markdown),
             "bzl" => Some(Self::Starlark),
+            "v" => Some(Self::V),
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
             "dart" => Some(Self::Dart),
@@ -109,6 +117,7 @@ impl Language {
             "hcl" | "tf" | "tfvars" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "mk" => Some(Self::Make),
+            "clj" | "cljs" | "cljc" | "bb" => Some(Self::Clojure),
             _ => None,
         }
     }
@@ -118,6 +127,7 @@ impl Language {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Self::Gleam => tree_sitter_gleam::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
@@ -136,6 +146,7 @@ impl Language {
             Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             Self::Markdown => tree_sitter_md::LANGUAGE.into(),
             Self::Starlark => tree_sitter_starlark::LANGUAGE.into(),
+            Self::V => tree_sitter_vlang::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::Nix => tree_sitter_nix::LANGUAGE.into(),
             Self::Dart => tree_sitter_dart::LANGUAGE.into(),
@@ -147,6 +158,61 @@ impl Language {
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
+            Self::Clojure => tree_sitter_clojure_orchard::LANGUAGE.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+    use tree_sitter::Parser;
+
+    use super::Language;
+
+    const JSX_SOURCE: &str = "export const x = <T a={<B c={d} />} />;";
+    const TYPE_ASSERTION_SOURCE: &str = "const x = <T>y;";
+
+    fn parses_cleanly(lang: Language, source: &str) -> bool {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.ts_language()).unwrap();
+        !parser.parse(source, None).unwrap().root_node().has_error()
+    }
+
+    #[test_case("tsx")]
+    #[test_case("jsx")]
+    #[test_case("js")]
+    fn extension_parses_jsx(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            JSX_SOURCE
+        ));
+    }
+
+    #[test]
+    fn tsx_name_parses_jsx() {
+        assert!(parses_cleanly(
+            Language::from_name("tsx").unwrap(),
+            JSX_SOURCE
+        ));
+    }
+
+    // The TSX grammar reads `<T>` as an unclosed tag, so this also pins down
+    // that .ts never gets routed there.
+    #[test]
+    fn ts_extension_keeps_type_assertions() {
+        let ts = Language::from_extension("ts").unwrap();
+        assert!(parses_cleanly(ts, TYPE_ASSERTION_SOURCE));
+    }
+
+    #[test_case("clj")]
+    #[test_case("cljs")]
+    #[test_case("cljc")]
+    #[test_case("bb")]
+    fn clojure_extension_parses_cleanly(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            "(ns a.b (:require [c.d :as e]))\n(defn f [x] (inc x))"
+        ));
     }
 }

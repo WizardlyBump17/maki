@@ -4,6 +4,12 @@ pub mod agent;
 pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
+pub mod file_index;
+pub use file_index::{
+    FILE_MATCH_CONFIG, FileIndex, FileMatch, FileQuery, FileReader, Ranked, WalkEnd,
+    byte_highlights, cancel_walks, file_haystack, file_haystack_owned, file_index, file_pattern,
+    invalidate_for, on_walk_end, resolved_index,
+};
 pub mod headless;
 pub mod mailbox;
 pub mod mcp;
@@ -12,15 +18,16 @@ pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
 };
+pub mod session;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
-    is_instruction_file,
+    ModelSlot, RunContext, RunContextBuilder, SharedMessages, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, find_subdirectory_instructions, is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use mailbox::{MailboxError, SessionMailbox};
-pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
+pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
 pub mod permissions;
@@ -35,12 +42,13 @@ use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
-pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
+pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, Envelope, EventSender, GrepFileEntry, GrepLine, GrepMatchGroup,
-    InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    AgentEvent, BufferSnapshot, DoneReason, Envelope, EventSender, EventStreamGuard, GrepFileEntry,
+    GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger, RunTotals,
+    SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle,
     SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -60,8 +68,14 @@ impl AgentMode {
 }
 
 pub enum ExtractedCommand {
-    Interrupt(AgentInput, u64),
-    Compact(u64),
+    /// Every message the user queued back to back, so one turn answers them
+    /// all. A source must stop there and hand anything else over on its own,
+    /// since a command like `/compact` rewrites the history the later messages
+    /// land in.
+    Interrupt(Vec<AgentInput>),
+    /// Carries the guidance typed as `/compact <instructions>`, for this one
+    /// summary.
+    Compact(Option<String>),
 }
 
 pub trait InterruptSource: Send + Sync {
@@ -84,4 +98,27 @@ pub struct AgentInput {
     /// No `Default` on this struct so adding a field forces every call site to update.
     pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
+}
+
+impl AgentInput {
+    /// What a host with no toggle UI sends. `-p`, the SDK and ACP know nothing
+    /// about the toggles beyond what config says, so they all build their input
+    /// here and a knob added to [`SessionDefaults`] reaches every one of them.
+    pub fn from_defaults(
+        message: String,
+        mode: AgentMode,
+        images: Vec<ImageSource>,
+        defaults: SessionDefaults,
+    ) -> Self {
+        Self {
+            message,
+            mode,
+            images,
+            preamble: Vec::new(),
+            thinking: defaults.thinking.into(),
+            fast: defaults.fast,
+            workflow: defaults.workflow,
+            prompt: None,
+        }
+    }
 }

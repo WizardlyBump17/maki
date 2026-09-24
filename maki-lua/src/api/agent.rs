@@ -8,33 +8,39 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
-use maki_agent::agent::tool_dispatch::{self, Emit};
+use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
+    CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
-    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
-    History, McpSession, SubagentInfo, ToolDoneEvent,
+    Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
+    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
+    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
-use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
+use maki_providers::{
+    ContentBlock, ContextGauge, Model, ModelError, RequestOptions, Role, ThinkingConfig,
+    TokenUsage, add_cost,
+};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::info;
 
+use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
@@ -44,7 +50,7 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     };
     let requested: ModelTier = tier_str.parse().map_err(|e: ModelError| e.to_string())?;
-    let effective = requested.min(ctx.model.tier);
+    let effective = requested.capped_at(ctx.model.tier);
     if effective == ctx.model.tier {
         return Ok(Model::clone(&ctx.model));
     }
@@ -79,14 +85,14 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
 /// turn's tokens plus the run's summed cost), and one total per run on
 /// `usage_tx`, which `prompt` waits for.
 async fn relay_session_events(
-    sub_rx: flume::Receiver<Envelope>,
+    mut sub_events: SessionEvents,
     parent_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     usage_tx: flume::Sender<TokenUsage>,
     live_sink: Option<flume::Sender<ToolLive>>,
 ) {
     let mut cost = None;
-    while let Ok(mut envelope) = sub_rx.recv_async().await {
+    while let Some(mut envelope) = sub_events.next().await {
         match &envelope.event {
             AgentEvent::TurnComplete(turn) => {
                 add_cost(&mut cost, turn.cost);
@@ -172,7 +178,10 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let agent = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
+    let slots = Arc::clone(&try_pair!(dispatch_ctx(&ctx, "system_prompt")).prompt_slots);
+    // Nothing may hold the ctx borrow across the wait: a cancel hook firing
+    // meanwhile needs `ctx:finish`, which takes it mutably.
+    drop(ctx);
     let prompt_id_str: String = opts.get("prompt_id")?;
     let prompt_id = match prompt_id_str.as_str() {
         "research" => maki_agent::prompt::PromptId::Research,
@@ -193,7 +202,7 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    let assembled = maki_agent::prompt::assemble(prompt_id, &agent.prompt_slots, &instructions);
+    let assembled = maki_agent::prompt::assemble(prompt_id, &slots, &instructions);
     Ok((Some(vars.apply(&assembled).into_owned()), None))
 }
 
@@ -210,6 +219,9 @@ async fn system_prompt(
 ///   `except` (string[]?) - exclude these tool names.
 ///   `workflow` (boolean?) - use workflow-mode descriptions. Default: `false`.
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
+///   `mcp` (boolean?) - describe tools as if MCP is reachable. Default: `true`.
+///     Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
+///     advertise MCP tools that the session has no way to call.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
 /// @example
 /// local defs, err = maki.agent.tools(ctx, {
@@ -231,6 +243,7 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
     let except: Option<Vec<String>> = opts.get("except")?;
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
 
     let parsed = spec_str
         .as_deref()
@@ -257,12 +270,62 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         filter: &filter,
         audience,
         workflow,
+        mcp: mcp_enabled && agent.mcp.is_some(),
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
     let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
+}
+
+/// Every tool name this context can dispatch: registry tools, MCP tools
+/// (deferred ones included), host tools (ACP client tools, a subagent's
+/// `structured_output`) and `tool_search`. Reach for it when you expose tools
+/// inside a sandbox and need the names to bind. `maki.api.get_tools()` covers
+/// the registry alone and has no view of the session.
+///
+/// The list already accounts for this session's audience, the config's
+/// `disabled_tools` and the model's capabilities. Read `audiences` to layer
+/// your own policy on top. A sandbox wants `interpreter`.
+///
+/// Each name shows up once, described by the tool a call would really reach, so
+/// a host tool that shadows a registry name reports its own audience rather
+/// than the shadowed one's.
+///
+/// @param ctx LuaCtx Agent context.
+/// @return (table?, string?) Array of `{ name, alias?, source, audiences, schema? }`,
+///   or `(nil, err)` on failure. `source` is one of `"native"`, `"local"`,
+///   `"mcp"`. `alias` is a safe identifier to bind, set only when `name` is not
+///   one (say `srv__get-docs`). Dispatch `name` in every case. `schema` comes
+///   with registry tools only.
+/// @example
+/// local tools, err = maki.agent.callable_tools(ctx)
+/// if err then error(err) end
+/// for _, t in ipairs(tools) do
+///   print(t.source, t.alias or t.name)
+/// end
+#[lua_fn]
+async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<Table>> {
+    let agent = try_pair!(dispatch_ctx(&ctx, "callable_tools"));
+    let out = lua.create_table()?;
+    for (i, tool) in tool_dispatch::callable(&agent.to_tool_context())
+        .into_iter()
+        .enumerate()
+    {
+        let t = lua.create_table()?;
+        t.set("name", tool.name)?;
+        if let Some(alias) = tool.alias {
+            t.set("alias", alias)?;
+        }
+        t.set("source", tool.source)?;
+        t.set("audiences", audiences_to_lua(&lua, tool.audience)?)?;
+        if let Some(schema) = tool.schema {
+            t.set("schema", json_to_lua(&lua, &schema)?)?;
+        }
+        out.set(i + 1, t)?;
+    }
+    Ok((Some(out), None))
 }
 
 /// Run a tool by name and wait for the result. This is how you call built-in
@@ -283,6 +346,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
+///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+///   not in the text: they land on the calling tool's own result.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
 ///   command = "ls -la",
@@ -335,10 +400,7 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
-    match interpreter_bridge::flatten(&done) {
-        Ok(text) => Ok((Some(text), None)),
-        Err(err) => Ok((None, Some(err))),
-    }
+    Ok(pair(interpreter_bridge::flatten(&done)))
 }
 
 /// Create a new subagent session. The session inherits the parent model and
@@ -356,7 +418,9 @@ async fn call_tool(
 ///   `local_tools` (table?) - map of `name -> spec` for Lua-backed tools. Each spec
 ///     requires `description` (string), `input_schema` (table), and
 ///     `handler` (function). The handler receives the input table and must return
-///     `(string)` or `(nil, err)`.
+///     `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
+///     call it, the same way `maki.api.register_tool` does. The default is the
+///     model alone, so a script cannot reach it through `code_execution`.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
 ///   `mcp` (boolean?) - give the session access to MCP tools. Their
@@ -365,8 +429,8 @@ async fn call_tool(
 ///     starts with no loaded tools of its own. Default: `true`.
 ///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, an
 ///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
-///     `"max"`), or a budget integer (token count). Inherits parent setting
-///     if omitted.
+///     `"max"`), or a budget integer (token count). Inherits the parent
+///     setting if omitted, and is capped at it otherwise.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
@@ -377,8 +441,11 @@ async fn call_tool(
 ///   name = "researcher",
 /// })
 /// if err then error(err) end
-/// local result = sess:prompt("Summarize this file.")
+///
+/// -- Close before handling the error, so no path leaves the session open.
+/// local result, prompt_err = sess:prompt("Summarize this file.")
 /// sess:close()
+/// if prompt_err then error(prompt_err) end
 #[lua_fn]
 async fn session(
     lua: Lua,
@@ -432,7 +499,7 @@ async fn session(
         None => JsonValue::Array(vec![]),
     };
 
-    let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
+    let mut local_map: HashMap<String, LocalTool> = HashMap::new();
     if let Some(tbl) = local_tools_tbl {
         let defs = tools_json.as_array_mut().expect("checked above");
         for pair in tbl.pairs::<String, Table>() {
@@ -452,36 +519,52 @@ async fn session(
                 "description": description,
                 "input_schema": sanitized_schema,
             }));
+            let audience =
+                parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
             let weak = lua.weak();
             local_map.insert(
                 name,
-                Arc::new(move |input: &JsonValue| call_local_tool(&weak, &handler, input))
-                    as LocalToolFn,
+                maki_agent::tools::local_tool(audience, move |input, _ctx| {
+                    let result = call_local_tool(&weak, &handler, &input);
+                    Box::pin(async move { result })
+                }),
             );
         }
     }
 
-    let thinking = match thinking_val {
-        Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
-            Ok(stored) => ThinkingConfig::from(stored),
-            Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
-        },
-        Some(LuaValue::Integer(n)) => match u32::try_from(n) {
-            Ok(tokens) if tokens > 0 => ThinkingConfig::Budget(tokens),
-            _ => return Ok(err_pair(format!("invalid thinking budget: {n}"))),
-        },
-        Some(LuaValue::Number(n)) if n >= 1.0 && n <= f64::from(u32::MAX) => {
-            ThinkingConfig::Budget(n as u32)
+    // Numbers take the same route as strings: `parse_setting` already spells
+    // out every accepted word and budget, so there is one grammar and one
+    // error message instead of a second one per Lua number type.
+    let requested_thinking = match thinking_val {
+        None => None,
+        Some(value) => {
+            let setting = match &value {
+                LuaValue::String(s) => s.to_str()?.to_owned(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => n.to_string(),
+                other => {
+                    return Ok(err_pair(format!(
+                        "thinking must be string or number, got {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            match StoredThinking::parse_setting(&setting) {
+                Ok(stored) => Some(ThinkingConfig::from(stored)),
+                Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
+            }
         }
-        Some(LuaValue::Number(n)) => {
-            return Ok(err_pair(format!("invalid thinking budget: {n}")));
-        }
-        Some(_) => return Err(mlua::Error::runtime("thinking must be string or number")),
-        None => agent_ctx.opts.thinking,
     };
+    // Omitting inherits the parent as-is; an explicit level is capped at it
+    // first, then reconciled once with the model so the status badge,
+    // `AgentInput` and the request itself all report what this session runs.
+    let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
+        t.clamp_to(agent_ctx.opts.thinking)
+    });
+    let opts = RequestOptions { thinking, fast }.clamped(&model);
 
-    let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
+    let (stream_guard, sub_events) = event_stream();
+    let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
@@ -489,7 +572,7 @@ async fn session(
     let (usage_tx, usage_rx) = flume::unbounded();
 
     smol::spawn(relay_session_events(
-        sub_rx,
+        sub_events,
         parent_tx.clone(),
         Arc::clone(&subagent_info),
         usage_tx,
@@ -497,14 +580,15 @@ async fn session(
     ))
     .detach();
 
-    // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth. The fallback key gets its own id:
-    // it keys `subagent_cancels`, so sharing the session id would make two
-    // subagents running at once collide.
+    // Doubles as the task id tools see. The fallback gets its own id: it keys
+    // `subagent_cancels`, where two subagents sharing the session id would
+    // collide.
     let ui_id = agent_ctx
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    // Registered before the session runs so the child token does not fire
+    // on drop and kill the subagent at birth.
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
@@ -515,6 +599,11 @@ async fn session(
     let name = name.unwrap_or_default();
     info!(name = %name, model = %model.id, "subagent session opened");
 
+    // The array is the caller's, and the filter comes out of it, so whatever
+    // the caller left out is also a name this session cannot dispatch or bind
+    // inside its sandbox.
+    let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
+
     let state = SessionState {
         params: AgentParams {
             provider,
@@ -523,26 +612,34 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
-            file_tracker: FileReadTracker::fresh(),
+            // Shared with the parent, not fresh: a lock that a subagent does
+            // not take is no lock at all once two of them edit one file, and a
+            // subagent starting with an empty read history would overwrite
+            // whatever its parent read without ever being told it was stale.
+            file_access: Arc::clone(&agent_ctx.file_access),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
             subagent_cancels: Arc::new(CancelMap::new()),
+            ledger: RunLedger::child(&agent_ctx.ledger),
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
         system: system.unwrap_or_default(),
-        tools: tools_json,
-        thinking,
-        fast,
+        tools,
+        opts,
         mcp: agent_ctx
             .mcp
             .as_ref()
             .filter(|_| mcp_enabled)
             .map(McpSession::fresh),
         history: History::new(Vec::new()),
+        gauge: ContextGauge::default(),
+        loaded_instructions: LoadedInstructions::new(),
         sub_event_tx,
+        stream_guard: Some(stream_guard),
         child_cancel,
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
@@ -586,7 +683,7 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, call_tool, session,
+        resolve_model, system_prompt, tools, callable_tools, call_tool, session,
     ]
 }
 
@@ -629,15 +726,7 @@ async fn dispatch_racing_live(
     rx: Option<flume::Receiver<ToolLive>>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
-    let run = tool_dispatch::run(
-        &tctx.registry,
-        tctx.mcp.as_ref(),
-        String::new(),
-        name,
-        input,
-        tctx,
-        Emit::Silent,
-    );
+    let run = tool_dispatch::run(String::new(), name, input, tctx, CallOrigin::Nested);
     let Some(rx) = rx else {
         return run.await;
     };
@@ -660,14 +749,25 @@ async fn dispatch_racing_live(
 struct SessionState {
     params: AgentParams,
     system: String,
-    tools: JsonValue,
-    thinking: ThinkingConfig,
-    fast: bool,
+    tools: RequestTools,
+    /// Already reconciled against `params.model`, so every reader agrees.
+    opts: RequestOptions,
     /// Fresh per session so `tool_search` loads never leak between a
     /// subagent and its parent.
     mcp: Option<McpSession>,
     history: History,
+    /// Travels with `history`: a subagent session spans many runs, and a gauge
+    /// rebuilt per run would forget every measurement it made.
+    gauge: ContextGauge,
+    /// Fresh per session, not per prompt: the parent's set would hide files
+    /// this model never saw, and a per-run set would inject the same file on
+    /// every turn.
+    loaded_instructions: LoadedInstructions,
     sub_event_tx: EventSender,
+    /// Dropped on close, which ends the relay task. Tool contexts keep
+    /// [`EventSender`] clones alive past the run, so the relay cannot key off
+    /// sender disconnect.
+    stream_guard: Option<EventStreamGuard>,
     child_cancel: maki_agent::cancel::CancelToken,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
@@ -694,6 +794,7 @@ impl SessionState {
             return;
         }
         self.closed = true;
+        self.stream_guard.take();
         self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
@@ -738,7 +839,9 @@ impl Drop for LuaSession {
 /// tools).
 ///
 /// @param message string User message to send.
-/// @return (table?, string?) Result table on success, or `(nil, err)` on failure.
+/// @return (table?, string?) Result table on success, or `(nil, err)` on
+/// failure. A run cut short after streaming some text hands you both: the
+/// error and a `{ text = <what it streamed> }` table.
 /// @example
 /// local r, err = sess:prompt("What files are in this project?")
 /// if err then error(err) end
@@ -763,6 +866,7 @@ async fn prompt(
             name: s.name.clone(),
             prompt: Some(message.clone()),
             model: Some(s.params.model.spec()),
+            opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
         });
     }
@@ -772,12 +876,14 @@ async fn prompt(
         s.params.clone(),
         AgentRunParams {
             history: &mut s.history,
+            gauge: &mut s.gauge,
             system: s.system.clone(),
             event_tx: s.sub_event_tx.clone(),
             tools: s.tools.clone(),
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))
+    .with_loaded_instructions(s.loaded_instructions.clone())
     .with_cancel(s.child_cancel.clone())
     .with_mcp(s.mcp.clone())
     .with_local_tools(Arc::clone(&s.local_tools));
@@ -787,15 +893,46 @@ async fn prompt(
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
-        thinking: s.thinking,
-        fast: s.fast,
+        thinking: s.opts.thinking,
+        fast: s.opts.fast,
         workflow: false,
         prompt: None,
     };
     let result = agent.run(input).await;
     drop(agent);
-    if let Err(e) = result {
-        return Ok((None, Some(e.to_string())));
+    // Only this call's messages count: older turns may hold stale preamble
+    // text, and the agent loop's empty-response retry leaves a synthetic
+    // "(empty)" assistant marker that must not pass for a real response.
+    // Auto-compaction can shrink the history mid-run, so clamp the start:
+    // after a rewrite the tail is this call's output either way.
+    let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
+    // A subagent can be cancelled on its own, and its caller should hear about
+    // that instead of taking a half-finished answer for a real one, so cancel
+    // reads like an error here even though the run ended normally.
+    let cut_short = match &result {
+        Err(e) => Some(e.to_string()),
+        Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
+        Ok(_) => None,
+    };
+    if let Some(err) = cut_short {
+        let partial = turn
+            .iter()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tbl = if partial.is_empty() {
+            None
+        } else {
+            let tbl = lua.create_table()?;
+            tbl.set("text", partial)?;
+            Some(tbl)
+        };
+        return Ok((tbl, Some(err)));
     }
     // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
     // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
@@ -808,12 +945,7 @@ async fn prompt(
         ),
     }
 
-    // Only this call's messages count: older turns may hold stale preamble
-    // text, and the agent loop's empty-response retry leaves a synthetic
-    // "(empty)" assistant marker that must not pass for a real response.
-    // Auto-compaction can shrink the history mid-run, so clamp the start:
-    // after a rewrite the tail is this call's output either way.
-    let text = s.history.as_slice()[history_len.min(s.history.len())..]
+    let text = turn
         .iter()
         .rfind(|m| matches!(m.role, Role::Assistant))
         .and_then(|m| {
@@ -832,9 +964,12 @@ async fn prompt(
     Ok((Some(tbl), None))
 }
 
-/// Close the session and flush its history back to the parent agent. You can
-/// call this multiple times safely. If you forget, it runs automatically when
-/// the session is garbage collected.
+/// Close the session and flush its history back to the parent agent. Calling
+/// it more than once is safe.
+///
+/// Close on every path, error paths included. Dropping the session instead
+/// leaves the work to the Lua garbage collector, which may never run while
+/// the VM sits idle, and the subagent's event relay stays alive until it does.
 ///
 /// @return
 #[lua_fn]
@@ -851,8 +986,11 @@ lua_class! {
     ///
     /// Create one with `maki.agent.session()`, then send messages with
     /// `:prompt()`. The session remembers previous turns, so you can have
-    /// a multi-step conversation. Call `:close()` when you are done, or let
-    /// garbage collection handle it.
+    /// a multi-step conversation.
+    ///
+    /// Always call `:close()` when you are done, on error paths too. The
+    /// garbage collector is a fallback that may never run while the VM sits
+    /// idle, so a session you only drop can stay open for the rest of the run.
     "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
 }
 
@@ -870,7 +1008,7 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::TurnCompleteEvent;
+    use maki_agent::{DoneReason, TurnCompleteEvent};
     use maki_providers::Message;
     use serde_json::json;
 
@@ -914,14 +1052,7 @@ mod tests {
             output,
             cache_creation: 0,
             cache_read: 0,
-        }
-    }
-
-    fn envelope(event: AgentEvent) -> Envelope {
-        Envelope {
-            event,
-            subagent: None,
-            run_id: RUN_ID,
+            cost: None,
         }
     }
 
@@ -931,24 +1062,35 @@ mod tests {
             usage,
             model: "test-model".into(),
             cost: Some(cost),
+            subsidised_list_cost: None,
             context_size: None,
+            context_window: 0,
         }))
     }
 
+    fn subagent_info() -> Arc<OnceLock<SubagentInfo>> {
+        let info = Arc::new(OnceLock::new());
+        info.set(SubagentInfo {
+            parent_tool_use_id: PARENT_ID.into(),
+            name: "research".into(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+        })
+        .unwrap();
+        info
+    }
+
+    /// Dropping the guard is what ends the relay: a Lua tool context keeps a
+    /// sender alive past the run, so disconnect never comes. The forwarded
+    /// count also pins down that the close marker itself stays behind, since
+    /// passing it on would end the *parent's* stream at the first subagent.
     #[test]
     fn relay_session_events_reports_live_usage_and_done_total() {
-        let (sub_tx, sub_rx) = flume::unbounded();
+        let (guard, sub_events) = event_stream();
+        let sub_tx = guard.sender(RUN_ID);
         let (parent_raw_tx, parent_rx) = flume::unbounded();
-        let subagent_info = Arc::new(OnceLock::new());
-        subagent_info
-            .set(SubagentInfo {
-                parent_tool_use_id: PARENT_ID.into(),
-                name: "research".into(),
-                prompt: None,
-                model: None,
-                answer_tx: None,
-            })
-            .unwrap();
         let (usage_tx, usage_rx) = flume::unbounded();
         let (live_tx, live_rx) = flume::unbounded();
 
@@ -960,18 +1102,22 @@ mod tests {
             },
             AgentEvent::Done {
                 usage: DONE_USAGE,
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
                 num_turns: 2,
-                stop_reason: None,
+                reason: DoneReason::EndTurn,
             },
         ] {
-            sub_tx.send(envelope(event)).unwrap();
+            sub_tx.send(event).unwrap();
         }
-        drop(sub_tx);
+        drop(guard);
 
         smol::block_on(relay_session_events(
-            sub_rx,
+            sub_events,
             EventSender::new(parent_raw_tx, RUN_ID),
-            subagent_info,
+            subagent_info(),
             usage_tx,
             Some(live_tx),
         ));

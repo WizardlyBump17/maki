@@ -22,6 +22,10 @@ A skill is a directory with a `SKILL.md` inside. Maki looks for them every time 
 
 So project skills beat personal ones, and a skill at the repo root beats one with the same name deeper down. The `.claude`, `.opencode` and `.agents` dirs are there so skills you already wrote for other agents keep working.
 
+[Folder trust](/docs/folder-trust/) does not gate skills. Every project skill
+name and description is in the system prompt from startup, trusted or not, so
+read a repository's skills before you work in it.
+
 Only `SKILL.md` is read. If you want extra notes, put them in files next to it and link them from the body, like `./notes.md`.
 
 ## Writing one
@@ -55,7 +59,7 @@ Skills are not slash commands: typing `/git-release` does nothing unless you als
 
 ## The builtin: maki-plugin-dev
 
-Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. Turn it off if you never write plugins:
+Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
 
 ```lua
 -- ~/.config/maki/init.lua

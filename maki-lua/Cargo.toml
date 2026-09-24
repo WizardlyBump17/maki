@@ -19,10 +19,15 @@ maki-highlight = { workspace = true }
 maki-interpreter = { workspace = true }
 maki-lua-macro = { workspace = true }
 maki-markdown = { workspace = true }
+maki-pack = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
+nucleo-matcher = { workspace = true }
+serde = { workspace = true }
+shell-words = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+semver = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 smol = { workspace = true }
@@ -34,6 +39,7 @@ futures-lite = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
 unicode-width = { workspace = true }
+url = { workspace = true }
 regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }
@@ -45,6 +51,7 @@ toml = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tree-sitter-c = { workspace = true }
 tree-sitter-c-sharp = { workspace = true }
+tree-sitter-clojure-orchard = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 tree-sitter-elixir = { workspace = true }
 tree-sitter-gleam = { workspace = true }
@@ -66,6 +73,7 @@ tree-sitter-starlark = { workspace = true }
 tree-sitter-swift = { workspace = true }
 tree-sitter-toml-ng = { workspace = true }
 tree-sitter-typescript = { workspace = true }
+tree-sitter-vlang = { workspace = true }
 tree-sitter-zig = { workspace = true }
 tree-sitter-dart = { workspace = true }
 tree-sitter-yaml = { workspace = true }

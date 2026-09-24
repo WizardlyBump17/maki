@@ -21,8 +21,8 @@ local function mock_ctx(path)
       local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
       return set[name] or false
     end,
-    find_instructions = function()
-      return {}
+    load_instructions = function()
+      return true
     end,
   }
 end
@@ -57,6 +57,7 @@ require("tests.lang.bash")
 require("tests.lang.bazel")
 require("tests.lang.c")
 require("tests.lang.c_sharp")
+require("tests.lang.clojure")
 require("tests.lang.containerfile")
 require("tests.lang.cpp")
 require("tests.lang.css")
@@ -81,7 +82,9 @@ require("tests.lang.scala")
 require("tests.lang.sql")
 require("tests.lang.swift")
 require("tests.lang.toml")
+require("tests.lang.tsx")
 require("tests.lang.typescript")
+require("tests.lang.v")
 require("tests.lang.yaml")
 require("tests.lang.zig")
 

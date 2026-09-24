@@ -11,13 +11,16 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_lite::future;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy};
+use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
+use url::Url;
 
 use self::callback::{CallbackResult, CallbackServer};
-use self::discovery::parse_www_authenticate;
+use self::discovery::{
+    AuthServerMetadata, ResourceMetadata, WwwAuthenticateInfo, parse_www_authenticate,
+};
 use super::config::OauthClientConfig;
 use super::error::McpError;
 
@@ -77,20 +80,10 @@ pub async fn authenticate(
 
     let www_auth = www_authenticate.and_then(parse_www_authenticate);
 
-    let resource_meta =
-        discovery::discover_resource_metadata(&client, server_url, www_auth.as_ref())
+    let (resource_meta, auth_server) =
+        discover_auth_server_for(&client, server_url, www_auth.as_ref())
             .await
             .map_err(&wrap)?;
-
-    let auth_server_url = resource_meta
-        .authorization_servers
-        .first()
-        .cloned()
-        .unwrap_or_else(|| discovery::server_origin(server_url));
-
-    let auth_server = discovery::discover_auth_server(&client, &auth_server_url)
-        .await
-        .map_err(&wrap)?;
 
     if !auth_server.code_challenge_methods_supported.is_empty()
         && !auth_server
@@ -147,10 +140,11 @@ pub async fn authenticate(
         .map_err(|e| wrap(OAuthError::Other(format!("CSPRNG unavailable: {e}"))))?;
     let state = URL_SAFE_NO_PAD.encode(state_buf);
 
-    let scope = www_auth
-        .as_ref()
-        .and_then(|w| w.scope.clone())
-        .or_else(|| resource_meta.scopes_supported.as_ref().map(|s| s.join(" ")));
+    let scope = www_auth.as_ref().and_then(|w| w.scope.clone()).or_else(|| {
+        resource_meta
+            .and_then(|m| m.scopes_supported)
+            .map(|s| s.join(" "))
+    });
 
     let auth_url = build_authorization_url(
         &auth_server.authorization_endpoint,
@@ -160,7 +154,8 @@ pub async fn authenticate(
         &pkce.challenge,
         scope.as_deref(),
         server_url,
-    );
+    )
+    .map_err(&wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
     let result = match interaction {
@@ -260,9 +255,8 @@ pub async fn silent_refresh(
     let token_endpoint = match existing.token_endpoint.clone() {
         Some(pinned) => pinned,
         None => {
-            discover_auth_server_for(&client, server_url, None)
-                .await?
-                .token_endpoint
+            let (_, auth_server) = discover_auth_server_for(&client, server_url, None).await?;
+            auth_server.token_endpoint
         }
     };
 
@@ -290,15 +284,21 @@ pub async fn silent_refresh(
 async fn discover_auth_server_for(
     client: &HttpClient,
     server_url: &str,
-    www_auth: Option<&discovery::WwwAuthenticateInfo>,
-) -> Result<discovery::AuthServerMetadata, OAuthError> {
-    let resource_meta = discovery::discover_resource_metadata(client, server_url, www_auth).await?;
+    www_auth: Option<&WwwAuthenticateInfo>,
+) -> Result<(Option<ResourceMetadata>, AuthServerMetadata), OAuthError> {
+    // Some servers, like Atlassian's, never publish RFC 9728 resource metadata.
+    // Before 9728 the MCP server was its own auth server, so its origin is a
+    // good guess. If that guess is wrong too, the auth server lookup says so.
+    let resource_meta = discovery::discover_resource_metadata(client, server_url, www_auth)
+        .await
+        .inspect_err(|e| warn!(server_url, error = %e, "no resource metadata, trying server origin as auth server"))
+        .ok();
     let auth_server_url = resource_meta
-        .authorization_servers
-        .first()
-        .cloned()
+        .as_ref()
+        .and_then(|m| m.authorization_servers.first().cloned())
         .unwrap_or_else(|| discovery::server_origin(server_url));
-    discovery::discover_auth_server(client, &auth_server_url).await
+    let auth_server = discovery::discover_auth_server(client, &auth_server_url).await?;
+    Ok((resource_meta, auth_server))
 }
 
 async fn auth_timeout() -> Result<CallbackResult, String> {
@@ -318,6 +318,8 @@ fn is_headless() -> bool {
 fn build_http_client(timeout: Duration) -> Result<HttpClient, isahc::Error> {
     HttpClient::builder()
         .redirect_policy(RedirectPolicy::Limit(super::http::MAX_REDIRECTS))
+        // Same pin as mcp::http, so oauth and data traffic match.
+        .version_negotiation(VersionNegotiation::http11())
         .timeout(timeout)
         .build()
 }
@@ -330,9 +332,15 @@ fn build_authorization_url(
     code_challenge: &str,
     scope: Option<&str>,
     resource: &str,
-) -> String {
+) -> Result<String, OAuthError> {
+    let parsed = Url::parse(authorization_endpoint).map_err(|e| {
+        OAuthError::InvalidResponse(format!(
+            "invalid authorization endpoint {authorization_endpoint}: {e}"
+        ))
+    })?;
+    let sep = if parsed.query().is_some() { '&' } else { '?' };
     let mut url = format!(
-        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
         token::url_encode(client_id),
         token::url_encode(redirect_uri),
         token::url_encode(resource),
@@ -341,5 +349,75 @@ fn build_authorization_url(
         url.push_str("&scope=");
         url.push_str(&token::url_encode(s));
     }
-    url
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OAuthError, build_authorization_url};
+    use test_case::test_case;
+    use url::Url;
+
+    const CLIENT_ID: &str = "client-id";
+    const REDIRECT_URI: &str = "http://127.0.0.1:8080/callback";
+    const STATE: &str = "state-value";
+    const CHALLENGE: &str = "challenge-value";
+
+    const SCOPE: &str = "offline#access";
+    const RESOURCE: &str = "https://example.com/resource a b";
+
+    fn query_pairs(url: &str) -> Vec<(String, String)> {
+        let parsed = Url::parse(url).expect("built authorization URL should parse");
+        parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn has(pairs: &[(String, String)], key: &str, value: &str) -> bool {
+        pairs.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    #[test_case("https://example.com/authorize", None; "plain_endpoint")]
+    #[test_case("https://mcp-slack.example.com/dcr/authorize?provider=slack", Some("slack"); "slack_provider")]
+    fn builds_authorization_url(endpoint: &str, provider: Option<&str>) {
+        let url = build_authorization_url(
+            endpoint,
+            CLIENT_ID,
+            REDIRECT_URI,
+            STATE,
+            CHALLENGE,
+            Some(SCOPE),
+            RESOURCE,
+        )
+        .expect("endpoint should parse");
+
+        assert!(url.contains("resource=https%3A%2F%2Fexample.com%2Fresource%20a%20b"));
+        assert!(url.contains("scope=offline%23access"));
+
+        let pairs = query_pairs(&url);
+        assert!(has(&pairs, "response_type", "code"));
+        assert!(has(&pairs, "client_id", CLIENT_ID));
+        assert!(has(&pairs, "resource", RESOURCE));
+        assert!(has(&pairs, "scope", SCOPE));
+        if let Some(expected) = provider {
+            assert!(has(&pairs, "provider", expected));
+        }
+    }
+
+    #[test_case("not a url"; "invalid_endpoint")]
+    fn invalid_endpoint_returns_error(endpoint: &str) {
+        assert!(matches!(
+            build_authorization_url(
+                endpoint,
+                CLIENT_ID,
+                REDIRECT_URI,
+                STATE,
+                CHALLENGE,
+                None,
+                RESOURCE
+            ),
+            Err(OAuthError::InvalidResponse(_))
+        ));
+    }
 }

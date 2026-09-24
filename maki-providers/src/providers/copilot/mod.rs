@@ -13,28 +13,78 @@ use tracing::{debug, warn};
 use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
-use crate::model::{Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier};
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::{ResolvedAuth, Timeouts};
+use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
     ThinkingConfig, dialect,
 };
+use maki_config::providers::Protocol;
 
 pub mod auth;
 
+const SLUG: &str = "copilot";
+const DISPLAY_NAME: &str = "Copilot";
+const ENV_VAR: &str = "GH_COPILOT_TOKEN";
 const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+const DEFAULT_MODEL: &str = "copilot/gpt-5.6-terra";
+const LOGIN_URL: &str = "https://github.com/settings/copilot";
+/// Prose, not a value: the real endpoint is discovered over GraphQL.
+const DOC_API_URL: &str =
+    "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)";
+const FEATURES: &str = "Native Copilot Chat HTTP API with model endpoint discovery";
+const AUTH_NOTE: &str = "(or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)";
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "copilot",
-    display_name: "Copilot",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: DEFAULT_API_ENDPOINT,
-    default_api_key_env: "GH_COPILOT_TOKEN",
-    default_model: "copilot/gpt-5.2",
-    plans: None,
-    login_url: Some("https://github.com/settings/copilot"),
-    needs_url: false,
-});
+/// No Aperture route: Copilot's auth is GraphQL-discovered, not a clean proxy
+/// target.
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(100_000),
+    fallback_context_window: 200_000,
+    models_toml: include_str!("../../../models/copilot.toml"),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: None,
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: DEFAULT_API_ENDPOINT,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[DOC_API_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVarWith(AUTH_NOTE),
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Copilot::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Copilot::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
 const API_VERSION_HEADER: &str = "2025-10-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
@@ -43,55 +93,8 @@ const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/models";
 
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["gpt-5-mini", "gpt-5 mini", "claude-haiku-4.5"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.2", "gpt-4.1", "claude-sonnet-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &[
-                "gpt-5.4",
-                "gpt-5.3-codex",
-                "claude-opus-4.6",
-                "grok-code-fast-1",
-            ],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4.7"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing::ZERO,
-            max_output_tokens: Some(64_000),
-            context_window: 264_000,
-        },
-    ]
-}
+/// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
+const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
 
 pub struct Copilot {
     client: HttpClient,
@@ -275,12 +278,16 @@ impl Copilot {
                 .map(Arc::new)
         });
         if let Some(info) = reasoning_info {
-            apply_responses_reasoning(&mut body, thinking, model, &effort_dialect(&info));
+            responses::apply_responses_reasoning(
+                &mut body,
+                thinking,
+                model,
+                &effort_dialect(&info),
+            );
         }
-        let resolved = super::ResolvedAuth {
-            base_url: Some(auth.endpoint.clone()),
-            headers: copilot_headers(&auth, Some("conversation-agent")),
-        };
+        let resolved =
+            super::ResolvedAuth::new(SLUG, copilot_headers(&auth, Some("conversation-agent")))?
+                .with_base_url(Some(auth.endpoint.clone()));
         responses::do_stream(
             &self.client,
             model,
@@ -302,16 +309,7 @@ impl Copilot {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let mut body = json!({
-            "model": model.id,
-            "max_tokens": model.max_output_tokens.unwrap_or(shared::FALLBACK_MAX_TOKENS),
-            "system": [{"type": "text", "text": system}],
-            "messages": anthropic_messages(messages),
-            "tools": tools,
-            "stream": true,
-        });
-        thinking.apply_to_body(&mut body, model);
-
+        let body = messages_body(model, messages, system, tools, thinking);
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
@@ -367,6 +365,8 @@ struct CopilotModel {
     #[serde(default)]
     capabilities: CopilotModelCapabilities,
     #[serde(default)]
+    billing: CopilotModelBilling,
+    #[serde(default)]
     is_chat_default: bool,
     #[serde(default)]
     model_picker_enabled: bool,
@@ -374,6 +374,30 @@ struct CopilotModel {
     model_picker_category: Option<CopilotModelCategory>,
     #[serde(default)]
     supported_endpoints: Vec<String>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotModelBilling {
+    #[serde(default)]
+    token_prices: Option<CopilotTokenPrices>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotTokenPrices {
+    #[serde(default)]
+    batch_size: u32,
+    #[serde(default)]
+    default: Option<CopilotTokenPriceTier>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct CopilotTokenPriceTier {
+    #[serde(default)]
+    input_price: f64,
+    #[serde(default)]
+    output_price: f64,
+    #[serde(default)]
+    cache_price: f64,
 }
 
 impl CopilotModel {
@@ -392,7 +416,7 @@ impl CopilotModel {
             id: self.id.clone(),
             context_window: self.capabilities.limits.max_context_window_tokens,
             max_output_tokens: self.capabilities.limits.max_output_tokens,
-            pricing: None,
+            pricing: self.pricing(),
             supports_thinking: Some(self.supports_thinking()),
             supports_vision: Some(self.capabilities.supports.vision),
             tier: self
@@ -433,6 +457,29 @@ impl CopilotModel {
             reasoning_efforts,
             adaptive_thinking: self.capabilities.supports.adaptive_thinking,
         }
+    }
+
+    /// `/models` reports prices in AI credits per billing batch (1 credit =
+    /// $0.01), scaled to USD per 1M tokens for [`ModelPricing`]. The endpoint
+    /// exposes only the default context tier and cached-input reads; cache
+    /// writes are inherited from the static spec by id prefix so cost
+    /// accounting matches the offline path.
+    fn pricing(&self) -> Option<ModelPricing> {
+        let token_prices = self.billing.token_prices.as_ref()?;
+        let default = token_prices.default.as_ref()?;
+        let batch_size = f64::from(token_prices.batch_size);
+        if batch_size == 0.0 {
+            return None;
+        }
+        let usd_per_million = AIC_TO_USD_PER_MILLION / batch_size;
+        let manifest_cache_write =
+            lookup_entry(SPEC.models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
+        Some(ModelPricing::per_million(
+            default.input_price * usd_per_million,
+            default.output_price * usd_per_million,
+            manifest_cache_write,
+            default.cache_price * usd_per_million,
+        ))
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -640,18 +687,23 @@ fn copilot_auth_from_resolved(auth: &super::ResolvedAuth) -> Result<CopilotAuth,
     })
 }
 
-fn anthropic_messages(messages: &[Message]) -> Value {
-    Value::Array(
-        messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect(),
-    )
+fn messages_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: ThinkingConfig,
+) -> Value {
+    let mut body = json!({
+        "model": model.id,
+        "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
+        "system": [{"type": "text", "text": system}],
+        "messages": shared::wire_messages(messages),
+        "tools": tools,
+        "stream": true,
+    });
+    thinking.apply_to_body(&mut body, model);
+    body
 }
 
 fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
@@ -663,17 +715,6 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
         },
         adaptive: (!info.adaptive_thinking).then_some(Effort::High),
         off: info.reasoning_off.then_some(dialect::OFF),
-    }
-}
-
-fn apply_responses_reasoning(
-    body: &mut Value,
-    thinking: ThinkingConfig,
-    model: &Model,
-    dialect: &EffortDialect,
-) {
-    if let Some(effort) = thinking.effort_str(dialect, model) {
-        body["reasoning"] = json!({"effort": effort});
     }
 }
 
@@ -746,7 +787,13 @@ impl Provider for Copilot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::ProviderRegistry;
+    use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
+
+    const OPUS_CACHE_WRITE: f64 = 6.25;
+    const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
+    const REPLY: &str = "reply";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -757,6 +804,7 @@ mod tests {
                 model_type: "chat".into(),
                 ..Default::default()
             },
+            billing: CopilotModelBilling::default(),
             is_chat_default: false,
             model_picker_enabled: true,
             model_picker_category: None,
@@ -845,6 +893,96 @@ mod tests {
         assert_eq!(model.model_info().supports_thinking, Some(expected));
     }
 
+    #[test_case(ModelTier::Weak, "gpt-5.6-luna"; "weak defaults to luna")]
+    #[test_case(ModelTier::Medium, "gpt-5.6-terra"; "medium defaults to terra")]
+    #[test_case(ModelTier::Strong, "claude-opus-5"; "strong defaults to opus")]
+    fn manifest_has_exactly_one_default_per_tier(tier: ModelTier, expected_prefix: &str) {
+        let defaults: Vec<_> = SPEC
+            .models()
+            .iter()
+            .filter(|entry| entry.default && entry.tier == tier)
+            .collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].prefixes[0], expected_prefix);
+        assert_eq!(
+            ProviderRegistry::find_default_for_tier("copilot", tier)
+                .unwrap()
+                .prefixes[0],
+            expected_prefix
+        );
+    }
+
+    #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
+    #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
+    #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
+    fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
+        let usage = TokenUsage {
+            input,
+            output,
+            cache_creation: 0,
+            cache_read: 0,
+            cost: None,
+        };
+        let cost = Model::from_spec(spec)
+            .unwrap()
+            .list_cost(&usage, false)
+            .unwrap();
+        assert!((cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn token_prices_convert_aic_per_batch_to_usd_per_million() {
+        let model: CopilotModel = serde_json::from_value(json!({
+            "id": "gpt-5",
+            "billing": {
+                "token_prices": {
+                    "batch_size": 500_000,
+                    "default": {"input_price": 500.0, "output_price": 3000.0, "cache_price": 50.0}
+                }
+            }
+        }))
+        .unwrap();
+
+        let pricing = model.pricing().unwrap();
+        assert_eq!(pricing.input, 10.0);
+        assert_eq!(pricing.output, 60.0);
+        assert_eq!(pricing.cache_read, 1.0);
+        assert!(pricing.fast.is_none());
+    }
+
+    #[test]
+    fn pricing_inherits_cache_write_from_manifest_by_prefix() {
+        let billing = |id: &str| {
+            json!({
+                "id": id,
+                "billing": {
+                    "token_prices": {
+                        "batch_size": 500_000,
+                        "default": {"input_price": 250.0, "output_price": 1250.0, "cache_price": 25.0}
+                    }
+                }
+            })
+        };
+
+        let opus: CopilotModel = serde_json::from_value(billing("claude-opus-5")).unwrap();
+        let pricing = opus.pricing().unwrap();
+        assert_eq!(pricing.input, 5.0);
+        assert_eq!(pricing.output, 25.0);
+        assert_eq!(pricing.cache_read, 0.5);
+        assert_eq!(pricing.cache_write, OPUS_CACHE_WRITE);
+
+        let unmatched: CopilotModel = serde_json::from_value(billing("gpt-5")).unwrap();
+        assert_eq!(unmatched.pricing().unwrap().cache_write, 0.0);
+    }
+
+    #[test_case(json!({"id": "gpt-5"}) ; "no billing")]
+    #[test_case(json!({"id": "gpt-5", "billing": {"token_prices": {"batch_size": 0, "default": {"input_price": 1.0, "output_price": 1.0, "cache_price": 0.1}}}}) ; "zero batch size")]
+    fn pricing_falls_back_when_billing_unusable(billing: Value) {
+        let model: CopilotModel = serde_json::from_value(billing).unwrap();
+        assert!(model.pricing().is_none());
+        assert!(model.model_info().pricing.is_none());
+    }
+
     #[test]
     fn responses_reasoning_uses_effort_object_and_explicit_none() {
         let model = Model::from_spec("copilot/gpt-5.4").unwrap();
@@ -856,18 +994,44 @@ mod tests {
         let dialect = effort_dialect(&info);
 
         let mut body = json!({});
-        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        responses::apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
         assert_eq!(body, json!({"reasoning": {"effort": "none"}}));
 
         let mut body = json!({});
-        apply_responses_reasoning(
+        responses::apply_responses_reasoning(
             &mut body,
             ThinkingConfig::Effort(Effort::Medium),
             &model,
             &dialect,
         );
-        assert_eq!(body, json!({"reasoning": {"effort": "medium"}}));
+        assert_eq!(
+            body,
+            json!({"reasoning": {"effort": "medium", "summary": "auto"}})
+        );
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn messages_body_drops_unsigned_thinking_without_cache_control() {
+        let model = Model::from_spec(CLAUDE_SPEC).unwrap();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "gpt reasoning summary".into(),
+                    signature: None,
+                },
+                ContentBlock::Text { text: REPLY.into() },
+            ],
+            ..Default::default()
+        }];
+
+        let body = messages_body(&model, &messages, "system", &json!([]), ThinkingConfig::Off);
+
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY}]}])
+        );
     }
 
     #[test]
@@ -881,6 +1045,7 @@ mod tests {
                 model_type: "chat".into(),
                 ..Default::default()
             },
+            billing: CopilotModelBilling::default(),
             is_chat_default: false,
             model_picker_enabled: true,
             model_picker_category: None,

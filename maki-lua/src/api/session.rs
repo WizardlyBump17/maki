@@ -7,9 +7,17 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::command::{SessionRequest, UiAction, ui_roundtrip};
+use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair};
+
+/// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
+/// optional session id from Lua and returns a serialized
+/// [`crate::SessionSnapshot`].
+pub type SessionSnapshotFn =
+    Box<dyn Fn(Option<&str>) -> Result<serde_json::Value, String> + Send + Sync + 'static>;
+
+pub struct SessionSnapshotSlot(pub SessionSnapshotFn);
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
@@ -19,10 +27,11 @@ async fn roundtrip(
     tx: Option<flume::Sender<UiAction>>,
     req: SessionRequest,
 ) -> LuaResult<Pair<Value>> {
-    let reply =
-        try_pair!(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Session { req, reply_tx }).await);
-    let value = try_pair!(reply);
-    Ok((Some(json_to_lua(&lua, &value)?), None))
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
+        req,
+        reply_tx,
+    })
+    .await
 }
 
 /// Lists sessions stored for the current project. Answered from a
@@ -37,7 +46,8 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 }
 
 /// Lists the sessions currently running in this UI. Status is "working",
-/// "needs_input", or "idle".
+/// "needs_input", or "idle". A mailbox follow-up stays "working" without an
+/// intermediate "idle" status.
 ///
 /// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 /// @example
@@ -45,6 +55,61 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 #[lua_fn]
 async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
+}
+
+/// One-call snapshot of a session: queue, usage, context, cost, mode, and
+/// status. Reads the focused session, or the one you name in `session` when
+/// you act on a background tab.
+///
+/// The returned table:
+/// ```text
+/// {
+///   id, cwd, model, mode = "build" | "plan",
+///   status = "idle" | "working" | "needs_input",
+///   focused, updated_at,
+///   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
+///   context_size, context_window,
+///   cost,
+///   queue = { count }, -- nil under headless drivers
+///   title,             -- nil under headless drivers
+/// }
+/// ```
+///
+/// `usage` and `cost` include subagent spend. `context_size` is the main
+/// session's own, since a subagent runs its own window. There is no
+/// `list_cost` here: the un-subsidised total for a run arrives on the
+/// `TurnEnd` autocmd, and `maki.model.info` carries the rates behind it.
+///
+/// @param opts table? `session` (string?) Session id; defaults to focused.
+/// @return (table|nil, string|nil) Snapshot table, or nil and an error.
+/// @example
+/// local s = maki.session.read()
+/// if s.context_size > s.context_window * 0.8 then
+///   maki.ui.notify("context is nearly full")
+/// end
+#[lua_fn]
+async fn read(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let id = match opts {
+        Some(t) => t.get::<Option<String>>("session")?,
+        None => None,
+    };
+    // Headless drivers install a provider, the UI leaves the slot empty and
+    // answers from its event loop, which owns the live session runtimes.
+    if let Some(slot) = lua.app_data_ref::<SessionSnapshotSlot>() {
+        return match (slot.0)(id.as_deref()) {
+            Ok(value) => Ok((Some(json_to_lua(&lua, &value)?), None)),
+            Err(msg) => Ok(err_pair(msg)),
+        };
+    }
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
+        req: SessionRequest::Read { id },
+        reply_tx,
+    })
+    .await
 }
 
 /// Returns the id of the currently focused session.
@@ -57,7 +122,7 @@ async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRes
     roundtrip(lua, tx, SessionRequest::Current).await
 }
 
-/// Switches the UI to the session with {id}. The session must be live.
+/// Switches the UI to the session with {id}.
 ///
 /// @param id string Session id, as returned by `list()` or `live()`.
 /// @return (boolean|nil, string|nil) true on success, or nil and an error.
@@ -165,6 +230,33 @@ fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>
     Ok((Some(true), None))
 }
 
+/// Switches a live session between plan and build mode. Entering plan mode
+/// allocates the session's plan file if it has none.
+///
+/// A session that is mid-plan answers the next prompt with another draft of
+/// the plan. Set `"build"` first and that prompt implements it.
+///
+/// @param mode string "build" or "plan".
+/// @param opts table? Options:
+///   session (string) id of a live session, defaults to the focused one.
+/// @return (boolean|nil, string|nil) true, or nil and an error.
+/// @example
+/// maki.session.set_mode("build", { session = opts.session })
+/// maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
+#[lua_fn]
+async fn set_mode(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    mode: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let id = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
+    roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -192,7 +284,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
 
 #[cfg(test)]
@@ -262,6 +354,38 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+    }
+
+    /// Mode is per session like the plan it drives, so a row handler firing
+    /// for a background tab has to be able to name it.
+    #[test_case(r#"return session.set_mode('build', { session = 'abc' })"#, Some("abc"), "build" ; "explicit_session_id")]
+    #[test_case("return session.set_mode('plan')", None, "plan" ; "defaults_to_focused")]
+    fn set_mode_forwards_the_mode_and_session_id(
+        code: &str,
+        expected_id: Option<&str>,
+        expected_mode: &str,
+    ) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let expected_mode = expected_mode.to_owned();
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::SetMode { id, mode },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected set_mode request");
+            };
+            assert_eq!(id, expected_id);
+            assert_eq!(mode, expected_mode);
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let (val, err): (bool, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert!(val);
     }
 
     #[test]

@@ -74,7 +74,7 @@ async fn run_btw(
 ) {
     let (event_tx, event_rx) = flume::unbounded();
     let tools = Value::Array(vec![]);
-    let messages = maki_providers::adapt_images_for_model(&model, &messages);
+    let messages = maki_providers::adapt_images_for_model(&model, &messages).await;
 
     let stream_fut = provider.stream_message(
         &model,
@@ -88,11 +88,12 @@ async fn run_btw(
 
     let forward_fut = async {
         while let Ok(event) = event_rx.recv_async().await {
-            let delta = match event {
-                ProviderEvent::TextDelta { text } | ProviderEvent::ThinkingDelta { text } => text,
+            let event = match event {
+                ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
+                ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
                 _ => continue,
             };
-            if btw_tx.send(BtwEvent::TextDelta(delta)).is_err() {
+            if btw_tx.send(event).is_err() {
                 return;
             }
         }

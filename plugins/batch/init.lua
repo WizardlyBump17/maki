@@ -97,6 +97,9 @@ local function normalize_entry(entry)
   if type(tool) ~= "string" then
     return nil, "batch entry missing 'tool'"
   end
+  -- Lua twin of `canonical_tool_name` (streaming.rs): strip GPT's
+  -- `functions.` prefix so headers and the nested-batch guard match.
+  tool = tool:match("^functions%.(.+)") or tool
   local rest = {}
   local has_rest = false
   for k, v in pairs(entry) do
@@ -139,6 +142,19 @@ local function header_spans(tool, params)
   return spans or { { tool, "tool" } }
 end
 
+-- The chat and the reason travel along so a child keying per-chat state
+-- (todo_write) files the call where it would standalone. From the handler
+-- `restore_reason` is nil, which reads as a rerender: the child's own
+-- handler already ran.
+local function child_ctx(ctx)
+  return {
+    tool_output_lines = ctx:tool_output_lines(),
+    session_id = ctx:session_id(),
+    task_id = ctx:task_id(),
+    reason = ctx:restore_reason(),
+  }
+end
+
 -- The child's own restore fn builds the body, fed the real is_error, so
 -- a failed child looks exactly like the same tool run standalone. When
 -- restore is missing, throws, or returns no buf, the ToolView fallback
@@ -146,14 +162,15 @@ end
 -- The pcall is for the cancel sweep, which runs outside the coroutine,
 -- where a restore that awaits raises instead of yielding. One child's
 -- body must not stop the sweep from repainting the rest.
-local function child_body_buf(c, tol)
+local function child_body_buf(c, cctx)
   local output = c.output or ""
   local t = maki.api.get_tool(c.tool)
   local buf
   if t and t.restore then
-    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
+    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, cctx)
     buf = ok and res or nil
   end
+  local tol = cctx.tool_output_lines
   return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
 end
 
@@ -340,8 +357,8 @@ end
 local Batch = {}
 Batch.__index = Batch
 
-function Batch.new(children, tol)
-  local self = setmetatable({ children = children, tol = tol }, Batch)
+function Batch.new(children, cctx)
+  local self = setmetatable({ children = children, cctx = cctx }, Batch)
   self.buf = maki.ui.buf()
   -- A click fans out to child bufs, and every child change event would
   -- recompose the whole batch; mute them and recompose once at the end.
@@ -385,7 +402,7 @@ function Batch:watch(c, buf)
 end
 
 function Batch:attach_body(c)
-  self:watch(c, child_body_buf(c, self.tol))
+  self:watch(c, child_body_buf(c, self.cctx))
 end
 
 -- Forward the click to the child's own buf so its real toggle logic
@@ -419,10 +436,13 @@ function Batch:annotate(c, ann)
   self:rerender()
 end
 
+-- A child the sweep settled may be settled once more, when its own call
+-- comes back with the partial output the sweep could not know about.
 function Batch:settle(c, status, output)
-  if TERMINAL[c.status] then
+  if TERMINAL[c.status] and not c.swept then
     error(string.format(RESETTLE_FMT, c.tool, c.status, status))
   end
+  c.swept = nil
   c.status = status
   c.output = output
   self:attach_body(c)
@@ -453,8 +473,13 @@ function Batch:run_child(c, ctx)
     end,
   })
   -- The sweep may have settled this child mid-call, and the call knows
-  -- nothing about that, so its result is moot.
+  -- nothing about that, so its result is moot. Unless it came back with
+  -- more than the sweep's bare reason: that partial output is worth
+  -- keeping.
   if TERMINAL[c.status] then
+    if err and c.swept and err ~= c.output then
+      self:settle(c, STATUS.ERROR, err)
+    end
     return
   end
   if err then
@@ -464,12 +489,22 @@ function Batch:run_child(c, ctx)
   end
 end
 
--- Whatever is still non-terminal becomes a cancelled child, so none is
+function Batch:reply()
+  return {
+    llm_output = render_llm(self.children),
+    is_error = self.cancelled,
+    body = self.buf,
+    state = to_state(self.children),
+  }
+end
+
+-- Whatever is still non-terminal becomes a {reason} child, so none is
 -- left dangling, on screen or in the output.
-function Batch:sweep_cancelled()
+function Batch:sweep_cancelled(reason)
   for _, c in ipairs(self.children) do
     if not TERMINAL[c.status] then
-      self:settle(c, STATUS.ERROR, CANCELLED_ERROR)
+      self:settle(c, STATUS.ERROR, reason)
+      c.swept = true
     end
   end
 end
@@ -485,12 +520,19 @@ function Batch:run(ctx)
   end
   -- The cancel reaches neither `call_tool` nor `gather`, so a child parked
   -- in a request would stay drawn as running until the host gives up on
-  -- the whole handler, seconds later.
-  maki.async.on_cancel(function()
-    self:sweep_cancelled()
+  -- the whole handler, seconds later. The finish covers the case where the
+  -- host gives up on us anyway: the model still gets per-child results
+  -- rather than a bare "cancelled".
+  -- The reason is the model's only clue why the children stopped: a
+  -- deadline must not read as an Esc it can never retry its way out of.
+  maki.async.on_cancel(function(reason)
+    self.cancelled = true
+    self.cut_reason = reason
+    self:sweep_cancelled(reason)
+    ctx:finish(self:reply())
   end)
   maki.async.gather(funs)
-  self:sweep_cancelled()
+  self:sweep_cancelled(self.cut_reason or CANCELLED_ERROR)
 end
 
 --- Tool entry points --------------------------------------------------------
@@ -504,15 +546,11 @@ local function handler(input, ctx)
     return { llm_output = EMPTY_ERROR, is_error = true }
   end
 
-  local batch = Batch.new(children, ctx:tool_output_lines())
+  local batch = Batch.new(children, child_ctx(ctx))
   ctx:live_buf(batch.buf)
   batch:run(ctx)
 
-  return {
-    llm_output = render_llm(children),
-    body = batch.buf,
-    state = to_state(children),
-  }
+  return batch:reply()
 end
 
 -- Last resort: no state, output isn't section-formatted.
@@ -533,7 +571,8 @@ local function legacy_restore(children, output, tol)
 end
 
 local function restore(input, output, _is_error, rctx)
-  local tol = rctx:tool_output_lines()
+  local cctx = child_ctx(rctx)
+  local tol = cctx.tool_output_lines
   local children = prepare_children(input.tool_calls or {})
   if not children then
     return ToolView.restore(output, { max_lines = tol.other, keep = "head" })
@@ -550,7 +589,7 @@ local function restore(input, output, _is_error, rctx)
       c.output, c.annotation = sc.output, sc.annotation
       c.usage = sc.usage
     end
-    return Batch.new(children, tol).buf
+    return Batch.new(children, cctx).buf
   end
   return legacy_restore(children, output, tol)
 end

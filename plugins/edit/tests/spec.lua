@@ -1,25 +1,9 @@
 local fr = require("maki.fuzzy_replace")
+local th = require("maki.test_helpers")
 
-local failures = {}
-
-local function case(name, fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    table.insert(failures, name .. ": " .. tostring(err))
-  end
-end
-
-local function eq(actual, expected, msg)
-  if actual ~= expected then
-    error((msg or "") .. "\nexpected: " .. tostring(expected) .. "\n  actual: " .. tostring(actual))
-  end
-end
-
-local function has(s, substr, msg)
-  if not s:find(substr, 1, true) then
-    error((msg or "") .. "\nexpected to contain: " .. tostring(substr) .. "\n  actual: " .. tostring(s))
-  end
-end
+local case = th.case
+local eq = th.eq
+local has = th.has
 
 local R = "REPLACED"
 local NO_MATCH = fr.NO_MATCH
@@ -41,6 +25,117 @@ end)
 case("different_indentation", function()
   local result = fr.replace("    fn f() {\n        bar();\n    }", "fn f() {\n    bar();\n}", R, false)
   has(result, R)
+end)
+
+case("fuzzy_match_reindents_new_string", function()
+  local content = "class Foo\n  def bar\n    baz(\n      a,\n    )\n  end\nend\n"
+  local old = "def bar\n  baz(\n    a,\n  )\nend"
+  local new = "def bar\n  baz(\n    a,\n    b,\n  )\nend"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "class Foo\n  def bar\n    baz(\n      a,\n      b,\n    )\n  end\nend\n")
+end)
+
+case("reindent_ignores_new_string_own_indentation", function()
+  local content = "class A\n  def f\n    x\n  end\nend\n"
+  local old = "def f\n  x\nend"
+  local new = "  def f\n    y\n  end"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "class A\n  def f\n    y\n  end\nend\n")
+end)
+
+case("reindent_converts_spaces_to_tabs", function()
+  local content = "\tfn f() {\n\t\tif x {\n\t\t\tg();\n\t\t}\n\t}"
+  local old = "fn f() {\n    if x {\n        g();\n    }\n}"
+  local new = "fn f() {\n    if x {\n        h();\n    }\n}"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "\tfn f() {\n\t\tif x {\n\t\t\th();\n\t\t}\n\t}")
+end)
+
+case("reindent_leaves_a_correct_new_string_alone", function()
+  local content = "def f():\n    a = 1 \n    return a\n"
+  local old = "    a = 1\n    return a"
+  local new = "    a = 1\n    return a\n\n\ndef g():\n    return 2"
+  local result = fr.replace(content, old, new, false)
+  eq(result, "def f():\n    a = 1\n    return a\n\n\ndef g():\n    return 2\n")
+end)
+
+-- A replacement that adds a nesting level uses a column the file has never
+-- shown, so the "every column is a file column" test cannot recognise the
+-- frame on its own and the whole block used to sink a level.
+case("reindent_leaves_a_file_frame_new_string_that_adds_a_level_alone", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "    if x:\n        if y:\n            a()"
+  local result = fr.replace(content, "if x:\na()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+case("reindent_still_rebases_a_model_frame_new_string_that_adds_a_level", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "if x:\n    if y:\n        a()"
+  local result = fr.replace(content, "if x:\na()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+-- Bases agree here, so only the columns tell the frames apart: the file's own
+-- widths are already in `new_string`, nothing to correct.
+case("reindent_leaves_a_file_frame_new_string_alone_when_only_widths_drifted", function()
+  local content = "if x:\n    a()\n"
+  local result = fr.replace(content, "if x:\n  a()", "if x:\n    a()\n    b()", false)
+  eq(result, "if x:\n    a()\n    b()\n")
+end)
+
+case("reindent_widens_inner_levels_when_the_base_column_is_shared", function()
+  local content = "if x:\n    a()\n"
+  local result = fr.replace(content, "if x:\n  a()", "if x:\n  a()\n  b()", false)
+  eq(result, "if x:\n    a()\n    b()\n")
+end)
+
+-- Nothing in the file shows an eight or twelve space column, so the base column
+-- is the only thing left that can recognise the file's own frame, and a drift
+-- that is itself two levels deep must not talk it out of that.
+case("reindent_leaves_a_file_frame_new_string_that_adds_a_level_below_the_deepest_alone", function()
+  local content = "def f():\n    if x:\n        a()\n    return 1\n"
+  local new = "    if x:\n        if y:\n            a()"
+  local result = fr.replace(content, "  if x:\n    a()", new, false)
+  eq(result, "def f():\n    if x:\n        if y:\n            a()\n    return 1\n")
+end)
+
+case("reindent_leaves_a_line_that_exits_the_block_alone", function()
+  local content = "def f():\n    a = 1\n    return a\n"
+  local new = "  a = 1\n  return a\n\n\ndef g():\n  return 2"
+  local result = fr.replace(content, "  a = 1\n  return a", new, false)
+  eq(result, "def f():\n    a = 1\n    return a\n\n\ndef g():\n    return 2\n")
+end)
+
+case("reindent_keeps_the_block_when_a_column_zero_line_is_dropped", function()
+  local content = "def f():\n    a = 1\n# TODO\n    b = 2\n"
+  local old = "  a = 1\n# TODO\n  b = 2"
+  local result = fr.replace(content, old, "  a = 1\n  b = 2", false)
+  eq(result, "def f():\n    a = 1\n    b = 2\n")
+end)
+
+case("reindent_takes_its_widths_from_the_block_not_the_file", function()
+  local content = 'M = """\n\tgcc x.c\n"""\n\ndef g():\n    if x:\n        foo()\n'
+  local old = "  if x:\n    foo()"
+  local result = fr.replace(content, old, "  if x:\n    foo()\n    baz()", false)
+  eq(result, 'M = """\n\tgcc x.c\n"""\n\ndef g():\n    if x:\n        foo()\n        baz()\n')
+end)
+
+case("reindent_leaves_a_midline_match_alone", function()
+  local result = fr.replace("    let x = compute(a,  b);", "compute(a, b)", "compute(c, d)", false)
+  eq(result, "    let x = compute(c, d);")
+end)
+
+case("reindent_applies_to_every_replaced_occurrence", function()
+  local content = "  a();\n  b();\nx\n  a();\n  b();\n"
+  local result = fr.replace(content, "a();\nb();", "a();\nc();\nb();", true)
+  eq(result, "  a();\n  c();\n  b();\nx\n  a();\n  c();\n  b();\n")
+end)
+
+case("exact_match_keeps_new_string_indentation", function()
+  local content = "  a\n  b\n"
+  local result = fr.replace(content, "  a\n  b", "  a\n      b", false)
+  eq(result, "  a\n      b\n")
 end)
 
 case("whitespace_collapsed", function()
@@ -152,16 +247,21 @@ case("empty_content_no_match", function()
   eq(err, NO_MATCH)
 end)
 
-case("empty_old_string", function()
-  local result, err = fr.replace("abc", "", "x", false)
-  eq(result, nil)
-  eq(err, EMPTY_OLD_STRING)
-end)
-
-case("empty_old_string_replace_all_does_not_hang", function()
-  local result, err = fr.replace("abc", "", "x", true)
-  eq(result, nil)
-  eq(err, EMPTY_OLD_STRING)
+-- An old_string that trims down to nothing used to match at every offset, so
+-- replace_all spliced forever. A regression hangs here instead of failing.
+case("degenerate_old_string_is_rejected", function()
+  local vectors = {
+    { "abc", "", false, EMPTY_OLD_STRING },
+    { "abc", "", true, EMPTY_OLD_STRING },
+    { "a\n\nb", "   ", true, NO_MATCH },
+  }
+  for _, v in ipairs(vectors) do
+    local content, old, replace_all, expected_err = table.unpack(v)
+    local msg = ("old_string=%q replace_all=%s"):format(old, tostring(replace_all))
+    local result, err = fr.replace(content, old, "x", replace_all)
+    eq(result, nil, msg)
+    eq(err, expected_err, msg)
+  end
 end)
 
 case("replace_all_no_occurrences", function()
@@ -188,13 +288,6 @@ case("lua_pattern_special_chars", function()
   has(result, "foo(a+b).bar;")
 end)
 
-case("tabs_vs_spaces_indentation", function()
-  local content = "\tfn f() {\n\t\tbar();\n\t}"
-  local search = "    fn f() {\n        bar();\n    }"
-  local result = fr.replace(content, search, R, false)
-  has(result, R)
-end)
-
 case("double_backslash_literal", function()
   local content = "path\\name"
   local result = fr.replace(content, "path\\\\name", R, false)
@@ -212,6 +305,18 @@ case("exact_match_wins_over_fuzzy", function()
   eq(result, R .. "\nlet  x = 1;")
 end)
 
+-- Two model columns of the same width map to different file columns here, so
+-- the base is a real tie. Without a stable order the same edit can reindent one
+-- way on one run and another way on the next, hence the repeat.
+case("reindent_base_is_deterministic_when_indent_widths_tie", function()
+  local content = "if x:\n    a()\n        b()\n"
+  local old = "\ta()\n b()"
+  local new = "    a()\n      c()"
+  for _ = 1, 8 do
+    eq(fr.replace(content, old, new, false), "if x:\n    a()\n      c()\n")
+  end
+end)
+
 case("cjk_exact_match", function()
   local content = "// こんにちは世界\n// hello"
   local result = fr.replace(content, "// こんにちは世界", R, false)
@@ -220,6 +325,20 @@ case("cjk_exact_match", function()
 end)
 
 local replace_lines = require("edit_helpers").replace_lines
+local insert_after = require("edit_helpers").insert_after
+local preserve_line_endings = require("edit_helpers").preserve_line_endings
+
+local function edit_lines(content, start_line, end_line, new_string)
+  return preserve_line_endings(content, function(lf)
+    return replace_lines(lf, start_line, end_line, new_string)
+  end)
+end
+
+local function fuzzy_edit(content, old, new)
+  return preserve_line_endings(content, function(lf)
+    return fr.replace(lf, old, new, false)
+  end)
+end
 
 case("replace_lines_range_replace_and_delete", function()
   local content = "aaa\nbbb\nccc\nddd\neee\n"
@@ -262,6 +381,49 @@ case("replace_lines_insert_mode", function()
   eq(r4, "aaa\n\nbbb\nccc\n")
 end)
 
-if #failures > 0 then
-  error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
-end
+case("insert_after_mode", function()
+  local content = "aaa\nbbb\nccc\n"
+
+  local r0 = insert_after(content, 0, "TOP")
+  eq(r0, "TOP\naaa\nbbb\nccc\n")
+
+  local r2 = insert_after(content, 2, "XXX\nYYY")
+  eq(r2, "aaa\nbbb\nXXX\nYYY\nccc\n")
+
+  local r3 = insert_after(content, 3, "END")
+  eq(r3, "aaa\nbbb\nccc\nEND\n")
+
+  local _, e1 = insert_after(content, -1, "x")
+  has(e1, "out of range")
+  local _, e2 = insert_after(content, 4, "x")
+  has(e2, "out of range")
+end)
+
+case("edit_lines_keeps_crlf_line_endings", function()
+  local content = "aaa\r\nbbb\r\nccc\r\n"
+  eq(edit_lines(content, 2, 2, "XXX\nYYY"), "aaa\r\nXXX\r\nYYY\r\nccc\r\n")
+  eq(edit_lines(content, 2, 3, ""), "aaa\r\n")
+  eq(edit_lines(content, 1, nil, "TOP"), "TOP\r\naaa\r\nbbb\r\nccc\r\n")
+end)
+
+case("edit_lines_keeps_lf_line_endings", function()
+  eq(edit_lines("aaa\nbbb\nccc\n", 2, 2, "XXX"), "aaa\nXXX\nccc\n")
+end)
+
+case("edit_lines_keeps_a_missing_trailing_newline", function()
+  eq(edit_lines("aaa\r\nbbb", 1, 1, "XXX"), "XXX\r\nbbb")
+  eq(edit_lines("aaa\nbbb", 1, 1, "XXX"), "XXX\nbbb")
+end)
+
+case("fuzzy_edit_keeps_crlf_line_endings", function()
+  local content = "fn f() {\r\n    a();\r\n}\r\n"
+  eq(fuzzy_edit(content, "    a();", "    b();\n    c();"), "fn f() {\r\n    b();\r\n    c();\r\n}\r\n")
+end)
+
+case("line_endings_follow_the_majority_when_mixed", function()
+  eq(edit_lines("a\r\nb\r\nc\r\nd\n", 1, 1, "X"), "X\r\nb\r\nc\r\nd\r\n")
+  eq(edit_lines("a\r\nb\nc\nd\n", 1, 1, "X"), "X\nb\nc\nd\n")
+  eq(edit_lines("a\r\nb\n", 1, 1, "X"), "X\nb\n")
+end)
+
+th.report()

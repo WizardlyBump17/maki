@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
 use futures::future::join_all;
@@ -116,21 +117,27 @@ fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> 
     Ok(())
 }
 
-/// Register {fn} to run as soon as the current task is cancelled, without
-/// waiting for whatever it is doing to finish. Use it to paint the
-/// cancelled state: a handler waiting on children (`gather`, `call_tool`)
-/// stays parked until they wind down, so anything after the wait is too
-/// late to reach the screen.
+/// Register {fn} to run as soon as the current task is cancelled or hits
+/// its deadline, without waiting for whatever it is doing to finish. Use
+/// it to paint the cancelled state: a handler waiting on children
+/// (`gather`, `call_tool`) stays parked until they wind down, so anything
+/// after the wait is too late to reach the screen.
+///
+/// The callback receives the reason (`"cancelled"` or `"timeout"`) and may
+/// still call `ctx:finish`; the host prefers that reply over the generic
+/// cancelled/timeout error. Mark it `is_error = true` and end it with a
+/// marker, so the model knows the output it gets is cut short.
 ///
 /// The callback runs outside your coroutine, so it must not yield. It
 /// fires at most once, immediately if the task is already cancelled. An
 /// error inside it is logged and never reaches your handler, and the
 /// other hooks still run.
 ///
-/// @param fn function Zero-argument function to run on cancel.
+/// @param fn function Function to run on cancel; receives the reason string.
 /// @example
-/// maki.async.on_cancel(function()
-///   view:append({ { "cancelled", "tool_error" } })
+/// maki.async.on_cancel(function(reason)
+///   view:append({ { reason, "tool_error" } })
+///   ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 /// end)
 /// maki.async.gather(children)
 #[lua_fn]
@@ -189,6 +196,26 @@ async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
     Ok(out)
 }
 
+/// Suspend the calling task for {ms} milliseconds. The plugin thread is
+/// never blocked, so other tasks and the UI keep running, and a cancel
+/// still lands while you sleep.
+///
+/// For a timer that has to outlive the tool call that started it, such
+/// as a toast dismissing itself, use `maki.defer_fn`.
+///
+/// @param ms integer Milliseconds to sleep.
+/// @return
+/// @example
+/// maki.async.run(function()
+///   maki.async.sleep(4000)
+///   win:close()
+/// end)
+#[lua_fn]
+async fn sleep(_lua: Lua, ms: u64) -> LuaResult<()> {
+    smol::Timer::after(Duration::from_millis(ms)).await;
+    Ok(())
+}
+
 /// Create a counting semaphore that allows at most {n} concurrent permits.
 /// Use this to limit how many tasks hit a resource at the same time.
 ///
@@ -233,6 +260,7 @@ const await__doc: FnDoc = FnDoc {
         },
     ],
     returns: "(...) Values passed by the caller to the injected callback.",
+    guard: None,
     example: "local result = maki.async.await(2, http.get, url)",
 };
 
@@ -254,6 +282,7 @@ const wrap__doc: FnDoc = FnDoc {
         },
     ],
     returns: "(function) Wrapped function you can call like a normal function.",
+    guard: None,
     example: "local get = maki.async.wrap(2, http.get)\nlocal body = get(url)",
 };
 
@@ -275,6 +304,7 @@ const join__doc: FnDoc = FnDoc {
         },
     ],
     returns: "",
+    guard: None,
     example: "maki.async.join(4, {\n  function() process(files[1]) end,\n  function() process(files[2]) end,\n  function() process(files[3]) end,\n})",
 };
 
@@ -293,7 +323,7 @@ lua_table! {
     /// })
     /// ```
     extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
-        run, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+        run, sleep, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
     ]
 }
 

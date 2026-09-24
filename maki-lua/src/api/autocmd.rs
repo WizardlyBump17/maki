@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::dispatch::{DepthGuard, call_isolated};
+use crate::api::util::dispatch::{DepthGuard, Reentry};
+use crate::runtime::{run_detached, strip_traceback};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,6 +56,12 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 }
 
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
+/// Each callback runs in its own coroutine under its own detached task
+/// scope, so it may suspend (the `maki.fs.*` helpers park on
+/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// across metamethod / C-call boundary". The per-callback scope also means
+/// task-owned jobs a handler starts die with that handler instead of
+/// outliving it to the end of the batch.
 ///
 /// The snapshot below looks racy but is not: all Lua runs on the runtime
 /// thread and plugin unloads arrive through the request channel, so nothing
@@ -63,8 +70,8 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// `data` is shared across callbacks (nvim does the same), but each callback
 /// gets its own `ev` table, so one plugin's mutation cannot leak into the
 /// next.
-pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Value) {
-    let Ok(_guard) = DepthGuard::enter(lua, "autocmd", event) else {
+pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, data: Value) {
+    let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
     };
@@ -72,14 +79,14 @@ pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Valu
         let Some(mut store) = lua.app_data_mut::<AutocmdStore>() else {
             return;
         };
-        let Some(entries) = store.listeners.get_mut(event) else {
+        let Some(entries) = store.listeners.get_mut(&event) else {
             return;
         };
         let mut snapshot = Vec::new();
         // Drop `once` entries now, at snapshot time: if a callback refires
         // the same event they are already gone, so they stay exactly-once.
         entries.retain(|e| {
-            let fires = pattern_matches(e.patterns.as_deref(), pattern);
+            let fires = pattern_matches(e.patterns.as_deref(), pattern.as_deref());
             if fires {
                 snapshot.push((e.id, Arc::clone(&e.plugin), e.callback.clone()));
             }
@@ -88,14 +95,26 @@ pub(crate) fn dispatch(lua: &Lua, event: &str, pattern: Option<&str>, data: Valu
         snapshot
     };
     for (id, plugin, callback) in snapshot {
-        let ev = match make_ev_table(lua, id, event, pattern, &data) {
+        let ev = match make_ev_table(&lua, id, &event, pattern.as_deref(), &data) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!(event, error = %e, "failed to build autocmd ev table");
                 return;
             }
         };
-        call_isolated::<()>(lua, &callback, ev, event, &plugin);
+        if let Err(e) = run_detached(&lua, async {
+            let thread = lua.create_thread(callback)?;
+            thread.into_async::<()>(ev)?.await
+        })
+        .await
+        {
+            tracing::warn!(
+                event,
+                plugin = &*plugin,
+                error = %strip_traceback(&e),
+                "plugin callback failed"
+            );
+        }
     }
 }
 
@@ -128,15 +147,98 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `del_autocmd` later to remove the listener.
 ///
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`, and
-/// `"SessionFocusChanged"`. Plugins can also fire their own events with
+/// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
+/// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
+/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
+/// `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
+/// `"FileIndexReady"`. Plugins can also fire their own events with
 /// `exec_autocmds`.
 ///
-/// Each host event carries `data.session_id`. For `"SessionReset"` that
-/// is the session being left behind; the other events name the session now
-/// running or focused. Tool events also carry `data.tool_id` and `data.tool`.
-/// `"SessionFocusChanged"` also carries `data.previous_session_id` except on
-/// initial startup.
+/// Every host event carries `data.session_id` except `"FileIndexReady"`,
+/// which is about a directory rather than a session. For `"SessionReset"` and
+/// `"SessionEnd"` that is the session being left behind, the other events
+/// name the session now running or focused. What each event adds:
+///
+/// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+/// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
+///   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
+///   cache included), `data.cost`, `data.list_cost`, `data.context_size`,
+///   `data.context_window`, and `data.num_turns` (model round-trips the
+///   turn took). `list_cost` is the un-subsidised list price and `cost` is
+///   the real bill, so a budget plugin charges against whichever one it
+///   wants.
+/// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
+///   trigger time.
+/// - `"CompactionDone"`: `data.context_size_before`,
+///   `data.context_size_after`, and `data.context_window`.
+/// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
+///   agent just wrote. Fires once per draft. Plan state is per session, so
+///   pass `data.session_id` to `maki.plan.read`.
+/// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
+///   first focus at startup.
+/// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
+///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+/// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
+///   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
+///   changes status. A task that comes back from disk already finished
+///   stays quiet, so reloading a session does not replay old tasks.
+/// - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
+///   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
+///   the chat cycling keys, `maki.task.focus`, and a session switch that
+///   lands on another task.
+/// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
+///   plus `data.previous_spec`. Picking the model already in use stays
+///   quiet, and so does startup.
+/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
+///   name when that plugin's `maki.ui.input_edit` was the only writer this
+///   frame, and nil otherwise (including when the user moved the caret), so
+///   ignoring your own name never drops a change. `data.cursor_only` is true
+///   when only the caret moved. Handlers that only care about the text
+///   should return early on it. Fires at most once per frame, and only when
+///   the text or caret changed. Focusing another session republishes that
+///   session's input.
+/// - `"FileIndexReady"`: `data.root`, the absolute directory that was
+///   walked, `data.files`, how many paths the walk left, and `data.crashed`
+///   and `data.truncated`, the two ways that list is not the whole tree.
+///   Fires once per walk that ends, whatever `maki.fs.fuzzy_files` or the
+///   `Ctrl+S` picker started it, so a plugin ranking files asks again
+///   instead of polling. A walk cancelled before it ended stays quiet.
+///   `data.root` is absent for a directory with no UTF-8 spelling, and so is
+///   the `root` of the call that asked for the walk, so a plugin matching
+///   the two takes an event without a root as a reason to ask again. Asking
+///   again only ever re-reads the root the plugin passed.
+///
+/// `"TurnEnd"` fires once per turn and only for the main session, so
+/// subagent turns never show up. A manual `/compact` ends its run without
+/// ending a turn, so it stays quiet too.
+///
+/// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
+/// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
+/// call the dispatcher yet, so plugins loaded under ACP receive no turn
+/// events. Everything else fires under `maki -p` and sdk mode as well.
+///
+/// `"SessionEnd"` is the teardown signal: it fires first so handlers can
+/// still inspect or stop the session's jobs, then session-owned jobs are
+/// reaped. `data.reason` names the path it came from: `"reset"` (TUI
+/// `/new`), `"load"`, `"delete"` (tab closed), `"shutdown"`, `"reload"`
+/// (`/reload` is rebuilding the plugin host, and the session carries on in
+/// the new one), `"replaced"` (an ACP client took the session's place), or
+/// `"completed"` (a headless run finished).
+///
+/// On `"shutdown"`, `"reload"`, `"replaced"`, and `"completed"` the host is
+/// already tearing down, so the UI is detached (`maki.fn` roundtrips fail
+/// right away) and every handler shares one grace period. `data.deadline_ms`
+/// is how much of it is left at dispatch, so write state out with `maki.fs`
+/// and do not park. On the other reasons nothing waits and `data.deadline_ms`
+/// is nil.
+///
+/// `"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
+/// `"SessionEnd"` with `reason = "reset"`.
+///
+/// Jobs started inside a callback die with the dispatch unless you await
+/// them there (`jobwait`) or hand them to a session
+/// (`scope = { session = ... }`).
 ///
 /// @param event string|string[] Event name or list of names.
 /// @param opts table Options:
@@ -194,7 +296,9 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 }
 
 /// Fire one or more events manually. Every matching autocmd callback
-/// runs synchronously before this function returns.
+/// runs to completion before this function returns.
+///
+/// A handler may suspend, so this call may too.
 ///
 /// @param event string|string[] Event name or list of names to fire.
 /// @param opts table? Options:
@@ -207,7 +311,7 @@ fn del_autocmd(lua: &Lua, id: u64) -> LuaResult<()> {
 ///   data = { msg = "hello" },
 /// })
 #[lua_fn]
-fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> {
+async fn exec_autocmds(lua: Lua, event: Value, opts: Option<Table>) -> LuaResult<()> {
     let events = parse_string_or_seq(event, "event")?;
     let (pattern, data) = match opts {
         Some(opts) => {
@@ -221,7 +325,7 @@ fn exec_autocmds(lua: &Lua, event: Value, opts: Option<Table>) -> LuaResult<()> 
         None => (None, Value::Nil),
     };
     for event in events {
-        dispatch(lua, &event, pattern.as_deref(), data.clone());
+        dispatch(lua.clone(), event, pattern.clone(), data.clone()).await;
     }
     Ok(())
 }

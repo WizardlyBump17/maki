@@ -2,15 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
-use crate::components::DisplayRole;
+use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
-use crate::components::{Action, LoadedSession};
-use maki_providers::{Model, TokenUsage};
+use maki_lua::SessionEndReason;
+use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
 
-use crate::AppSession;
+use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState, Status};
@@ -30,19 +31,25 @@ pub(super) struct Sent {
     pub at: Instant,
 }
 
-/// The one content check: `App::checkpoint` saves a session only when this
-/// holds, and the shutdown report reuses it to say which tabs were saved, so
-/// the report and the disk can never disagree.
+/// The one content check. `App::checkpoint` saves a session only when this
+/// holds, and the shutdown report asks the same question, so the report and the
+/// disk never disagree. A draft, a queue or plan mode used to count too, and
+/// every tab that had one showed up in the picker as another empty session.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
-        || session.meta.input_draft.is_some()
-        || !session.meta.queued_messages.is_empty()
-        || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
 }
 
 impl App {
-    pub(crate) fn has_content(&self) -> bool {
-        session_has_content(&self.state.session)
+    /// Stricter than `session_has_content`. A draft or plan mode is not worth a
+    /// file, but it is still worth keeping when the picker wants this tab for
+    /// another session.
+    pub(crate) fn is_blank(&self) -> bool {
+        let session = &self.state.session;
+        let meta = &session.meta;
+        !session_has_content(session)
+            && meta.input_draft.is_none()
+            && meta.queued_messages.is_empty()
+            && meta.mode == Some(StoredMode::Build)
     }
 
     /// The event loop runs this once per frame per session. It syncs whatever
@@ -70,15 +77,13 @@ impl App {
             self.state.token_usage,
         );
 
-        if !self.has_content() {
-            // A draft typed and then deleted is already on disk, and a file with
-            // nothing in it is a session the picker still offers to resume. Idle
-            // only: submitting empties the draft a frame before the agent mirrors
-            // the prompt back, and that gap is not an abandoned session.
+        if !session_has_content(&self.state.session) {
+            // A rewind to the first prompt empties a session already on disk,
+            // which the picker would otherwise still offer to resume.
             let id = self.state.session.id;
-            if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
-            {
-                self.storage_writer.delete(id, |_| {});
+            if self.last_sent.take_if(|last| last.id == id).is_some() {
+                self.storage_writer
+                    .delete(id, Some(self.state.claim.clone()), |_| {});
             }
             return;
         }
@@ -104,7 +109,8 @@ impl App {
             }
         }
 
-        self.storage_writer.send(Arc::clone(&self.state.session));
+        self.storage_writer
+            .send(Arc::clone(&self.state.session), self.state.claim.clone());
         self.last_sent = Some(sent);
     }
 
@@ -128,8 +134,9 @@ impl App {
                 self.recoverable_queue.clone()
             },
             thinking: Some(state.thinking.into()),
-            fast: state.fast,
+            fast: state.fast_intent(),
             workflow: state.workflow,
+            yolo: self.permissions.persisted_yolo(),
         }
     }
 
@@ -147,6 +154,8 @@ impl App {
                     tool_use_id: tool_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    thinking: chat.opts.map(|o| o.thinking.into()),
+                    fast: chat.opts.is_some_and(|o| o.fast),
                 }
             })
             .collect();
@@ -159,9 +168,13 @@ impl App {
         }
     }
 
+    /// Call only once `state.session` is final: the chats it builds are
+    /// stamped with that session for life.
     pub(super) fn reset_ui_chrome(&mut self) {
         self.chats.clear();
         let mut main = Chat::new(
+            self.state.session.id,
+            None,
             "Main".into(),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
@@ -170,16 +183,21 @@ impl App {
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
-        self.status = super::Status::Idle;
+        self.status = Status::Idle;
+        self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
-        self.task_picker_original = None;
         self.last_esc = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
+        // The draft this chrome belonged to is gone, and the Lua thread still
+        // owes answers about it. Retiring them here is what keeps a handler
+        // that comes back after a `/new`, a rewind or a tab switch from
+        // implementing a plan in a session the user never picked in.
+        self.plan_answers.abandon();
     }
 
     pub(crate) fn restore_display(&mut self) {
@@ -192,12 +210,7 @@ impl App {
             &self.ui_config.tool_output_lines,
         );
         self.main_chat().load_messages(display_msgs);
-        // The restored total predates any per-turn cost, so price it once with the
-        // selected model. Later turns add their own exact cost.
-        let cost = self
-            .state
-            .model
-            .cost_of(&self.state.token_usage, self.state.fast);
+        let cost = self.state.cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();
         main.cost = cost;
@@ -207,31 +220,45 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        self.fire_restore_items(restore_items);
+        self.chats[0].request_restores(restore_items);
 
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
         // checkpoint write the same list again.
         for sa in self.state.session.subagents().to_vec() {
-            let idx = self.chats.len();
-            self.chat_index.insert(sa.tool_use_id.clone(), idx);
+            // A subagent reaches disk when it spawns but its transcript only
+            // when it ends, so one without an entry here never got to finish:
+            // leftovers from a kill mid-turn. It has nothing to show, and
+            // restoring it would park a task no agent backs at the top of the
+            // picker, running forever. `sync_subagents` below drops it for good.
+            let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
+                continue;
+            };
+            let (display, items) = history_to_display(
+                messages,
+                self.state.session.tool_outputs(),
+                &self.ui_config.tool_output_lines,
+            );
+            self.chat_index
+                .insert(sa.tool_use_id.clone(), self.chats.len());
             let mut chat = Chat::new(
+                self.state.session.id,
+                Some(&sa.tool_use_id),
                 sa.name,
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
-            if let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) {
-                let (display, items) = history_to_display(
-                    messages,
-                    self.state.session.tool_outputs(),
-                    &self.ui_config.tool_output_lines,
-                );
-                chat.load_messages(display);
-                chat.mark_finished(DisplayRole::Done, DONE_TEXT);
-                self.fire_restore_items(items);
-            }
+            chat.opts = sa.thinking.map(|thinking| RequestOptions {
+                thinking: thinking.into(),
+                fast: sa.fast,
+            });
+            chat.load_messages(display);
+            // The session file keeps the transcript but never how it ended,
+            // so a reload admits that instead of guessing.
+            chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            chat.request_restores(items);
             self.chats.push(chat);
         }
 
@@ -246,24 +273,22 @@ impl App {
         }
     }
 
-    fn fire_restore_items(&self, items: Vec<maki_lua::RestoreItem>) {
-        let Some(tx) = &self.restore_event_tx else {
-            return;
-        };
-        let eh = &self.lua_event_handle;
-        let theme_gen = crate::theme::generation();
-        for mut item in items {
-            item.theme_gen = Some(theme_gen);
-            eh.request_restore(item, tx.clone());
-        }
+    /// The one funnel from a session's meta to the manager that enforces it,
+    /// `App::new` included. A tab keeps one manager while sessions come and go
+    /// under it, and a new tab forks the prototype the process started with, so
+    /// whoever takes a session has to state its answer in full, rules and yolo
+    /// both, or it runs on what the last one was granted. A session that stored
+    /// no yolo falls back to `--yolo` and `always_yolo`.
+    pub(super) fn apply_stored_permissions(&self, meta: &SessionMeta) {
+        self.permissions
+            .load_session_rules(stored_to_rules(&meta.session_rules));
+        self.permissions.set_session_yolo(meta.yolo);
     }
 
     /// Resume at process start: the agent was already spawned with this
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.permissions
-            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -275,18 +300,43 @@ impl App {
     /// agent did not give it (rewind, load, new session), the mirror handle
     /// goes away in the same breath, so no later checkpoint can bring the
     /// agent's stale copy back. Only `respawn_agent` hands a live mirror in.
-    fn install_local_history(&mut self) -> LoadedSession {
+    fn install_local_history(&mut self) -> Vec<Message> {
         self.shared_history = None;
-        LoadedSession {
-            messages: self.state.session.messages().to_vec(),
-            model_spec: self.state.session.model.clone(),
-        }
+        self.state.session.messages().to_vec()
+    }
+
+    /// `/new` swaps a fresh session under this tab, `Ctrl-N` spawns a new tab
+    /// that rebuilds its whole state from this meta, so both gestures keep
+    /// exactly what is listed here. Written out field by field so a new
+    /// `SessionMeta` field has to pick a side: settings that say how the user
+    /// works ride along, anything a finished turn produced stays behind, or the
+    /// new session writes over work it never did.
+    pub(crate) fn blank_session(&self) -> OpenSession {
+        let mut open = OpenSession::fresh(
+            &self.state.model.spec(),
+            &self.state.session.cwd,
+            &self.storage,
+        );
+        open.session.meta = SessionMeta {
+            mode: Some(self.state.mode.into()),
+            thinking: Some(self.state.thinking.into()),
+            fast: self.state.fast_intent(),
+            workflow: self.state.workflow,
+            plan_path: None,
+            plan_written: false,
+            session_rules: Vec::new(),
+            context_size: 0,
+            input_draft: None,
+            queued_messages: Vec::new(),
+            yolo: self.permissions.persisted_yolo(),
+        };
+        open
     }
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.checkpoint_now();
-        self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
+        self.state.cost = None;
         self.state.context_size = 0;
         self.state.plan = PlanState::None;
         if self.state.mode == Mode::Plan {
@@ -296,12 +346,20 @@ impl App {
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
-        self.state.session = Arc::new(AppSession::new(
-            &self.state.session.model,
-            &self.state.session.cwd,
-        ));
-        self.install_local_history();
-        vec![Action::NewSession]
+        self.lua_event_handle
+            .end_session(self.state.session.id, SessionEndReason::Reset);
+        // Swapping the claim is what gives the old session back: the snapshot
+        // `checkpoint_now` just queued holds its own clone until it lands.
+        let OpenSession { session, claim } = self.blank_session();
+        self.apply_stored_permissions(&session.meta);
+        self.state.session = Arc::new(session);
+        self.state.claim = claim;
+        self.reset_ui_chrome();
+        maki_otel::emit::session_started(
+            maki_otel::emit::START_FRESH,
+            Some(&self.state.session.id.to_string()),
+        );
+        vec![Action::RestartAgent(self.install_local_history())]
     }
 
     pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
@@ -315,12 +373,21 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        // The live size came from the provider, so it also counts the system
+        // prompt and the tool schemas, a baseline the estimator cannot see.
+        // Subtract only what we drop, or the gauge collapses until the next
+        // turn measures it again. An emptied history is a fresh session though,
+        // baseline included.
+        let baseline = self
+            .state
+            .context_size
+            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
         let session = self.state.session_mut();
         session.truncate_messages(entry.turn_index);
         session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
         session.update_title_if_default();
-        self.state.context_size =
-            maki_agent::agent::estimate_message_tokens(self.state.session.messages());
+        let kept = estimate_message_tokens(self.state.session.messages());
+        self.state.context_size = if kept == 0 { 0 } else { baseline + kept };
 
         self.reset_ui_chrome();
         self.restore_display();
@@ -328,19 +395,24 @@ impl App {
         self.input_box.set_input(entry.prompt_text);
         self.input_box.buffer.move_to_end();
 
-        vec![Action::LoadSession(Box::new(self.install_local_history()))]
+        vec![Action::RestartAgent(self.install_local_history())]
     }
 
+    /// The event loop owns the policy and the providers, so it resolves the
+    /// model and this only adopts it.
     pub(crate) fn apply_loaded_session(
         &mut self,
-        session: AppSession,
-        fallback_model: &Model,
-    ) -> LoadedSession {
+        open: OpenSession,
+        model: &Model,
+    ) -> Vec<Message> {
+        let previous = self.state.session.id;
         self.checkpoint_now();
-        self.permissions
-            .load_session_rules(stored_to_rules(&session.meta.session_rules));
-        self.state =
-            SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.apply_stored_permissions(&open.session.meta);
+        self.state = SessionState::from_session(open, model, &self.storage);
+        if previous != self.state.session.id {
+            self.lua_event_handle
+                .end_session(previous, SessionEndReason::Load);
+        }
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -349,17 +421,61 @@ impl App {
 
         self.install_local_history()
     }
+}
 
-    pub(crate) fn load_session(&mut self, session_id: MakiId) -> Vec<Action> {
-        let session = match AppSession::load(session_id, &self.storage) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_bar
-                    .flash(format!("Failed to load session: {e}"));
-                return vec![];
-            }
-        };
-        let loaded = self.apply_loaded_session(session, &self.state.model.clone());
-        vec![Action::LoadSession(Box::new(loaded))]
+#[cfg(test)]
+mod tests {
+    use crate::app::tests::test_app;
+    use crate::app::{App, FAST_OFF_MSG, FAST_PENDING_MSG};
+    use crate::components::command::ParsedCommand;
+    use maki_providers::model::FastSupport;
+    use test_case::test_case;
+
+    fn pending_app() -> App {
+        let mut app = test_app();
+        app.state.model.supports_fast_override = Some(FastSupport::Pending);
+        app
+    }
+
+    /// A `/fast` typed before the model list lands has to outlive the snapshot
+    /// a new session inherits, otherwise the answer arrives and the wish is
+    /// already gone.
+    #[test_case(false ; "kept")]
+    #[test_case(true ; "cancelled")]
+    fn pending_fast_survives_snapshot_until_discovery_answers(cancel: bool) {
+        let mut app = pending_app();
+        app.set_fast(true).unwrap();
+        if cancel {
+            app.set_fast(false).unwrap();
+        }
+        assert!(!app.state.fast);
+        assert_eq!(app.state.pending_fast, !cancel);
+        assert_eq!(app.build_meta().fast, !cancel);
+        assert_eq!(app.blank_session().session.meta.fast, !cancel);
+
+        let mut model = app.state.model.clone();
+        model.supports_fast_override = Some(FastSupport::Supported);
+        app.state.update_model(&model);
+        assert_eq!(app.state.fast, !cancel);
+        assert!(!app.state.pending_fast);
+        assert_eq!(app.build_meta().fast, !cancel);
+    }
+
+    #[test]
+    fn fast_command_flashes_pending_while_discovery_runs() {
+        let mut app = pending_app();
+        for expected in [FAST_PENDING_MSG, FAST_OFF_MSG] {
+            app.execute_command(
+                ParsedCommand {
+                    name: "/fast".into(),
+                    args: String::new(),
+                    bang: false,
+                },
+                0,
+            );
+            assert_eq!(app.status_bar.flash_text(), Some(expected));
+            assert!(!app.state.fast);
+        }
+        assert!(!app.state.pending_fast);
     }
 }

@@ -19,7 +19,7 @@ use jiff::tz::TimeZone;
 
 use crate::markdown::{should_truncate, text_to_lines, truncate_output, truncation_notice};
 use maki_agent::{
-    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
+    BufferSnapshot, InstructionBlock, SnapshotSpan, SpanColor, SpanStyle, ToolInput, ToolOutput,
 };
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -38,6 +38,12 @@ pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+/// Instruction blocks have no tool of their own, so they render under this name.
+const INSTRUCTIONS_TOOL: &str = "load";
+/// Stands in for a tool message whose role carries no name.
+const UNNAMED_TOOL: &str = "?";
+const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+const THINKING_EXPAND_HINT: &str = " (click to expand)";
 
 pub struct RoleStyle {
     pub prefix: &'static str,
@@ -77,6 +83,24 @@ pub fn thinking_style() -> RoleStyle {
     }
 }
 
+/// The stand-in for thinking the reader chose not to see. The transcript and
+/// the `/btw` modal both draw it, so it lives here to keep them in step, but
+/// only the transcript rows can be clicked, hence `expandable`.
+pub(crate) fn thinking_indicator(line_count: usize, expandable: bool) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let mut footer = vec![Span::styled(
+        format!("({line_count} lines)"),
+        theme.tool_dim,
+    )];
+    if expandable {
+        footer.push(Span::styled(THINKING_EXPAND_HINT, theme.thinking));
+    }
+    vec![
+        Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
+        Line::from(footer),
+    ]
+}
+
 pub fn error_style() -> RoleStyle {
     RoleStyle {
         prefix: "",
@@ -101,7 +125,6 @@ pub fn done_style() -> RoleStyle {
 
 pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
-    pub search_text: String,
     pub highlight: Option<HighlightRequest>,
     pub spinner_lines: Vec<(usize, usize)>,
     /// Index of the first live-buffer snapshot line, recorded in the same
@@ -205,6 +228,7 @@ pub fn append_right_info(
     }
 }
 
+#[derive(Clone, Copy)]
 enum Indicator {
     InProgress,
     Success,
@@ -223,7 +247,6 @@ impl From<ToolStatus> for Indicator {
 
 struct ResolvedOutput<'a> {
     text: Option<Cow<'a, str>>,
-    full_text: Option<Cow<'a, str>>,
     skipped: usize,
 }
 
@@ -234,13 +257,7 @@ fn resolve_output<'a>(
     pre_truncated: usize,
     limits: RenderLimits,
 ) -> ResolvedOutput<'a> {
-    let full_text: Option<Cow<'a, str>> = match output {
-        Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
-            Some(Cow::Borrowed(t.text.as_str()))
-        }
-        Some(ToolOutput::Batch { text }) => Some(Cow::Borrowed(text.as_str())),
-        _ => None,
-    };
+    let full_text: Option<Cow<'a, str>> = output.and_then(plain_output_text).map(Cow::Borrowed);
 
     let expanded = limits.is_output_expanded();
     let (raw_text, already_truncated): (Option<Cow<'a, str>>, usize) = if expanded {
@@ -249,7 +266,6 @@ fn resolve_output<'a>(
             None if output.is_some() => {
                 return ResolvedOutput {
                     text: None,
-                    full_text: None,
                     skipped: 0,
                 };
             }
@@ -268,7 +284,6 @@ fn resolve_output<'a>(
             (None, None) if output.is_some() => {
                 return ResolvedOutput {
                     text: None,
-                    full_text: None,
                     skipped: 0,
                 };
             }
@@ -289,16 +304,11 @@ fn resolve_output<'a>(
         _ => (None, already_truncated),
     };
 
-    ResolvedOutput {
-        text,
-        full_text,
-        skipped,
-    }
+    ResolvedOutput { text, skipped }
 }
 
 struct ToolLineBuilder {
     lines: Vec<Line<'static>>,
-    search_text: String,
     spinner_lines: Vec<(usize, usize)>,
     snapshot_base: Option<usize>,
     content_range: (usize, usize),
@@ -306,14 +316,19 @@ struct ToolLineBuilder {
     truncation: SectionFlags,
     limits: RenderLimits,
     markdown: bool,
+    indicator: Indicator,
 }
 
 impl ToolLineBuilder {
-    fn new(width: u16, expanded: SectionFlags, max_output_lines: usize) -> Self {
+    fn new(
+        width: u16,
+        expanded: SectionFlags,
+        max_output_lines: usize,
+        indicator: Indicator,
+    ) -> Self {
         let limits = RenderLimits::new(expanded, max_output_lines);
         Self {
             lines: Vec::new(),
-            search_text: String::new(),
             spinner_lines: Vec::new(),
             snapshot_base: None,
             content_range: (0, 0),
@@ -321,6 +336,7 @@ impl ToolLineBuilder {
             truncation: SectionFlags::default(),
             limits,
             markdown: false,
+            indicator,
         }
     }
 
@@ -345,50 +361,45 @@ impl ToolLineBuilder {
             if let Some(first_line) = snapshot.lines.first() {
                 let line_idx = self.lines.len();
                 let spinners = &mut self.spinner_lines;
-                bake_spans(&first_line.spans, &mut spans, spinner_str(0), |span_idx| {
-                    spinners.push((line_idx, span_idx));
-                });
+                bake_spans(
+                    &first_line.spans,
+                    &mut spans,
+                    spinner_str(0),
+                    self.indicator,
+                    |span_idx| {
+                        spinners.push((line_idx, span_idx));
+                    },
+                );
             }
         } else {
             spans.push(Span::styled(header.to_owned(), theme::current().tool));
         }
-        let mut copy = format!("{tool_name}> {header}");
         if let Some(ann) = annotation {
             spans.push(Span::styled(
                 format!(" ({ann})"),
                 theme::current().tool_annotation,
             ));
-            write!(copy, " ({ann})").unwrap();
         }
         self.lines.push(Line::from(spans));
-        self.search_text = copy;
     }
 
-    fn push_search_text(&mut self, text: &str) {
-        if !self.search_text.is_empty() {
-            self.search_text.push('\n');
-        }
-        self.search_text.push_str(text);
-    }
-
-    fn prepend_indicator(&mut self, indicator: Indicator, started_at: Instant) {
+    fn prepend_indicator(&mut self, started_at: Instant) {
         if self.lines.is_empty() {
             return;
         }
-        let (text, style) = match indicator {
+        let (text, style) = match self.indicator {
             Indicator::InProgress => {
                 let ch = spinner_frame(started_at.elapsed().as_millis());
                 (format!("{ch} "), theme::current().spinner)
             }
-            Indicator::Success => (TOOL_INDICATOR.into(), theme::current().tool_success),
-            Indicator::Error => (TOOL_INDICATOR.into(), theme::current().tool_error),
+            finished => (TOOL_INDICATOR.into(), finished_style(finished)),
         };
         for (line, span) in &mut self.spinner_lines {
             if *line == 0 {
                 *span += 1;
             }
         }
-        if matches!(indicator, Indicator::InProgress) {
+        if matches!(self.indicator, Indicator::InProgress) {
             self.spinner_lines.push((0, 0));
         }
         self.lines[0].spans.insert(0, Span::styled(text, style));
@@ -404,12 +415,6 @@ impl ToolLineBuilder {
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
-        if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) = input {
-            self.push_search_text(code.trim_end());
-        }
-        if let Some(text) = output.and_then(|o| o.structured_display_text()) {
-            self.push_search_text(&text);
-        }
     }
 
     fn push_resolved_output(&mut self, resolved: &ResolvedOutput<'_>) {
@@ -429,11 +434,6 @@ impl ToolLineBuilder {
                 self.push_markdown_body(text);
             } else {
                 push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT);
-            }
-            if let Some(full) = &resolved.full_text {
-                self.push_search_text(full);
-            } else {
-                self.push_search_text(text);
             }
             self.push_truncation_count(resolved.skipped);
         }
@@ -466,25 +466,16 @@ impl ToolLineBuilder {
         }
     }
 
-    fn push_snapshot(
-        &mut self,
-        snapshot: &BufferSnapshot,
-        search_fallback: Option<&str>,
-        started_at: Instant,
-    ) {
+    fn push_snapshot(&mut self, snapshot: &BufferSnapshot, started_at: Instant) {
         let base = self.lines.len();
         self.snapshot_base = Some(base);
         let total = snapshot.lines.len();
         let frame = spinner_str(started_at.elapsed().as_millis());
         let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame);
+            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, self.indicator);
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
-        self.push_search_text(&snapshot.text());
-        if let Some(text) = search_fallback {
-            self.push_search_text(text);
-        }
     }
 
     fn finish(
@@ -496,7 +487,6 @@ impl ToolLineBuilder {
         let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
         ToolLines {
             lines: self.lines,
-            search_text: self.search_text,
             highlight,
             spinner_lines: self.spinner_lines,
             snapshot_base: self.snapshot_base,
@@ -517,18 +507,26 @@ fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static 
 }
 
 /// Bakes snapshot spans onto `out`. `"spinner"`-styled spans bake to the
-/// current frame, and `on_spinner` gets their span index in the same pass,
-/// so animation offsets can never drift from the baked spans.
+/// current frame while a tool is in progress, and `on_spinner` gets their
+/// span index in the same pass, so animation offsets can never drift from
+/// the baked spans. Finished tools bake a static dot instead and record no
+/// spinner position, so a stale `"spinner"` span can never keep animating.
 fn bake_spans(
     src: &[SnapshotSpan],
     out: &mut Vec<Span<'static>>,
     spinner_frame: &'static str,
+    indicator: Indicator,
     mut on_spinner: impl FnMut(usize),
 ) {
     for span in src {
         if matches!(&span.style, SpanStyle::Named(n) if n == SPINNER_STYLE_NAME) {
-            on_spinner(out.len());
-            out.push(Span::styled(spinner_frame, theme::current().spinner));
+            match indicator {
+                Indicator::InProgress => {
+                    on_spinner(out.len());
+                    out.push(Span::styled(spinner_frame, theme::current().spinner));
+                }
+                finished => out.push(Span::styled(TOOL_INDICATOR, finished_style(finished))),
+            }
         } else {
             out.push(Span::styled(
                 span.text.clone(),
@@ -538,11 +536,20 @@ fn bake_spans(
     }
 }
 
+fn finished_style(indicator: Indicator) -> Style {
+    if matches!(indicator, Indicator::Error) {
+        theme::current().tool_error
+    } else {
+        theme::current().tool_success
+    }
+}
+
 fn snapshot_to_lines_range(
     snapshot: &BufferSnapshot,
     indent: &str,
     range: std::ops::Range<usize>,
     spinner_frame: &'static str,
+    indicator: Indicator,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut spinners = Vec::new();
     let lines = snapshot.lines[range]
@@ -550,13 +557,23 @@ fn snapshot_to_lines_range(
         .enumerate()
         .map(|(i, sline)| {
             let mut spans = vec![Span::raw(indent.to_string())];
-            bake_spans(&sline.spans, &mut spans, spinner_frame, |span_idx| {
-                spinners.push((i, span_idx));
-            });
+            bake_spans(
+                &sline.spans,
+                &mut spans,
+                spinner_frame,
+                indicator,
+                |span_idx| {
+                    spinners.push((i, span_idx));
+                },
+            );
             Line::from(spans)
         })
         .collect();
     (lines, spinners)
+}
+
+fn span_color(c: SpanColor) -> Option<Color> {
+    theme::segment_slot(theme::segment_color_from_span(c))
 }
 
 pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
@@ -565,11 +582,11 @@ pub(crate) fn resolve_span_style(style: &SpanStyle) -> Style {
         SpanStyle::Named(name) => theme::style_by_name(name),
         SpanStyle::Inline(inline) => {
             let mut s = Style::default();
-            if let Some((r, g, b)) = inline.fg {
-                s = s.fg(Color::Rgb(r, g, b));
+            if let Some(fg) = inline.fg.and_then(span_color) {
+                s = s.fg(fg);
             }
-            if let Some((r, g, b)) = inline.bg {
-                s = s.bg(Color::Rgb(r, g, b));
+            if let Some(bg) = inline.bg.and_then(span_color) {
+                s = s.bg(bg);
             }
             if inline.bold {
                 s = s.bold();
@@ -600,13 +617,18 @@ pub fn build_tool_lines(
     rctx: &RenderCtx,
     expanded: SectionFlags,
 ) -> ToolLines {
-    let tool_name = msg.role.tool_name().unwrap_or("?");
+    let tool_name = msg.role.tool_name().unwrap_or(UNNAMED_TOOL);
     let (header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
 
-    let mut b = ToolLineBuilder::new(rctx.width, expanded, rctx.tool_output_lines.get(tool_name));
+    let mut b = ToolLineBuilder::new(
+        rctx.width,
+        expanded,
+        rctx.tool_output_lines.get(tool_name),
+        status.into(),
+    );
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
         tool_name,
@@ -614,7 +636,7 @@ pub fn build_tool_lines(
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
-    b.prepend_indicator(status.into(), rctx.started_at);
+    b.prepend_indicator(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
@@ -625,17 +647,7 @@ pub fn build_tool_lines(
         },
     );
     let show_output = if let Some(ref snapshot) = msg.render_snapshot {
-        let search_text = msg
-            .tool_output
-            .as_ref()
-            .and_then(|o| match o.as_ref() {
-                ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
-                    Some(t.text.as_str())
-                }
-                _ => None,
-            })
-            .or(body);
-        b.push_snapshot(snapshot, search_text, rctx.started_at);
+        b.push_snapshot(snapshot, rctx.started_at);
         // A denial can land while the snapshot still shows only the
         // pre-permission script preview, so the error goes below it.
         // But a collapsed snapshot keeps just a window of the output,
@@ -673,6 +685,78 @@ pub fn build_tool_lines(
     )
 }
 
+/// What `/` searches for one tool message, built on demand instead of kept
+/// beside every rendered segment. It follows the same order
+/// [`build_tool_lines`] draws in, except the output is never truncated: a
+/// collapsed tool would otherwise hide its own body from search, and a tool
+/// still running is searched through its live buffer.
+pub fn search_text_for(msg: &DisplayMessage) -> String {
+    let (header, body) = match msg.text.split_once('\n') {
+        Some((h, b)) => (h, Some(b)),
+        None => (msg.text.as_str(), None),
+    };
+    let mut out = header_search_text(
+        msg.role.tool_name().unwrap_or(UNNAMED_TOOL),
+        header,
+        msg.annotation.as_deref(),
+    );
+
+    let output = msg.tool_output.as_deref();
+    if let Some(ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) =
+        msg.tool_input.as_deref()
+    {
+        push_section(&mut out, code.trim_end());
+    }
+    if let Some(text) = output.and_then(ToolOutput::structured_display_text) {
+        push_section(&mut out, &text);
+    }
+    if let Some(snapshot) = &msg.render_snapshot {
+        push_section(&mut out, &snapshot.text());
+    }
+    if let Some(text) = output
+        .and_then(plain_output_text)
+        .or(body)
+        .or(msg.live_output.as_deref())
+    {
+        push_section(&mut out, text);
+    }
+    out
+}
+
+/// An instruction segment sits beside its tool but draws its own blocks, so it
+/// searches on its own text.
+pub fn instructions_search_text(blocks: &[InstructionBlock]) -> String {
+    let (header, annotation) = instructions_header(blocks);
+    let mut out = header_search_text(INSTRUCTIONS_TOOL, header, annotation.as_deref());
+    for block in blocks {
+        push_section(&mut out, &block.content);
+    }
+    out
+}
+
+fn header_search_text(tool: &str, header: &str, annotation: Option<&str>) -> String {
+    match annotation {
+        Some(ann) => format!("{tool}> {header} ({ann})"),
+        None => format!("{tool}> {header}"),
+    }
+}
+
+fn push_section(out: &mut String, text: &str) {
+    out.push('\n');
+    out.push_str(text);
+}
+
+/// The untruncated output text, for the variants that carry one.
+fn plain_output_text(output: &ToolOutput) -> Option<&str> {
+    match output {
+        ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t) => {
+            Some(t.text.as_str())
+        }
+        ToolOutput::Batch { text } => Some(text.as_str()),
+        _ => None,
+    }
+}
+
 pub fn truncate_to_header(text: &mut String) {
     let end = text.find('\n').unwrap_or(text.len());
     text.truncate(end);
@@ -685,25 +769,30 @@ pub(crate) fn append_annotation(ann: &mut Option<String>, suffix: &str) {
     }
 }
 
+fn instructions_header(blocks: &[InstructionBlock]) -> (&str, Option<String>) {
+    let path = blocks.first().map_or("", |b| b.path.as_str());
+    let extra = (blocks.len() > 1).then(|| format!("+{}", blocks.len() - 1));
+    (path, extra)
+}
+
 pub fn build_instructions_lines(
     blocks: &[InstructionBlock],
     width: u16,
     expanded: bool,
 ) -> ToolLines {
-    let header = blocks.first().map_or("", |b| b.path.as_str());
-    let annotation = if blocks.len() > 1 {
-        Some(format!("+{}", blocks.len() - 1))
-    } else {
-        None
-    };
-
+    let (header, annotation) = instructions_header(blocks);
     let exp = SectionFlags {
         script: false,
         output: expanded,
     };
-    let mut b = ToolLineBuilder::new(width, exp, code_view::instruction_limit(expanded));
-    b.push_header("load", header, annotation.as_deref(), None);
-    b.prepend_indicator(Indicator::Success, Instant::now());
+    let mut b = ToolLineBuilder::new(
+        width,
+        exp,
+        code_view::instruction_limit(expanded),
+        Indicator::Success,
+    );
+    b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None);
+    b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
     let has_truncation =
@@ -713,14 +802,6 @@ pub fn build_instructions_lines(
         line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
     }
     b.content_range = (start, b.lines.len());
-
-    b.push_search_text(
-        &blocks
-            .iter()
-            .map(|bl| bl.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    );
 
     let output = Arc::new(ToolOutput::Instructions {
         blocks: blocks.to_vec(),
@@ -736,6 +817,7 @@ mod tests {
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::TRUNCATION_PREFIX;
     use maki_agent::tools::{BASH_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME};
+    use maki_agent::types::{DefaultColor, InlineStyle};
     use maki_agent::{SnapshotLine, SnapshotSpan, TextOutput, ToolInput, ToolOutput};
     use test_case::test_case;
 
@@ -801,6 +883,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         }
     }
 
@@ -939,6 +1022,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         }
     }
 
@@ -1034,6 +1118,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         }
     }
 
@@ -1074,6 +1159,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         }
     }
 
@@ -1094,16 +1180,10 @@ mod tests {
             text: "import asyncio".into(),
             style: SpanStyle::Named("keyword".into()),
         }]]);
-        let tl = build_tool_lines(
-            &snapshot_msg(snapshot),
-            ToolStatus::Success,
-            &test_rctx(80),
-            SectionFlags::default(),
-        );
+        let text = search_text_for(&snapshot_msg(snapshot));
         assert!(
-            tl.search_text.contains("import asyncio"),
-            "search must index the rendered snapshot body, got: {}",
-            tl.search_text
+            text.contains("import asyncio"),
+            "search must index the rendered snapshot body, got: {text}"
         );
     }
 
@@ -1289,8 +1369,8 @@ mod tests {
         assert!(text.contains("from_snapshot"));
         assert!(!text.contains("plain fallback"));
         assert!(
-            tl.search_text.contains("plain fallback"),
-            "search_text should contain tool output for Ctrl+F"
+            search_text_for(&msg).contains("plain fallback"),
+            "search must reach the tool output the snapshot hides"
         );
     }
 
@@ -1387,6 +1467,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         }
     }
 
@@ -1488,6 +1569,7 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         }
     }
 
@@ -1598,16 +1680,11 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         };
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80),
-            SectionFlags::default(),
-        );
         assert!(
-            tl.search_text.contains("llm_output_here"),
-            "search_text should come from ToolOutput::Plain, not body text"
+            search_text_for(&msg).contains("llm_output_here"),
+            "search text should come from ToolOutput::Plain, not body text"
         );
     }
 
@@ -1637,25 +1714,50 @@ mod tests {
             render_header: None,
             snapshot_theme_gen: 0,
             thinking_collapsed: false,
+            images: Vec::new(),
         };
-        let tl = build_tool_lines(
-            &msg,
-            ToolStatus::Success,
-            &test_rctx(80),
-            SectionFlags::default(),
-        );
         assert!(
-            tl.search_text.contains("body_fallback"),
-            "search_text should fall back to msg body when no plain output"
+            search_text_for(&msg).contains("body_fallback"),
+            "search text should fall back to msg body when no plain output"
+        );
+    }
+
+    #[test]
+    fn search_text_reaches_the_live_buffer_of_a_running_tool() {
+        const LIVE_TEXT: &str = "streaming_line";
+        let msg = DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                status: ToolStatus::InProgress,
+                name: "bash".into(),
+            })),
+            text: "cargo build".into(),
+            tool_input: None,
+            tool_raw_input: None,
+            tool_output: None,
+            live_output: Some(LIVE_TEXT.into()),
+            annotation: None,
+            plan_path: None,
+            timestamp: None,
+            turn_usage: None,
+            truncated_lines: 0,
+            render_snapshot: None,
+            render_header: None,
+            snapshot_theme_gen: 0,
+            thinking_collapsed: false,
+            images: Vec::new(),
+        };
+        assert!(
+            search_text_for(&msg).contains(LIVE_TEXT),
+            "a tool still running is only searchable through its live buffer"
         );
     }
 
     #[test]
     fn resolve_span_style_inline_all_modifiers() {
-        use maki_agent::types::InlineStyle;
         let style = SpanStyle::Inline(InlineStyle {
-            fg: Some((10, 20, 30)),
-            bg: Some((40, 50, 60)),
+            fg: Some(SpanColor::Rgb((10, 20, 30))),
+            bg: Some(SpanColor::Rgb((40, 50, 60))),
             bold: true,
             italic: true,
             underline: true,
@@ -1675,6 +1777,21 @@ mod tests {
         assert!(resolved.add_modifier.contains(Modifier::REVERSED));
     }
 
+    /// A span asking for the terminal default has to leave the slot empty.
+    /// Setting `Color::Reset` would win over the line style underneath it, and
+    /// the selected row of a plugin float would lose its highlight.
+    #[test_case(SpanColor::Ansi(4), Some(Color::Blue) ; "palette index")]
+    #[test_case(SpanColor::Default(DefaultColor::Default), None ; "terminal default")]
+    fn resolve_span_style_inline_colors(color: SpanColor, expected: Option<Color>) {
+        let style = SpanStyle::Inline(InlineStyle {
+            fg: Some(color),
+            bg: Some(color),
+            ..InlineStyle::default()
+        });
+        let resolved = resolve_span_style(&style);
+        assert_eq!((resolved.fg, resolved.bg), (expected, expected));
+    }
+
     #[test]
     fn default_span_resolves_to_theme_tool() {
         theme::set(theme::load_by_name("dracula").expect("dracula theme"));
@@ -1690,7 +1807,8 @@ mod tests {
             text: "content".into(),
             style: SpanStyle::Default,
         }]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ");
+        let (lines, _) =
+            snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", Indicator::InProgress);
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
         assert_eq!(first_span.content.as_ref(), ">>");
@@ -1712,7 +1830,7 @@ mod tests {
                 style: SpanStyle::Default,
             },
         ]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ");
+        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", Indicator::InProgress);
         let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
     }
@@ -1735,8 +1853,63 @@ mod tests {
                 },
             ],
         ]);
-        let (lines, spinners) = snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ");
+        let (lines, spinners) =
+            snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", Indicator::InProgress);
         assert_eq!(spinners, vec![(1, 2)]);
         assert_eq!(lines[1].spans[2].content.as_ref(), "⠹ ");
+    }
+
+    #[test_case(ToolStatus::Success ; "success_bakes_dot")]
+    #[test_case(ToolStatus::Error ; "error_bakes_dot")]
+    fn done_snapshot_with_spinner_span_bakes_dot_and_records_no_spinner(status: ToolStatus) {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "child ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let tl = build_tool_lines(
+            &snapshot_msg(snapshot),
+            status,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.spinner_lines, vec![]);
+        let body = tl.lines.get(1).expect("snapshot body line");
+        let dot = body.spans.last().expect("baked dot span");
+        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    #[test]
+    fn done_header_with_spinner_span_bakes_dot_and_records_no_spinner() {
+        let header = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "3 tools ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let msg = DisplayMessage {
+            render_header: Some(header),
+            render_snapshot: None,
+            ..snapshot_msg(make_snapshot(vec![]))
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.spinner_lines, vec![]);
+        let header_line = tl.lines.first().expect("header line");
+        let dot = header_line.spans.last().expect("baked dot span");
+        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
     }
 }

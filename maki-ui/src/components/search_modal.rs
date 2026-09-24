@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 
 use crate::components::Overlay;
 use crate::components::keybindings::key;
+use crate::components::messages::ScrollPos;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::text_buffer::TextBuffer;
@@ -34,7 +35,7 @@ pub enum SearchAction {
     Consumed,
     Navigate,
     Select(usize),
-    Close(Option<(u16, bool)>),
+    Close(Option<(ScrollPos, bool)>),
 }
 
 pub struct SearchModal {
@@ -44,7 +45,7 @@ pub struct SearchModal {
     scroll_offset: usize,
     viewport_height: usize,
     open: bool,
-    saved_scroll: Option<(u16, bool)>,
+    saved_scroll: Option<(ScrollPos, bool)>,
     matcher: Matcher,
 }
 
@@ -62,10 +63,10 @@ impl SearchModal {
         }
     }
 
-    pub fn open(&mut self, scroll_top: u16, auto_scroll: bool) {
+    pub fn open(&mut self, scroll: ScrollPos, auto_scroll: bool) {
         self.reset();
         self.open = true;
-        self.saved_scroll = Some((scroll_top, auto_scroll));
+        self.saved_scroll = Some((scroll, auto_scroll));
     }
 
     pub fn close(&mut self) {
@@ -146,7 +147,9 @@ impl SearchModal {
         }
     }
 
-    pub fn update_matches(&mut self, segment_texts: &[&str]) {
+    /// `corpus` is called only once there is something to match, so an empty
+    /// query never pays to materialize the transcript.
+    pub fn update_matches(&mut self, corpus: impl FnOnce() -> Vec<String>) {
         let query = self.search.value();
         self.matches.clear();
         self.selected = 0;
@@ -166,7 +169,7 @@ impl SearchModal {
 
         let mut buf = Vec::new();
         let mut indices = Vec::new();
-        for (idx, text) in segment_texts.iter().enumerate() {
+        for (idx, text) in corpus().iter().enumerate() {
             if text.is_empty() {
                 continue;
             }
@@ -217,9 +220,9 @@ impl SearchModal {
         self.render_list(frame, list_area, viewport_h);
         self.render_search(frame, search_area);
 
-        let total = self.matches.len() as u16;
-        if total > viewport_h as u16 {
-            render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u16);
+        let total = self.matches.len() as u32;
+        if total > viewport_h as u32 {
+            render_vertical_scrollbar(frame, list_area, total, self.scroll_offset as u32);
         }
 
         popup
@@ -365,9 +368,9 @@ mod tests {
 
     fn modal_with_query(query: &str, texts: &[&str]) -> SearchModal {
         let mut modal = SearchModal::new();
-        modal.open(0, true);
+        modal.open(ScrollPos::default(), true);
         modal.search = TextBuffer::new(query.into());
-        modal.update_matches(texts);
+        modal.update_matches(|| texts.iter().map(|t| (*t).to_owned()).collect());
         modal
     }
 

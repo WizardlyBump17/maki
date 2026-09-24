@@ -33,6 +33,8 @@ const RECOVERED_TEXT: &str = "summary after nudge";
 const SUMMARY_NUDGE_FRAGMENT: &str = "concise summary";
 const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
+const PARTIAL_TEXT: &str = "half a transcript";
+const CANCELLED_ERR: &str = "cancelled";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
@@ -42,6 +44,7 @@ const SCENARIO_INVALID_THEN_VALID: &str = "invalid_then_valid";
 const SCENARIO_NEVER_STRUCTURED: &str = "never_structured";
 const SCENARIO_INVALID_ONLY: &str = "invalid_only";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
+const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
 const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
@@ -117,6 +120,10 @@ behaviors.prompt_error = function(sess, msg)
   return nil, "@PROMPT_ERR@"
 end
 
+behaviors.partial_error = function(sess, msg)
+  return { text = "@PARTIAL_TEXT@" }, "@CANCELLED_ERR@"
+end
+
 behaviors.no_summary = function(sess, msg)
   return { text = "" }
 end
@@ -135,6 +142,7 @@ end
 maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
+  recorder.thinking = opts.thinking
   local sess = { opts = opts }
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
@@ -157,6 +165,7 @@ maki.api.register_tool({
       closed = recorder.closed,
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
+      thinking = recorder.thinking,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -189,7 +198,9 @@ fn load_task_host_with_opts(
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
-        .replace("@RAISE_MSG@", RAISE_MSG);
+        .replace("@RAISE_MSG@", RAISE_MSG)
+        .replace("@PARTIAL_TEXT@", PARTIAL_TEXT)
+        .replace("@CANCELLED_ERR@", CANCELLED_ERR);
     host.load_source_with_opts(
         "task_policy",
         &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
@@ -227,6 +238,26 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
 }
 
 const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+
+/// Advertised to the model, so the wording lives in the docs, not here: what
+/// matters is that the property exists and that whatever the model writes
+/// reaches the session verbatim, capping being the session's job.
+#[test_case::test_case(Some(json!("high")) ; "effort")]
+#[test_case::test_case(Some(json!(4096)) ; "token_budget")]
+#[test_case::test_case(None ; "inherit_parent_when_omitted")]
+fn thinking_forwards_to_session(thinking: Option<Value>) {
+    let (reg, _host) = load_task_host();
+    let entry = reg.get(TASK_TOOL).expect("task tool missing");
+    assert!(entry.tool.schema()["properties"]["thinking"].is_object());
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    if let Some(thinking) = &thinking {
+        input["thinking"] = thinking.clone();
+    }
+
+    exec_tool(&reg, TASK_TOOL, input).expect("task failed");
+    let snap = probe(&reg);
+    assert_eq!(snap.get("thinking"), thinking.as_ref());
+}
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {
@@ -410,6 +441,19 @@ fn prompt_error_maps_to_sub_agent_error() {
     assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
     let snap = probe(&reg);
     assert_eq!(snap["closed"], json!(1));
+}
+
+/// Esc during a sub-agent run: the prompt hands back both an error and
+/// whatever the sub-agent managed to say, and half a transcript is worth
+/// more to the model than a bare "cancelled".
+#[test]
+fn interrupted_prompt_reports_the_partial_transcript() {
+    let (reg, _host) = load_task_host();
+    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PARTIAL_ERROR, None)).unwrap_err();
+    assert_eq!(
+        err,
+        format!("sub-agent interrupted ({CANCELLED_ERR}). Partial output:\n{PARTIAL_TEXT}")
+    );
 }
 
 #[test]

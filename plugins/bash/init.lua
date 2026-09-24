@@ -1,6 +1,7 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+local partial = require("maki.partial")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
 local RTK_UNSUPPORTED_FLAGS = {
@@ -103,7 +104,7 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and config.no_rtk then
+  if config and not config.rtk then
     return nil
   end
 
@@ -191,43 +192,61 @@ local function is_complex(node)
   return false
 end
 
-local LEAF_COMMAND_TYPES = {
-  command = true,
-  redirected_statement = true,
-  negated_command = true,
-  subshell = true,
-  compound_statement = true,
-  if_statement = true,
-  while_statement = true,
-  for_statement = true,
-  case_statement = true,
-  function_definition = true,
-  c_style_for_statement = true,
+local REDIRECT_TYPES = {
+  file_redirect = true,
+  heredoc_redirect = true,
+  herestring_redirect = true,
 }
 
+-- Nodes we walk through instead of turning into a scope. `redirected_statement`
+-- has to be one of them: tree-sitter hangs a trailing `2>&1` off the entire
+-- `cd x && cargo test` chain rather than off `cargo test`, so treating it as a
+-- leaf turns the whole chain into a single scope starting with `cd `, and a
+-- `cd *` allow rule then quietly covers whatever runs after the `&&`.
+local WALK_THROUGH_TYPES = {
+  program = true,
+  list = true,
+  pipeline = true,
+  redirected_statement = true,
+}
+
+local function node_text(node, source)
+  return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+end
+
+-- Anything we don't walk through becomes one scope, its own text. That covers
+-- plain commands and the block forms (`if`, `while`, subshells) we deliberately
+-- keep whole, plus any node type we never thought of, which is what we want:
+-- an unknown node has to end up in front of the user, not get dropped.
 local function collect_commands(node, source)
-  local out = {}
-  local kind = node:type()
-  if kind == "program" or kind == "list" then
-    for child in node:iter_children() do
-      local nested = collect_commands(child, source)
-      for _, cmd in ipairs(nested) do
-        out[#out + 1] = cmd
-      end
-    end
-  elseif kind == "pipeline" then
-    for child in node:iter_children() do
-      if child:named() then
-        local text = maki.treesitter.get_node_text(child, source):match("^%s*(.-)%s*$")
-        if text ~= "" then
-          out[#out + 1] = text
+  if not WALK_THROUGH_TYPES[node:type()] then
+    local text = node_text(node, source)
+    return text ~= "" and { text } or {}
+  end
+
+  local out, redirects = {}, {}
+  for child in node:iter_children() do
+    local kind = child:type()
+    if child:named() and kind ~= "comment" then
+      if REDIRECT_TYPES[kind] then
+        redirects[#redirects + 1] = node_text(child, source)
+      else
+        for _, cmd in ipairs(collect_commands(child, source)) do
+          out[#out + 1] = cmd
         end
       end
     end
-  elseif LEAF_COMMAND_TYPES[kind] then
-    local text = maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
-    if text ~= "" then
-      out[#out + 1] = text
+  end
+
+  -- The redirect belongs to the last command of the chain, the one bash would
+  -- actually apply it to. A bodiless `> log` has no such command and still
+  -- truncates the file, so it becomes a scope of its own instead of vanishing.
+  if #redirects > 0 then
+    local text = table.concat(redirects, " ")
+    if #out > 0 then
+      out[#out] = out[#out] .. " " .. text
+    else
+      out[1] = text
     end
   end
   return out
@@ -242,7 +261,8 @@ Commands run in ]] .. cwd .. [[ by default.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
 - Output truncated beyond 2000 lines or 50KB.
-- Interactive commands (sudo, ssh prompts) fail immediately.]]
+- Interactive commands (sudo, ssh prompts) fail immediately.
+- Use the `tail` param, not `| tail`: piping hides live output.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
@@ -267,9 +287,11 @@ maki.api.register_tool({
       command = { type = "string", description = "The bash command to execute", required = true },
       timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
+      tail = { type = "integer", description = "Return only the last N lines" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
+  permission = "run",
   permission_scopes = function(input)
     local command = input.command
     if not command or command:match("^%s*$") then
@@ -299,12 +321,19 @@ maki.api.register_tool({
     if workdir then
       s = s .. " in " .. relative_path(workdir)
     end
+    local hints = {}
     if input.timeout then
-      local buf = maki.ui.buf()
-      buf:line({ { s }, { " (" .. maki.ui.humantime(input.timeout) .. " timeout)", "dim" } })
-      return buf
+      hints[#hints + 1] = maki.ui.humantime(input.timeout) .. " timeout"
     end
-    return s
+    if input.tail then
+      hints[#hints + 1] = "tail " .. input.tail
+    end
+    if #hints == 0 then
+      return s
+    end
+    local buf = maki.ui.buf()
+    buf:line({ { s }, { " (" .. table.concat(hints, ", ") .. ")", "dim" } })
+    return buf
   end,
 
   restore = function(input, output, is_error, ctx)
@@ -338,6 +367,10 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
+    if input.tail and input.tail < 1 then
+      return { llm_output = "error: tail must be >= 1", is_error = true }
+    end
+
     local command, workdir = parse_cd_hint(input)
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
@@ -353,10 +386,25 @@ maki.api.register_tool({
 
     local output_parts = {}
     local has_output = false
+    local finished = false
+
+    -- The cut happens on the accumulated text, after the view already streamed
+    -- every line, so the user still sees the whole run while the model gets
+    -- only the tail. Both the exit and the cancel path go through here.
+    local function final_output()
+      local output = table.concat(output_parts)
+      if input.tail then
+        output = output_limits.tail(output, input.tail)
+      end
+      return truncate(output, max_lines, max_bytes)
+    end
 
     local function finish(exit_code)
-      local output = table.concat(output_parts)
-      output = truncate(output, max_lines, max_bytes)
+      if finished then
+        return
+      end
+      finished = true
+      local output = final_output()
 
       local is_error = exit_code ~= 0
       local llm_output
@@ -408,6 +456,16 @@ maki.api.register_tool({
         finish(code)
       end,
     })
+
+    -- Esc or deadline: hand back the lines streamed so far, so the model
+    -- keeps what the user just watched instead of a bare error.
+    maki.async.on_cancel(function(reason)
+      if finished then
+        return
+      end
+      finished = true
+      ctx:finish(partial.cut(view, final_output(), reason, timeout_secs))
+    end)
 
     return nil
   end,

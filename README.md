@@ -2,6 +2,12 @@
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
+## Benchmarks
+
+<img src="./site/bench.svg" alt="Maki 0.5.5 at 70% pass rate and $2.06 per pass, against the FrontierHarness Eval baselines">
+
+[FrontierHarness Eval](https://frontierharness.org/) benchmark result, [click here to download report.zip](https://github.com/tontinton/maki/releases/download/v0.5.5/frontierharness-report-2026-09-21.zip)
+
 ## Features
 
 ### Context efficiency
@@ -10,7 +16,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * `code_execution` tool - uses [monty](https://github.com/pydantic/monty) to run an interpreter that has all other tools available as async functions. Maki uses it to filter / summarize / transform / pipe data to other tools as input, without it ever reaching and polluting the context window. Sandbox limited by time & memory.
 * `task` tool - when delegating work to subagents, the AI chooses whether to run weak / medium / strong model of used provider. Think haiku / sonnet / opus.
 * System prompt, tool descriptions, and tool examples are all concise, I've made sure not to bloat your context.
-* Uses [rtk](https://github.com/rtk-ai/rtk) if you have it installed, disable with `--no-rtk`. Saves ~50% of bash output tokens. Remember bash is just 12% of total token usage, so 6% is nice, but saving on reads (65% of total) by using `index` gave me more benefit. I think I'll do bash output filtering like this myself in a future release.
+* Uses [rtk](https://github.com/rtk-ai/rtk) if you have it installed, disable with `maki.setup({ agent = { rtk = false } })` in your `init.lua`. Saves ~50% of bash output tokens. Remember bash is just 12% of total token usage, so 6% is nice, but saving on reads (65% of total) by using `index` gave me more benefit. I think I'll do bash output filtering like this myself in a future release.
 
 ### User experience
 
@@ -18,7 +24,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [User made plugins showcase](https://github.com/tontinton/maki/discussions/452), [Lua API reference](https://maki.sh/docs/lua-api/).
 * Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
 * UI fits everything well on my small screen laptop.
-* Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X), or Ctrl-N/P.
+* Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X).
 * Sensible permission system - when the agent runs `git diff && rm -rf /`, what do you think will happen in your current coding agent? It will treat it as `git *`. Maki uses tree-sitter to parse the bash command and figure out the permissions requested are `git *` and `rm *`. Disable using `--yolo`.
 * SSRF protection on `webfetch` calls.
 * A `memory` tool to keep long term context, just tell maki to remember something (sometimes it uses it automatically). Managed via `/memory` (view / edit / delete memories).
@@ -29,15 +35,17 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * 26 of the most popular themes.
 * Resume sessions.
 * Skills & MCPs.
+* Opt-in [OpenTelemetry](https://maki.sh/docs/telemetry/) export, same format as Claude Code's.
 * Plan mode.
 * Run bash commands using `!`, or `!!` if you want maki to not know about it.
 * `/cd` to change dir.
-* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions (although I wouldn't recommend that, maki is very new).
+* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions.
 
 ## Supported providers
 
 * Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS). Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
 * OpenAI - `OPENAI_API_KEY` and OAuth via `maki auth login openai`.
+* xAI - `XAI_API_KEY` and OAuth via `maki auth login xai`.
 * Google - `GEMINI_API_KEY`.
 * Copilot - `GH_COPILOT_TOKEN` or an existing GitHub Copilot sign-in at `~/.config/github-copilot/`.
 * Ollama - `OLLAMA_HOST` for local (e.g. `http://localhost:11434`), or `OLLAMA_API_KEY` for cloud.
@@ -46,11 +54,17 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * Z.AI - `ZHIPU_API_KEY`.
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
+* Requesty - `REQUESTY_API_KEY`. Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` for the EU region.
 * Synthetic - `SYNTHETIC_API_KEY`.
+* Regolo - `REGOLO_API_KEY`. EU-hosted open-weight models.
+* TensorX - `TENSORX_API_KEY`.
 * OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
+* Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
 **Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
+
+> Providers as Lua plugins WIP!
 
 ## Installation
 
@@ -120,7 +134,7 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 "agent_servers": {
   "Maki": {
     "default_config_options": {
-      "model": "deepseek/deepseek-v4-flash"
+      "model": "deepseek/deepseek-flash"
     },
     "type": "custom",
     "command": "maki",
@@ -134,8 +148,12 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 
 More info at the [official docs](https://maki.sh/docs).
 
-> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
+## Community
+
+[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/dEBhANTbX)
 
 ## Example config
 
 [tontinton/makiconf](https://github.com/tontinton/makiconf) - includes a [semble](https://github.com/MinishLab/semble) tool (Lua code) for semantic code search, and an [ast-grep](https://ast-grep.github.io) MCP server for AST-based search and replace.
+
+> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. Some parts of the code are not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded, and can easily be refactored if needed nowadays.

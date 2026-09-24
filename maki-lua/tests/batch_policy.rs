@@ -35,6 +35,8 @@ const PARKJOB_HL_TOOL: &str = "parkjob_hl";
 const CMD_TOOL: &str = "cmd";
 const BOOM_TOOL: &str = "boom";
 const BOOM_ERR: &str = "stub tool exploded";
+const PARTIAL_TOOL: &str = "partial";
+const PARTIAL_ERR: &str = "half the output [cancelled by user; output above is partial]";
 const CHILD_USAGE: &str = "12.3k↑ 456↓ $0.123";
 /// Wildly generous vs the expected kill (one poll plus one
 /// [`KILL_GRACE`]); only a watchdog that never fires gets here.
@@ -49,6 +51,21 @@ const PAINT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PAINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Only a batch that never settles waits this long.
 const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+const EDIT_TOOL: &str = "edit";
+const EDIT_TARGET: &str = "f.rs";
+const STATUS_SUCCESS: &str = "success";
+const STATUS_ERROR: &str = "error";
+const MARKER_A: &str = "AAA";
+const MARKER_B: &str = "BBB";
+const EDITED_A: &str = "aaa";
+const EDITED_B: &str = "bbb";
+/// Whichever of the two edits lands first erases the other's `old_string`.
+const OVERLAP_SOURCE: &str = "XYZ";
+const OVERLAP_HEAD: &str = "XY";
+const OVERLAP_HEAD_NEW: &str = "Q";
+const OVERLAP_TAIL: &str = "YZ";
+const OVERLAP_TAIL_NEW: &str = "R";
+
 const SPINNER_STYLE: &str = "spinner";
 const ERROR_STYLE: &str = "tool_error";
 const SUCCESS_STYLE: &str = "tool_success";
@@ -94,6 +111,10 @@ maki.agent.call_tool = function(ctx, name, input, opts)
     -- one of them its own restore.
     maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
     return "parkjob_done"
+  elseif name == "partial" then
+    -- Parks past the sweep, then comes back with more than "cancelled".
+    maki.fn.jobwait(maki.fn.jobstart("sleep @PARK_SECS@"))
+    return nil, "@PARTIAL_ERR@"
   elseif name == "spin" then
     -- Never yields, so nothing but the watchdog can end it.
     while true do end
@@ -167,6 +188,7 @@ fn load_batch_host_with(child_src: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let prelude = STUB_PRELUDE
         .replace("@BOOM_ERR@", BOOM_ERR)
         .replace("@CHILD_USAGE@", CHILD_USAGE)
+        .replace("@PARTIAL_ERR@", PARTIAL_ERR)
         .replace("@PARK_SECS@", &PARK_SECS.to_string());
     host.load_source(
         "batch_policy",
@@ -386,7 +408,9 @@ fn assert_indicators(buf: &maki_agent::SharedBuf, style: &str, want: usize, budg
 ///
 /// That sweep runs outside the coroutine, where a child restore that awaits
 /// raises, and one such body must not swallow the rest of the sweep. Children
-/// that already finished keep their own status and output.
+/// that already finished keep their own status and output, and a child whose
+/// own call lands after the sweep with more than "cancelled" trades the
+/// placeholder for it.
 #[test]
 fn cancel_mid_flight_repaints_parked_children_and_spares_finished_ones() {
     let batch = start_batch_with(
@@ -395,58 +419,51 @@ fn cancel_mid_flight_repaints_parked_children_and_spares_finished_ones() {
             { "tool": OK_TOOL, "parameters": { "tag": "a" } },
             { "tool": PARKJOB_TOOL, "parameters": {} },
             { "tool": PARKJOB_HL_TOOL, "parameters": {} },
+            { "tool": PARTIAL_TOOL, "parameters": {} },
             { "tool": BOOM_TOOL, "parameters": {} },
         ]),
     );
-    for (style, want) in [(SUCCESS_STYLE, 1), (ERROR_STYLE, 1), (SPINNER_STYLE, 2)] {
+    for (style, want) in [(SUCCESS_STYLE, 1), (ERROR_STYLE, 1), (SPINNER_STYLE, 3)] {
         assert_indicators(&batch.body, style, want, PAINT_TIMEOUT);
     }
 
     batch.trigger.cancel();
 
-    assert_indicators(&batch.body, ERROR_STYLE, 3, PAINT_TIMEOUT);
+    assert_indicators(&batch.body, ERROR_STYLE, 4, PAINT_TIMEOUT);
     assert_indicators(&batch.body, SPINNER_STYLE, 0, Duration::ZERO);
     assert_indicators(&batch.body, SUCCESS_STYLE, 1, Duration::ZERO);
 
     let cancelled = format!("{ERROR_PREFIX}{CANCELLED_ERROR}");
     let expected = format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         section(OK_TOOL, "ok:a"),
         section(PARKJOB_TOOL, &cancelled),
         section(PARKJOB_HL_TOOL, &cancelled),
+        section(PARTIAL_TOOL, &format!("{ERROR_PREFIX}{PARTIAL_ERR}")),
         section(BOOM_TOOL, &format!("{ERROR_PREFIX}{BOOM_ERR}")),
-        summary_mixed(1, 4, 3)
+        summary_mixed(1, 5, 4)
     );
     let settled = batch
         .result
         .recv_timeout(BATCH_RESULT_TIMEOUT)
         .expect("batch must settle instead of hanging on its cancelled children");
-    assert_eq!(settled, Ok(expected));
+    assert_eq!(settled, Err(expected));
 }
 
 /// Esc pressed before the batch is even dispatched: the handler still runs
-/// (only `maki.async.run` spawns are skipped on a cancelled token) and
-/// `gather` runs every fun it was handed, so only the batch itself can stop a
-/// swept child from executing anyway. A child born terminal keeps its own
-/// error, so the two sweeps never settle the same child twice.
+/// and `gather` runs every fun it was handed, so only the batch itself can
+/// stop a swept child from running anyway. The handler is doomed from its
+/// first line, so on a starved machine the watchdog may kill it before the
+/// cancel hook paints anything. That is why we only check what holds either
+/// way: an error comes back and nothing was dispatched.
 #[test]
-fn cancelled_batch_dispatches_nothing_and_keeps_born_terminal_errors() {
+fn cancelled_batch_dispatches_nothing() {
     let (reg, _host) = load_batch_host();
-    let out = run_cancelled_batch(
+    run_cancelled_batch(
         &reg,
-        json!([
-            { "tool": BATCH_TOOL, "parameters": { "tool_calls": [] } },
-            { "tool": OK_TOOL, "parameters": { "tag": "a" } },
-        ]),
+        json!([{ "tool": OK_TOOL, "parameters": { "tag": "a" } }]),
     )
-    .expect("the second sweep must not resettle an already cancelled child");
-    let expected = format!(
-        "{}{}{}",
-        section(BATCH_TOOL, &format!("{ERROR_PREFIX}{NESTED_ERROR}")),
-        section(OK_TOOL, &format!("{ERROR_PREFIX}{CANCELLED_ERROR}")),
-        summary_mixed(0, 2, 2)
-    );
-    assert_eq!(out, expected);
+    .expect_err("a cancelled batch is an error reply");
     assert!(
         recorded_calls(&reg).is_empty(),
         "a batch cancelled before it starts must dispatch nothing"
@@ -472,6 +489,31 @@ fn flat_nested_and_merged_params_normalize_identically() {
     assert_eq!(calls[0]["params"], json!({ "tag": "flat", "n": 1 }));
     assert_eq!(calls[1]["params"], json!({ "tag": "merged", "n": 1 }));
     assert_eq!(calls[2]["params"], json!({ "tag": "nested", "n": 1 }));
+}
+
+/// The batch plugin strips GPT's `functions.` prefix in Lua so child
+/// lookups and the nested-batch guard key on the canonical name.
+#[test]
+fn functions_prefix_stripped_from_child_tool_names() {
+    let (reg, _host) = load_batch_host();
+    let out = run_batch(
+        &reg,
+        json!([
+            { "tool": "functions.ok", "parameters": { "tag": "a" } },
+            { "tool": "functions.batch", "parameters": { "tool_calls": [] } },
+        ]),
+    )
+    .expect("batch failed");
+    let expected = format!(
+        "{}{}{}",
+        section("ok", "ok:a"),
+        section("batch", &format!("{ERROR_PREFIX}{NESTED_ERROR}")),
+        summary_mixed(1, 2, 1)
+    );
+    assert_eq!(out, expected);
+    let calls = recorded_calls(&reg);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], json!("ok"));
 }
 
 #[test_case::test_case(json!([]), EMPTY_ERROR ; "empty_list")]
@@ -610,6 +652,9 @@ fn restore_snapshot_lines_opts(
             theme_gen: None,
             clicks,
             state,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         EventSender::new(tx, 0),
     );
@@ -1015,8 +1060,7 @@ fn header_click_toggles_all_children() {
 /// and no line numbers read back from disk.
 #[test]
 fn edit_child_body_renders_diff_not_summary() {
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let (_reg, host) = real_builtins();
     let lines = restore_snapshot_lines(
         &host,
         json!({ "tool_calls": [{ "tool": "edit", "parameters": {
@@ -1030,16 +1074,16 @@ fn edit_child_body_renders_diff_not_summary() {
         ] })),
     );
     let spans: Vec<(String, SpanStyle)> = lines.into_iter().flatten().collect();
-    let old_span = (
-        "- let a = 1;".to_owned(),
-        SpanStyle::Named("diff_old".into()),
-    );
-    let new_span = (
-        "+ let a = 2;".to_owned(),
-        SpanStyle::Named("diff_new".into()),
-    );
-    assert!(spans.contains(&old_span), "old line in diff_old: {spans:?}");
-    assert!(spans.contains(&new_span), "new line in diff_new: {spans:?}");
+    let expected_spans = [
+        ("- ", "diff_old_sign"),
+        ("let a = 1;", "diff_old"),
+        ("+ ", "diff_new_sign"),
+        ("let a = 2;", "diff_new"),
+    ];
+    for (text, style) in expected_spans {
+        let span = (text.to_owned(), SpanStyle::Named(style.into()));
+        assert!(spans.contains(&span), "{text:?} in {style}: {spans:?}");
+    }
     assert!(
         !spans
             .iter()
@@ -1171,6 +1215,92 @@ fn exec_batch_live(
 
     barrier(host);
     (state, drain_snapshots(&rx))
+}
+
+/// Regression: two `edit` children on one file used to interleave their
+/// read-modify-write and silently lose one edit. The dispatcher now holds a
+/// per-file lock across each child's whole execution.
+#[test]
+fn parallel_edits_to_one_file_all_apply() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(EDIT_TARGET);
+    std::fs::write(&path, format!("{MARKER_A}\n{MARKER_B}\n")).unwrap();
+
+    let (reg, host) = real_builtins();
+    let (state, _) = exec_batch_live(
+        &host,
+        &reg,
+        json!([
+            edit_call(&path, MARKER_A, EDITED_A),
+            edit_call(&path, MARKER_B, EDITED_B),
+        ]),
+    );
+
+    assert_eq!(
+        child_statuses(&state),
+        vec![STATUS_SUCCESS, STATUS_SUCCESS],
+        "both edits must apply: {state}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{EDITED_A}\n{EDITED_B}\n")
+    );
+}
+
+/// Overlapping edits cannot both apply, so the contract is that the loser
+/// says so. Which one loses is `async_lock`'s business, not ours.
+#[test]
+fn overlapping_parallel_edits_fail_loudly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(EDIT_TARGET);
+    std::fs::write(&path, OVERLAP_SOURCE).unwrap();
+
+    let (reg, host) = real_builtins();
+    let (state, _) = exec_batch_live(
+        &host,
+        &reg,
+        json!([
+            edit_call(&path, OVERLAP_HEAD, OVERLAP_HEAD_NEW),
+            edit_call(&path, OVERLAP_TAIL, OVERLAP_TAIL_NEW),
+        ]),
+    );
+
+    let mut statuses = child_statuses(&state);
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        vec![STATUS_ERROR, STATUS_SUCCESS],
+        "exactly one edit may win, and the other must say so: {state}"
+    );
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        content == OVERLAP_SOURCE.replace(OVERLAP_HEAD, OVERLAP_HEAD_NEW)
+            || content == OVERLAP_SOURCE.replace(OVERLAP_TAIL, OVERLAP_TAIL_NEW),
+        "one whole edit, never a mix: {content}"
+    );
+}
+
+fn real_builtins() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    (reg, host)
+}
+
+fn edit_call(path: &std::path::Path, old_string: &str, new_string: &str) -> Value {
+    json!({ "tool": EDIT_TOOL, "parameters": {
+        "path": path.to_str().expect("utf-8 temp path"),
+        "old_string": old_string,
+        "new_string": new_string,
+    } })
+}
+
+fn child_statuses(state: &Value) -> Vec<&str> {
+    state["children"]
+        .as_array()
+        .expect("no children in batch state")
+        .iter()
+        .map(|child| child["status"].as_str().expect("child without status"))
+        .collect()
 }
 
 fn hl_child_src(tool: &str) -> String {

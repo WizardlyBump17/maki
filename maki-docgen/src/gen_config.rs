@@ -4,38 +4,44 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
+    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
-fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
-    writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
-    writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
-    for f in fields {
-        let default = f.default.format_default();
-        let min = f.min.map_or("-".to_string(), |v| v.to_string());
-        writeln!(
-            out,
-            "| `{name}` | {ty} | `{default}` | {min} | {desc} |",
-            name = f.name,
-            ty = escape_pipes(f.ty),
-            desc = f.description,
-        )
-        .unwrap();
-    }
-}
+use crate::gen_folder_trust::POLICY_EXAMPLE;
 
-fn write_table_no_min(out: &mut String, fields: &[ConfigField]) {
-    writeln!(out, "| Field | Type | Default | Description |").unwrap();
-    writeln!(out, "|-------|------|---------|-------------|").unwrap();
+type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
+
+fn write_table(out: &mut String, fields: &[ConfigField]) {
+    let extra: Option<ExtraColumn> = if fields.iter().any(|f| f.env.is_some()) {
+        Some(("Env", |f| {
+            f.env.map_or("-".to_string(), |e| {
+                e.split(", ")
+                    .map(|v| format!("`{v}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        }))
+    } else if fields.iter().any(|f| f.min.is_some()) {
+        Some(("Min", |f| f.min.map_or("-".to_string(), |v| v.to_string())))
+    } else {
+        None
+    };
+
+    let (header, rule) = extra.map_or((String::new(), ""), |(name, _)| {
+        (format!(" {name} |"), "-----|")
+    });
+    writeln!(out, "| Field | Type | Default |{header} Description |").unwrap();
+    writeln!(out, "|-------|------|---------|{rule}-------------|").unwrap();
     for f in fields {
-        let default = f.default.format_default();
+        let cell = extra.map_or(String::new(), |(_, cell)| format!(" {} |", cell(f)));
         writeln!(
             out,
-            "| `{name}` | {ty} | `{default}` | {desc} |",
+            "| `{name}` | {ty} | `{default}` |{cell} {desc} |",
             name = f.name,
             ty = escape_pipes(f.ty),
+            default = f.default.format_default(),
             desc = f.description,
         )
         .unwrap();
@@ -44,10 +50,6 @@ fn write_table_no_min(out: &mut String, fields: &[ConfigField]) {
 
 fn escape_pipes(ty: &str) -> String {
     ty.replace('|', "\\|")
-}
-
-fn has_any_min(fields: &[ConfigField]) -> bool {
-    fields.iter().any(|f| f.min.is_some())
 }
 
 fn lua_section_name(heading: &str) -> String {
@@ -60,11 +62,7 @@ fn lua_section_name(heading: &str) -> String {
 fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
     let lua_name = lua_section_name(heading);
     writeln!(out, "### `{lua_name}`\n").unwrap();
-    if has_any_min(fields) {
-        write_table_with_min(out, fields);
-    } else {
-        write_table_no_min(out, fields);
-    }
+    write_table(out, fields);
     writeln!(out).unwrap();
 }
 
@@ -128,12 +126,112 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "Themes use 24-bit colors, but not every terminal can show them. Maki \
-         checks the environment, terminfo, and the terminal itself, and when \
-         truecolor is missing it quietly falls back to the closest of the 256 \
-         classic terminal colors. If detection gets it wrong, set \
+        "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
+         `diff_old` and `diff_new`. These styles are applied after `code_block`, \
+         so their properties take precedence. Diff gutters use \
+         `diff_old_line_nr` and `diff_new_line_nr`, which default to \
+         `diff_line_nr`.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Themes use 24-bit colors by default, but not every terminal can show \
+         them. Maki checks the environment, terminfo, and the terminal itself, \
+         and when truecolor is missing it quietly falls back to the closest of \
+         the 256 classic terminal colors. If detection gets it wrong, set \
          `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force \
          the fallback.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Theme files can also name terminal colors instead of giving hex \
+         values, using the same names as Helix: `default`, `black`, `red`, \
+         `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `light-red`, \
+         `light-green`, `light-yellow`, `light-blue`, `light-magenta`, \
+         `light-cyan`, `light-gray`, and `white`. Write them exactly as \
+         listed. `lightgray`, `light_gray` and `LIGHT-GRAY` are all rejected. \
+         `default` means the terminal default. Maki also takes a number from \
+         `0` to `255` to pick a palette entry by index, which Helix does \
+         not.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "These work everywhere a hex value does, including syntax \
+         highlighting scopes, so a theme can be written entirely against the \
+         palette your terminal already defines. Maki passes them through as \
+         palette references rather than resolving them to RGB, so the colors \
+         stay correct in terminals that mangle truecolor, such as nested tmux \
+         over ssh.\n"
+    )
+    .unwrap();
+}
+
+fn write_net_section(out: &mut String) {
+    write_section(out, "[net]", NetConfig::FIELDS);
+    writeln!(
+        out,
+        "`maki.net` refuses private, loopback and metadata addresses, because \
+         the model picks the URLs. List a host here to let it through:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "\
+```lua
+maki.setup({{
+    net = {{
+        allowed_private_hosts = {{ \"localhost:8080\", \"nas.lan\", \"10.0.0.0/8\" }},
+    }},
+}})
+```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "An entry with no port covers every port. A name you list is allowed \
+         whatever it resolves to. A name you did not list stays blocked when \
+         DNS lands it on a private address, unless that address falls in a \
+         range you allowed, so keep ranges as small as the service needs. \
+         Every redirect hop is checked against the same list. \
+         [Permissions](/docs/permissions/#network-addresses) covers what the \
+         guard protects.\n"
+    )
+    .unwrap();
+}
+
+/// `paths` is a `Vec<String>`, which the `ConfigValue` table cannot describe,
+/// so this section is prose like `net.allowed_private_hosts`.
+fn write_trust_section(out: &mut String) {
+    writeln!(out, "### `trust`\n").unwrap();
+    writeln!(
+        out,
+        "Answers the folder trust question in advance. Read from the global \
+         `~/.config/maki/init.lua` only, since a project file that could set \
+         it would be trusting itself:\n"
+    )
+    .unwrap();
+    writeln!(out, "{POLICY_EXAMPLE}\n").unwrap();
+    writeln!(
+        out,
+        "`paths` is a list of globs matched against the project root, empty by \
+         default. `prompt` is a bool, `true` by default. Setting it to `false` \
+         drops the startup card and leaves the folder restricted unless a \
+         `paths` entry matches. \
+         [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax \
+         and which run modes apply the policy.\n"
+    )
+    .unwrap();
+}
+
+fn write_telemetry_section(out: &mut String) {
+    write_section(out, "[telemetry]", TelemetryConfig::FIELDS);
+    writeln!(
+        out,
+        "Every field also has an environment variable, shown in the Env \
+         column, and the variable wins. See [Telemetry](/docs/telemetry/) \
+         for the full picture.\n"
     )
     .unwrap();
 }
@@ -174,9 +272,12 @@ Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language
 Two places, both optional:
 
 - **Global**: `~/.config/maki/init.lua`
-- **Project**: `.maki/init.lua` (relative to your working directory)
+- **Project**: `.maki/init.lua` in the active Git checkout, or in the working
+  directory outside Git
 
 When both exist, project settings override global ones. Neither file is required.
+A project `init.lua` runs only once you trust that folder, see
+[Folder Trust](/docs/folder-trust/).
 
 ## Example
 
@@ -227,7 +328,7 @@ All fields are optional. Typos in field names cause an error right away.
     .unwrap();
 
     writeln!(out, "### Top-level\n").unwrap();
-    write_table_no_min(&mut out, TOP_LEVEL_FIELDS);
+    write_table(&mut out, TOP_LEVEL_FIELDS);
     writeln!(out).unwrap();
 
     write_section(&mut out, "[ui]", UiConfig::FIELDS);
@@ -236,6 +337,9 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
+    write_net_section(&mut out);
+    write_trust_section(&mut out);
+    write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(
@@ -243,13 +347,21 @@ All fields are optional. Typos in field names cause an error right away.
         "The `plugins` table turns plugins on or off and passes options to \
          them. All bundled plugins are on by default. Set \
          `enabled = false` to turn one off.\n\n\
+         A plugin that is off never loads, so its tool name is free for one \
+         of your own plugins to take. Permission rules are keyed by the tool \
+         name alone, and names such as `bash`, `write`, and `task` already \
+         have rules in maki. A plugin that takes one of them inherits those \
+         rules, together with any \"always allow\" you saved. Maki warns you \
+         at load when this happens.\n\n\
          Each plugin checks its own options at startup. A typo, a wrong \
          type, or an unknown plugin name gives you a clear error right \
          away.\n\n\
          The edit plugin's extra tools are options too: \
-         `plugins.edit = {{ multiedit = false, edit_lines = true }}`. \
+         `plugins.edit = {{ multiedit = false, insert_lines = true }}`. \
          The old `tools` table is gone. If your config still uses it, \
-         Maki stops at startup and shows you the new form.\n"
+         Maki stops at startup and shows you the new form.\n\n\
+         This table is for bundled plugins only. Your own plugins go in \
+         `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).\n"
     )
     .unwrap();
     writeln!(
@@ -291,7 +403,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\\maki\\` |
 | Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\\maki\\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
 `~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 

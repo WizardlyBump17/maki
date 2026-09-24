@@ -4,6 +4,7 @@ use maki_agent::tools::ToolRegistry;
 use maki_lua::PluginHost;
 use test_case::test_case;
 
+#[test_case("completion", include_str!("../../plugins/completion/tests/spec.lua") ; "completion_plugin_spec")]
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
 #[test_case("lib", include_str!("../../plugins/lib/tests/spec.lua") ; "lib_spec")]
@@ -13,6 +14,7 @@ use test_case::test_case;
 #[test_case("read", include_str!("../../plugins/read/tests/spec.lua") ; "read_plugin_spec")]
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
 #[test_case("task", include_str!("../../plugins/task/tests/spec.lua") ; "task_plugin_spec")]
+#[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]

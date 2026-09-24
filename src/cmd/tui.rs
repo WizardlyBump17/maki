@@ -3,25 +3,30 @@ use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::PluginHost;
+use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
+use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
+use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_ui::{AppSession, RunOutcome};
+use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
+use crate::resume::{self, Resolved};
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
+const STALE_GLOBAL_CONFIG: &str = "config.toml";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -35,11 +40,7 @@ struct Stack {
 
 impl Stack {
     fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts {
-            connect: self.config.provider.connect_timeout,
-            low_speed: self.config.provider.low_speed_timeout,
-            stream: self.config.provider.stream_timeout,
-        }
+        maki_providers::Timeouts::from(&self.config.provider)
     }
 }
 
@@ -72,24 +73,30 @@ impl Drop for Teardown {
     }
 }
 
-fn discover_commands(disable: bool) -> Vec<CustomCommand> {
+fn discover_commands(disable: bool, cwd: &Path) -> Vec<CustomCommand> {
     if disable {
         return Vec::new();
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    command::discover_commands(&cwd)
+    command::discover_commands(cwd)
 }
 
-fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
+fn load_config(
+    plugin_host: &PluginHost,
+    cli: &Cli,
+    init_files: InitFiles,
+    project_config: &ProjectConfig,
+    names: &super::KnownNames<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<Config> {
     let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, cwd)
+        .load_init_files(init_files, warnings)
         .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(cli.no_rtk)
+        .into_config(&names(plugin_host)?)
         .context("invalid config")?;
-    config.permissions = load_permissions(cwd);
+    config.permissions = load_permissions(project_config);
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -126,41 +133,53 @@ fn config_or_fallback(
         (Err(e), None) => Err(e),
     }
 }
+/// What every generation is built from, unchanged for the life of the process.
+struct Launch<'a> {
+    cli: &'a Cli,
+    cwd: &'a Path,
+    storage: &'a StateDir,
+    interaction: Interaction,
+}
 
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
 fn build_stack(
-    cli: &Cli,
-    cwd: &Path,
-    storage: &StateDir,
+    launch: &Launch<'_>,
+    trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
-    let mut warnings = Vec::new();
-
+    let cli = launch.cli;
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
         .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
-    let reloading = fallback_model.is_some();
-    let config = config_or_fallback(
-        load_config(&plugin_host, cli, cwd),
-        fallback_config,
-        &mut warnings,
+    let (config, mut warnings) = super::load_plugins(
+        &mut plugin_host,
+        cli.no_plugins,
+        if fallback_model.is_some() {
+            super::BuiltinFailure::Warn
+        } else {
+            super::BuiltinFailure::Fatal
+        },
+        launch.interaction,
+        |host, names, warnings| {
+            warnings.extend(trust.warning.clone());
+            let loaded = load_config(
+                host,
+                cli,
+                InitFiles::resolve(&trust.project_config, cli.no_plugins),
+                &trust.project_config,
+                names,
+                warnings,
+            );
+            config_or_fallback(loaded, fallback_config, warnings)
+        },
     )?;
 
-    if let Err(e) = plugin_host.load_builtins(&config.plugins) {
-        let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
-        if reloading {
-            warnings.push(format!("{e:#}"));
-        } else {
-            return Err(e);
-        }
-    }
+    let commands = discover_commands(cli.no_commands, launch.cwd);
 
-    let commands = discover_commands(cli.no_commands);
-
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
+    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),
         (Err(e), Some(last_model)) => {
@@ -182,35 +201,20 @@ fn build_stack(
             model,
             needs_login,
         },
-        warnings,
+        super::sanitize_warnings(&warnings),
     ))
 }
 
-fn resolve_session(
-    continue_session: bool,
-    session_id: Option<&str>,
-    model: &str,
-    cwd: &str,
-    storage: &StateDir,
-) -> Result<AppSession> {
-    if let Some(raw) = session_id {
-        let id: MakiId = raw
-            .parse()
-            .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        return AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"));
+/// The tab a run opens on. Which session that is lives in [`crate::resume`],
+/// and the only step left here is the TUI-only one: an explicit `--model` is a
+/// choice about the session being opened, and a session's own spec is what
+/// every later switch reads.
+fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+    let mut tab = resolved.into_session(model, cwd);
+    if explicit_model {
+        tab.session.set_model(model.to_owned());
     }
-    if continue_session {
-        match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => return Ok(session),
-            Ok(None) => {
-                tracing::info!("no previous session found for this directory, starting new");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load latest session, starting new");
-            }
-        }
-    }
-    Ok(AppSession::new(model, cwd))
+    tab
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -225,104 +229,244 @@ fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
     }
 }
 
+/// A project `.env` is loaded exactly once, when a folder that was not trusted
+/// becomes trusted. Every other rebuild must leave the process env alone.
+fn should_load_project_env(was_trusted: bool, now_trusted: bool) -> bool {
+    !was_trusted && now_trusted
+}
+
+/// Replaces a generation's stack. The only site in the binary that loads the
+/// project environment, because the ordering is the whole safety argument: the
+/// old plugin host's thread must be joined before `load_env_files` touches the
+/// process env, and the env must be in place before the new host reads config.
+fn rebuild(
+    launch: &Launch<'_>,
+    mut stack: Stack,
+    teardown: &mut Teardown,
+    trust: &ProjectDecision,
+    was_trusted: bool,
+    pack: Option<PackPlan>,
+    fallback: Option<(Config, Model)>,
+) -> Result<(Stack, Vec<String>, Option<PackReport>)> {
+    // Shut the old host down first so nothing can repopulate the registry after
+    // the clear: its senders disconnect, the watchdog aborts in-flight
+    // callbacks, and only this thread issues loads.
+    stack.plugin_host.begin_shutdown();
+    ToolRegistry::global().clear_lua();
+
+    let load_env = should_load_project_env(was_trusted, trust.project_config.is_trusted());
+    // A package plan has to wait for the old revision leases to close, and an
+    // env load may not run beside a thread that can read the env; an ordinary
+    // reload does neither and drops the stack in the background.
+    if pack.is_some() || load_env {
+        teardown.join();
+        drop(stack);
+    } else {
+        teardown.defer(move || drop(stack));
+    }
+    let pack_report = pack.map(maki_lua::apply_pack_plan);
+
+    if load_env {
+        // This calls `std::env::set_var`. On the startup grant path nothing
+        // long-lived exists yet, so the join above is the whole story. The only
+        // site that reaches it with threads alive is `/trust`, a rare explicit
+        // action, and only after the join: smol's worker pool and any telemetry
+        // exporter may still be parked.
+        load_env_files(&trust.project_config);
+    }
+
+    let (stack, warnings) = build_stack(launch, trust, fallback)?;
+    Ok((stack, warnings, pack_report))
+}
+
 pub fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
 
-    load_env_files(&cwd);
-    warn_stale_config_toml(&cwd);
+    // Only the interactive UI can answer an install confirmation or a trust
+    // prompt. The other modes refuse the install with its reason and skip
+    // untrusted project config with a warning, terminal or not.
+    let headless = cli.print || cli.is_sdk_mode();
+    let interaction = if headless {
+        Interaction::None
+    } else {
+        Interaction::Tty
+    };
+    // `--trust` answers the question up front, so it holds wherever Maki runs.
+    // Without it the store is the only source of an answer this early.
+    let mode = if cli.trust {
+        TrustMode::Session
+    } else {
+        TrustMode::Consult
+    };
+    let mut trust = project::resolve(&storage, &cwd, mode);
+    load_env_files(&trust.project_config);
+    warn_stale_config_toml(&trust.project_config);
+    let mut teardown = Teardown::default();
+    let launch = Launch {
+        cli: &cli,
+        cwd: &cwd,
+        storage: &storage,
+        interaction,
+    };
+    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
 
-    let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
+    // The card owns the terminal, so it is drawn before logging, telemetry and
+    // the panic hook claim it, and while the process is still single-threaded.
+    // Every mode settles the question here, so a policy grant reaches `-p` and
+    // the SDK exactly as it reaches the UI; only the card is TUI-only.
+    let can_ask = !headless && io::stdin().is_terminal() && io::stderr().is_terminal();
+    // Declared before the early returns so a policy grant can name its pattern
+    // in the UI's first frame. A headless run returns before the UI exists and
+    // drops it; its grant is already visible through `maki trust list`.
+    let mut notice = None;
+    // `unanswered` rather than `question`: a recorded `Never` is an answer, and
+    // neither the card nor the policy may overturn one.
+    let answer = trust.state.unanswered().and_then(|question| {
+        policy_grant(question, &stack.config.trust)
+            .map(|pattern| {
+                notice = Some(format!("{POLICY_GRANT_NOTICE} {pattern}"));
+                TrustAnswer::Trust
+            })
+            // `prompt = false` silences the card only: a `paths` match is an
+            // answer given in advance, not a prompt.
+            .or_else(|| {
+                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
+            })
+    });
+    match answer {
+        Some(answer) => {
+            let was_trusted = trust.project_config.is_trusted();
+            trust = project::apply_answer(&storage, trust, answer);
+            if should_load_project_env(was_trusted, trust.project_config.is_trusted()) {
+                // The untrusted build's warnings describe a config this run no
+                // longer uses, and `build_stack` reports `trust.warning` itself.
+                (stack, startup_warnings, _) = rebuild(
+                    &launch,
+                    stack,
+                    &mut teardown,
+                    &trust,
+                    was_trusted,
+                    None,
+                    None,
+                )?;
+            } else {
+                startup_warnings.extend(trust.warning.clone());
+            }
+        }
+        // A run that cannot ask says so instead of silently dropping the files.
+        None => startup_warnings.extend(trust.state.restricted_warning()),
+    }
 
     setup::init_logging(&stack.config.storage);
+    setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
+    // Discovery runs before logging is initialized, so a package problem has
+    // no log to reach either. The TUI shows these in its first generation; a
+    // mode that never opens the UI has to report them here or a broken
+    // package fails in complete silence.
+    if cli.is_sdk_mode() || cli.print {
+        for warning in &startup_warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+
+    // Resolved before the modes diverge, so `--print`, the SDK and the UI
+    // cannot pick different sessions, different ids or a different cwd to look
+    // in, and all three report the same start to telemetry.
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
+    setup::report_session_start(resolved.start_type, Some(&resolved.id));
+
     if cli.is_sdk_mode() {
-        let fast = stack.config.always_fast && stack.model.supports_fast();
+        let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
+            resumed,
+            claim,
+            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
             timeouts,
             prompt_slots,
-            fast,
-            workflow: stack.config.always_workflow,
+            defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+            plugin_rules: stack.plugin_host.plugin_rules(),
+            lua_handle: stack.plugin_host.event_handle(),
+            project_config: trust.project_config.clone(),
         })
         .context("run sdk mode")?;
         return Ok(());
     }
+
     if cli.print {
-        let fast = stack.config.always_fast && stack.model.supports_fast();
+        let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
-        crate::print::run(
-            &stack.model,
-            cli.initial_prompt,
-            cli.images,
-            cli.output_format,
-            cli.verbose,
-            stack.config.agent,
-            stack.config.permissions,
+        crate::print::run(crate::print::PrintParams {
+            model: stack.model,
+            prompt: cli.initial_prompt,
+            image_paths: cli.images,
+            format: cli.output_format,
+            verbose: cli.verbose,
+            config: stack.config.agent,
+            permissions_config: stack.config.permissions,
             timeouts,
-            stack.plugin_host.event_handle(),
-            fast,
-            stack.config.always_workflow,
-            Arc::new(stack.config.provider.model_policy.clone()),
-        )
+            lua_handle: stack.plugin_host.event_handle(),
+            defaults: stack.config.session_defaults,
+            model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+            plugin_rules: stack.plugin_host.plugin_rules(),
+            project_config: trust.project_config.clone(),
+            resumed,
+            claim,
+            storage: storage.clone(),
+        })
         .context("run print mode")?;
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy().into_owned();
-    let mut tabs = vec![resolve_session(
-        cli.continue_session,
-        cli.session.as_deref(),
+    let mut tabs = vec![open_tab(
+        resolved,
         &stack.model.spec(),
+        cli.model.is_some(),
         &cwd_str,
-        &storage,
-    )?];
+    )];
     let mut focused = 0;
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
-    let mut teardown = Teardown::default();
+    let launch = Launch {
+        cli: &cli,
+        cwd: &cwd,
+        storage: &storage,
+        interaction,
+    };
 
     loop {
-        for session in &mut tabs {
+        for OpenSession { session, .. } in &mut tabs {
             if session.messages().is_empty() {
-                session.meta.fast |= stack.config.always_fast;
-                session.meta.workflow |= stack.config.always_workflow;
-                if let Some(thinking) = stack.config.always_thinking {
-                    session.meta.thinking = Some(thinking);
-                }
+                stack.config.session_defaults.seed(&mut session.meta);
             }
         }
-        let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty()
-            || !stack
-                .config
-                .provider
-                .model_policy
-                .allows(&focused_tab.model)
-        {
-            stack.model.clone()
-        } else {
-            Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
-        };
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
-                model,
+                // The startup default only (`--model`, then last-used, then
+                // config). It seeds `ModelSlots` and catches a session whose
+                // model will not resolve. Otherwise each tab runs on its own
+                // recorded spec.
+                model: stack.model.clone(),
                 needs_login: stack.needs_login,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
+                startup_notice: notice.take(),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -330,6 +474,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
                     cwd.clone(),
+                    trust.project_config.clone(),
+                    stack.plugin_host.plugin_rules(),
                 )),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
@@ -337,8 +483,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
+                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
+                ui_attachment: stack.plugin_host.ui_attachment(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                project_config: trust.project_config.clone(),
+                trust_question: trust.state.question().cloned(),
             },
             initial_prompt.take(),
         )
@@ -347,10 +497,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -s {session_id}");
+                    eprintln!("Resume session:\n\n  maki -r {session_id}");
                 }
+                let started = Instant::now();
+                drop(stack);
+                let stack_ms = started.elapsed().as_millis() as u64;
+                teardown.join();
+                tracing::info!(
+                    stack_ms,
+                    teardown_ms = started.elapsed().as_millis() as u64 - stack_ms,
+                    "plugin host and teardown joined"
+                );
                 if code != 0 {
-                    teardown.join();
+                    maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
                 }
                 return Ok(());
@@ -358,25 +517,35 @@ pub fn run(mut cli: Cli) -> Result<()> {
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
+                pack,
             } => {
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
-                // Shut the old host down first so nothing can repopulate
-                // the registry after the clear: its senders disconnect, the
-                // watchdog aborts in-flight callbacks, and only this thread
-                // issues loads. The old VM then shares nothing with the new
-                // stack, so its slow join (up to 2s) can run on a
-                // background thread.
-                stack.plugin_host.begin_shutdown();
-                ToolRegistry::global().clear_lua();
-                teardown.defer(move || drop(stack));
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                let was_trusted = trust.project_config.is_trusted();
+                // Re-read the store: a `/trust` grant, or a `maki trust add`
+                // run in another terminal, only takes effect from here.
+                trust = project::resolve(&storage, &cwd, mode);
+                let (new_stack, new_warnings, pack_report) = rebuild(
+                    &launch,
+                    stack,
+                    &mut teardown,
+                    &trust,
+                    was_trusted,
+                    pack,
+                    Some(last_good),
+                )?;
                 tabs = reloaded;
                 if tabs.is_empty() {
-                    tabs.push(AppSession::new(&new_stack.model.spec(), &cwd_str));
+                    let replacement = Resolved::fresh(&storage);
+                    setup::report_session_start(replacement.start_type, Some(&replacement.id));
+                    tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
                 }
                 stack = new_stack;
-                warnings = new_warnings;
+                if let Some(report) = pack_report {
+                    notice = report.changed().then(|| report.summary());
+                    warnings = super::sanitize_warnings(&report.failures);
+                }
+                warnings.extend(new_warnings);
                 focused = f.min(tabs.len() - 1);
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -388,10 +557,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
 }
 
-fn warn_stale_config_toml(cwd: &std::path::Path) {
+/// Trust has nothing to say about this file, because Maki no longer reads it.
+/// Someone who declined trust deserves to hear that the file is inert just as
+/// much as someone who accepted.
+fn warn_stale_config_toml(project_config: &ProjectConfig) {
     let stale_paths = [
-        maki_config::global_config_dir().map(|d| d.join("config.toml")),
-        Some(cwd.join(".maki/config.toml")),
+        maki_config::global_config_dir().map(|dir| dir.join(STALE_GLOBAL_CONFIG)),
+        Some(project_config.config_root().join(STALE_PROJECT_CONFIG)),
     ];
     for path in stale_paths.into_iter().flatten() {
         if path.is_file() {
@@ -406,11 +578,35 @@ fn warn_stale_config_toml(cwd: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use color_eyre::eyre::eyre;
+    use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
+    use maki_providers::Message;
+    use maki_storage::sessions::SessionClaim;
+    use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::tempdir;
+    use test_case::test_case;
+
+    const STARTUP_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const STORED_SPEC: &str = "zai/glm-4.6";
+    const CWD: &str = "/project";
+    const STORED_MESSAGE: &str = "the turn the stored session already had";
+
+    fn no_names(_: &PluginHost) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    #[test_case(false, false, false ; "untrusted reload leaves the env alone")]
+    #[test_case(true, true, false ; "ordinary reload of a trusted folder does not reload the env")]
+    #[test_case(true, false, false ; "a revoked folder does not reload the env")]
+    #[test_case(false, true, true ; "a fresh grant loads the project env")]
+    fn project_env_loads_only_on_the_grant(was_trusted: bool, now_trusted: bool, expected: bool) {
+        assert_eq!(should_load_project_env(was_trusted, now_trusted), expected);
+    }
 
     /// `second_saw_first` requires both joins: `defer` joining the first
     /// closure before spawning the second, and `Drop` joining the second
@@ -450,20 +646,20 @@ mod tests {
 
     fn test_config() -> Config {
         RawConfig::default()
-            .into_config(false)
+            .into_config(&[])
             .expect("default config")
     }
 
     #[test]
     fn broken_config_with_fallback_uses_last_good_and_warns() {
         let mut last_good = test_config();
-        last_good.always_fast = true;
+        last_good.session_defaults.fast = true;
         let mut warnings = Vec::new();
 
         let config = config_or_fallback(Err(eyre!("boom")), Some(last_good), &mut warnings)
             .expect("fallback config");
 
-        assert!(config.always_fast);
+        assert!(config.session_defaults.fast);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].starts_with(CONFIG_FALLBACK_WARNING),
@@ -488,10 +684,6 @@ mod tests {
     /// `init.lua` must not be executed in that mode.
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
-        use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
-
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).expect("mkdir .maki");
@@ -507,8 +699,15 @@ mod tests {
         let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
             .expect("live host boots under --no-plugins");
 
-        let config = load_config(&plugin_host, &cli, dir.path())
-            .expect("no-plugins must skip the broken init.lua and still load defaults");
+        let config = load_config(
+            &plugin_host,
+            &cli,
+            InitFiles::Disabled,
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &mut Vec::new(),
+        )
+        .expect("no-plugins must skip the broken init.lua and still load defaults");
         assert!(
             !config.plugins.names.is_empty(),
             "default builtin plugins must still be enabled under --no-plugins"
@@ -526,10 +725,6 @@ mod tests {
     /// cannot silently regress into a tautology.
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
-        use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
-
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).expect("mkdir .maki");
@@ -545,11 +740,71 @@ mod tests {
         let mut plugin_host =
             PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
 
-        match load_config(&plugin_host, &cli, dir.path()) {
+        match load_config(
+            &plugin_host,
+            &cli,
+            InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &mut Vec::new(),
+        ) {
             Err(_) => {}
             Ok(_) => panic!("broken init.lua must error without --no-plugins"),
         }
 
         plugin_host.begin_shutdown();
+    }
+
+    /// A session's recorded spec is the single source of truth for the model
+    /// its tab runs on, so both directions matter. An explicit `--model` used
+    /// to be ignored on a resumed session, and without one the startup default
+    /// must not overwrite the recorded spec, or per tab models die on every
+    /// restart.
+    #[test_case(false, STORED_SPEC ; "a resumed tab keeps its own spec")]
+    #[test_case(true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
+    fn explicit_model_overrides_only_a_resumed_spec(explicit_model: bool, expected_spec: &str) {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let mut stored = AppSession::new(STORED_SPEC, &cwd);
+        stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
+        let stored_id = stored.id;
+        stored
+            .save(
+                &SessionClaim::acquire(stored_id, &storage).expect("claim"),
+                &storage,
+            )
+            .expect("write session to disk");
+        let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
+            .expect("continue resolves");
+
+        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
+
+        assert_eq!(session.id, stored_id);
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter_map(|m| m.user_text())
+                .collect::<Vec<_>>(),
+            vec![STORED_MESSAGE]
+        );
+        assert_eq!(session.model, expected_spec);
+    }
+
+    /// A fresh tab opens on the startup spec, which already folded in
+    /// `--model`, and under the id the resolver picked, so what the run
+    /// reports is what it writes.
+    #[test]
+    fn a_fresh_tab_opens_on_the_resolved_id_and_the_startup_spec() {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let resolved = Resolved::fresh(&storage);
+        let id = resolved.id.id();
+        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
+
+        assert_eq!(session.id, id);
+        assert!(session.messages().is_empty());
+        assert_eq!(session.model, STARTUP_SPEC);
     }
 }

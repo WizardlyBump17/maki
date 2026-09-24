@@ -5,13 +5,15 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
-mod file_tracker;
+mod file_access;
 pub mod grep;
+pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
-pub use file_tracker::FileReadTracker;
+pub use file_access::{FileAccess, FileKey};
+pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
@@ -27,23 +29,55 @@ use std::time::{Duration, Instant, SystemTime};
 
 use humantime::format_duration;
 use ignore::WalkBuilder;
+use maki_config::ProjectConfig;
 use serde_json::Value;
 
-use crate::agent::LoadedInstructions;
+use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
+use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
 
+pub(crate) const TOOL_NAME_FIELD: &str = "name";
+/// What `maki.task` calls the session's own chat.
+pub const MAIN_TASK_ID: &str = "main";
+
+/// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
+/// blocks in history, and those hold the model's own calls only, so a nested
+/// call must never change what the next request carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallOrigin {
+    /// Emitted by the model and recorded in history under its own id.
+    Model,
+    /// Made on the model's behalf and invisible to history: batch children,
+    /// `code_execution` scripts, Lua `call_tool`.
+    Nested,
+}
+
+impl CallOrigin {
+    pub fn is_model(self) -> bool {
+        matches!(self, Self::Model)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Nested => "nested",
+        }
+    }
+}
+
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
     pub audience: ToolAudience,
     pub workflow: bool,
+    /// Whether the session being described can reach MCP tools.
+    pub mcp: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,6 +137,88 @@ impl ToolFilter {
         exclude.extend(capability_exclusions(model));
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
         base.excluding(&exclude)
+    }
+}
+
+/// The tool array one run sends to the model, paired with the filter that
+/// produced it. A run context carries the pair, never a loose array, so the
+/// names dispatch offers in-process (`tool_dispatch::callable`, and through it
+/// the `code_execution` sandbox) cannot drift from what the model was shown.
+#[derive(Clone)]
+pub struct RequestTools {
+    definitions: Value,
+    filter: Arc<ToolFilter>,
+}
+
+impl Default for RequestTools {
+    fn default() -> Self {
+        Self {
+            definitions: Value::Array(Vec::new()),
+            filter: Arc::default(),
+        }
+    }
+}
+
+impl RequestTools {
+    /// The one place a run's tool array is built. Host exclusions (a client
+    /// that cannot service `question`) go through here and nowhere else, so
+    /// the array and the filter always agree on them.
+    pub fn build(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+    ) -> Self {
+        let filter = ToolFilter::from_config(config, model, excluded);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow,
+            mcp,
+        };
+        Self {
+            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            filter: Arc::new(filter),
+        }
+    }
+
+    /// For an array the host built itself, like a Lua subagent publishing what
+    /// its caller picked. The filter is read back off that array, so the names
+    /// the model was shown and the names a script may reach are one set, and
+    /// the caller's `only`/`except` never has to be passed twice. MCP names are
+    /// never matched against this filter and stay reachable.
+    ///
+    /// An array nobody can read a name out of says nothing about intent, so it
+    /// falls back to the config's filter instead of an `Only` of nothing that
+    /// would leave the session unable to do anything. An array that is
+    /// genuinely empty is an answer, and is kept as one.
+    pub fn assembled(definitions: Value, config: &AgentConfig, model: &Model) -> Self {
+        let published: Option<Vec<String>> = definitions.as_array().and_then(|defs| {
+            let names: Vec<String> = defs
+                .iter()
+                .filter_map(|def| def[TOOL_NAME_FIELD].as_str().map(str::to_owned))
+                .collect();
+            (defs.is_empty() || !names.is_empty()).then_some(names)
+        });
+        let filter = published.map_or_else(
+            || ToolFilter::from_config(config, model, &[]),
+            ToolFilter::Only,
+        );
+        Self {
+            definitions,
+            filter: Arc::new(filter),
+        }
+    }
+
+    pub fn definitions(&self) -> &Value {
+        &self.definitions
+    }
+
+    pub fn filter(&self) -> &Arc<ToolFilter> {
+        &self.filter
     }
 }
 
@@ -185,8 +301,31 @@ pub fn timeout_annotation(secs: u64) -> String {
     format!("{formatted} timeout")
 }
 
-pub type LocalToolFn = Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
-pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
+pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
+pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
+pub type LocalTools = Arc<HashMap<String, LocalTool>>;
+
+/// A tool the session's host supplies: an ACP client tool, a subagent's
+/// `structured_output`. Dispatch puts it ahead of the registry, so it carries
+/// its own audience: a host tool must not reach a sandbox by wearing the name
+/// of a registry tool that may.
+#[derive(Clone)]
+pub struct LocalTool {
+    pub handler: LocalToolFn,
+    pub audience: ToolAudience,
+}
+
+/// Coerces a closure into a [`LocalTool`]; the bound gives the boxed
+/// future a coercion target that `Arc::new` alone does not.
+pub fn local_tool<F>(audience: ToolAudience, f: F) -> LocalTool
+where
+    F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
+{
+    LocalTool {
+        handler: Arc::new(f),
+        audience,
+    }
+}
 
 #[derive(Clone)]
 pub struct ToolContext {
@@ -198,20 +337,32 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
+    /// spawning call's `tool_use_id` in a subagent. A subagent shares
+    /// `session_id` with its parent on purpose (provider affinity, hooks,
+    /// otel), so this is what tells their chats apart.
+    pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
+    /// Per model call, shared with its nested calls.
+    pub call_instructions: CallInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
     pub config: AgentConfig,
+    pub tool_filter: Arc<ToolFilter>,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
-    pub file_tracker: Arc<FileReadTracker>,
+    pub file_access: Arc<FileAccess>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    /// Shared with the run that spawned this tool, so a subagent's spend lands
+    /// in the parent turn's totals.
+    pub ledger: Arc<RunLedger>,
     pub registry: Arc<ToolRegistry>,
     pub workflow: bool,
     pub audience: ToolAudience,
@@ -408,7 +559,7 @@ pub fn interpreter_ctx(
     event_tx: &EventSender,
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
-    file_tracker: Arc<FileReadTracker>,
+    file_access: Arc<FileAccess>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
@@ -421,20 +572,24 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        task_id: None,
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
+        call_instructions: CallInstructions::default(),
         cancel,
         mcp: None,
         deadline: Deadline::None,
         config: AgentConfig::default(),
+        tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
-        file_tracker,
+        file_access,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
+        ledger: Arc::default(),
         registry,
         workflow: false,
         audience: ToolAudience::MAIN,
@@ -449,6 +604,7 @@ pub fn interpreter_ctx(
 pub fn cli_tool_ctx() -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     interpreter_ctx(
         &AgentMode::Build,
         &event_tx,
@@ -459,9 +615,11 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cwd.clone(),
+            ProjectConfig::discover(&cwd),
+            Arc::default(),
         )),
-        Arc::new(FileReadTracker::new()),
+        FileAccess::fresh(),
         None,
         Arc::clone(ToolRegistry::global_arc()),
     )
@@ -475,6 +633,66 @@ pub mod test_support {
     use super::*;
 
     pub const GUARDED_TOOL_NAME: &str = "guarded_mock";
+
+    /// Registry and routing tests care about the name and audience only, never
+    /// about what the tool returns.
+    pub fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        mock_tool_with_schema(
+            name,
+            audience,
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        )
+    }
+
+    pub fn mock_tool_with_schema(
+        name: &str,
+        audience: ToolAudience,
+        schema: Value,
+    ) -> Arc<dyn registry::Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience,
+            schema,
+        })
+    }
+
+    struct MockTool {
+        name: String,
+        audience: ToolAudience,
+        schema: Value,
+    }
+
+    struct MockInvocation;
+
+    impl registry::ToolInvocation for MockInvocation {
+        fn start_header(&self) -> registry::HeaderFuture {
+            registry::HeaderFuture::Ready(registry::HeaderResult::plain("mock".into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> registry::ExecFuture<'a> {
+            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
+        }
+    }
+
+    impl registry::Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "mock tool".into()
+        }
+        fn schema(&self) -> Value {
+            self.schema.clone()
+        }
+        fn audience(&self) -> ToolAudience {
+            self.audience
+        }
+        fn parse(
+            &self,
+            _input: &Value,
+        ) -> Result<Box<dyn registry::ToolInvocation>, registry::ParseError> {
+            Ok(Box::new(MockInvocation))
+        }
+    }
 
     pub struct GuardedMock;
 
@@ -522,6 +740,8 @@ pub mod test_support {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
+            ProjectConfig::discover(Path::new("/tmp")),
+            Arc::default(),
         ))
     });
 
@@ -543,7 +763,7 @@ pub mod test_support {
             event_tx,
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
-            Arc::new(FileReadTracker::new()),
+            FileAccess::fresh(),
             None,
             Arc::new(ToolRegistry::new()),
         );
@@ -567,7 +787,7 @@ pub mod test_support {
             &event_tx,
             CancelToken::none(),
             permissions,
-            Arc::new(FileReadTracker::new()),
+            FileAccess::fresh(),
             None,
             Arc::new(ToolRegistry::new()),
         );
@@ -586,11 +806,30 @@ mod tests {
     use super::*;
 
     const LINE_LIMIT: usize = 500;
+    const TEST_MODEL_SPEC: &str = "anthropic/claude-opus-4-8";
+
+    /// The array a host hands in is the whole answer, but only where names can
+    /// be read out of it. Something unreadable must not quietly come out as
+    /// "no tools at all".
+    #[test_case(serde_json::json!([{ TOOL_NAME_FIELD: READ_TOOL_NAME }]), true,  false ; "published_names_bind_the_filter")]
+    #[test_case(serde_json::json!([]),                                    false, false ; "empty_array_publishes_nothing")]
+    #[test_case(serde_json::json!([{ "description": "nameless" }]),       true,  true  ; "unreadable_array_falls_back_to_config")]
+    #[test_case(serde_json::json!({}),                                    true,  true  ; "non_array_falls_back_to_config")]
+    fn assembled_reads_its_filter_off_the_published_array(
+        definitions: Value,
+        read_matches: bool,
+        write_matches: bool,
+    ) {
+        let model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
+        let tools = RequestTools::assembled(definitions, &AgentConfig::default(), &model);
+        assert_eq!(tools.filter().matches(READ_TOOL_NAME), read_matches);
+        assert_eq!(tools.filter().matches(WRITE_TOOL_NAME), write_matches);
+    }
 
     #[test_case(true  ; "vision_model_keeps_view_image")]
     #[test_case(false ; "text_only_model_loses_view_image")]
     fn from_config_gates_view_image_on_vision(vision: bool) {
-        let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let mut model = Model::from_spec(TEST_MODEL_SPEC).unwrap();
         model.supports_vision_override = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
         assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
@@ -631,6 +870,7 @@ mod tests {
     #[test_case(&"x".repeat(LINE_LIMIT),       &"x".repeat(LINE_LIMIT)        ; "exact_boundary")]
     #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}...", "x".repeat(LINE_LIMIT)) ; "long_truncated")]
     #[test_case(&format!("{}\u{1F600}", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "multibyte_char_boundary")]
+    #[test_case(&format!("{}\u{0430}tail", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "two_byte_char_boundary")]
     fn truncate_bytes_cases(input: &str, expected: &str) {
         let result = truncate_bytes(input, LINE_LIMIT);
         assert_eq!(result, expected);

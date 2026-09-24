@@ -1,6 +1,18 @@
 local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
+local Toast = require("maki.toast")
+
+local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines" }
+local VIEW_PREF_FILE = "picker_view"
+
+-- A toast and not a flash, because this feedback has to stay readable while
+-- the picker is still covering the screen. Kept local on purpose: claiming the
+-- global `maki.notify` slot here would put a "memory" toast in front of every
+-- other plugin's notices too.
+local function notify(msg)
+  Toast.show(msg, { title = "memory" })
+end
 
 local function memories_path_suffix()
   local cwd = maki.uv.cwd()
@@ -8,22 +20,54 @@ local function memories_path_suffix()
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
 
-local function resolve_dir(check_legacy)
-  if check_legacy then
-    local legacy = maki.env.legacy_dir()
-    if legacy then
-      local dir = maki.fs.joinpath(legacy, memories_path_suffix())
-      local meta = maki.fs.metadata(dir)
-      if meta and meta.is_dir then
-        return dir
+local function legacy_dir_if_exists(suffix)
+  local legacy = maki.env.legacy_dir()
+  if not legacy then
+    return nil
+  end
+  local dir = maki.fs.joinpath(legacy, suffix)
+  local meta = maki.fs.metadata(dir)
+  if meta and meta.is_dir then
+    return dir
+  end
+end
+
+-- Notes live outside cwd, where file-write tools normally prompt; pre-allow
+-- them here so the agent can edit notes directly. Reads may come from the
+-- legacy dir while writes go to the state dir, so cover both.
+local function register_write_rules()
+  local suffix = memories_path_suffix()
+  local dirs = { legacy_dir_if_exists(suffix) }
+  local state = maki.env.state_dir()
+  if state then
+    dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
+  end
+  for _, dir in ipairs(dirs) do
+    for _, tool in ipairs(WRITE_TOOLS) do
+      -- The edit sub-tools are opt-in, and a rule naming an unregistered tool
+      -- is dropped with a warning. Ask first, or a default config logs that
+      -- warning at every startup.
+      if maki.api.get_tool(tool) then
+        maki.api.register_permission_rule({ tool = tool, scope = dir .. "/**" })
       end
+    end
+  end
+end
+register_write_rules()
+
+local function resolve_dir(check_legacy)
+  local suffix = memories_path_suffix()
+  if check_legacy then
+    local dir = legacy_dir_if_exists(suffix)
+    if dir then
+      return dir
     end
   end
   local state = maki.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
   end
-  return maki.fs.joinpath(state, memories_path_suffix())
+  return maki.fs.joinpath(state, suffix)
 end
 
 maki.api.register_prompt_hint({
@@ -129,12 +173,22 @@ local function cmd_delete(path, dir)
   return "deleted " .. path
 end
 
+local function with_dir(res, dir)
+  local prefix = "dir: " .. dir .. "\n\n"
+  if type(res) == "string" then
+    return prefix .. res
+  end
+  res.llm_output = prefix .. res.llm_output
+  return res
+end
+
 maki.api.register_tool({
   name = "memory",
   description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
     .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
     .. "- Save important context before compaction or to build up project knowledge.\n"
-    .. "- Keep entries concise and current. Delete outdated information.",
+    .. "- Keep entries concise and current. Delete outdated information.\n"
+    .. "- Notes are plain files; `list` and `read` report the dir, so use the edit tool on `<dir>/<name>` for targeted changes.",
 
   schema = {
     type = "object",
@@ -207,24 +261,74 @@ maki.api.register_tool({
     if err then
       return { llm_output = "error: " .. err, is_error = true }
     end
+    if cmd == "list" or cmd == "read" then
+      return with_dir(result, dir)
+    end
     return result
   end,
 })
 
-local function popup_build_items(dir)
-  local groups, warnings = helpers.grouped_tags(dir)
+local function flat_rows(files)
   local items = {}
-  for _, g in ipairs(groups) do
+  for i, f in ipairs(files) do
+    items[i] = { label = f.name, detail = helpers.detail_parts(f.size, f.tags) }
+  end
+  return items
+end
+
+-- No tags on the row: the section header names the tag, and the tint shows
+-- which other sections hold the same file.
+local function grouped_rows(files)
+  local items = {}
+  for _, g in ipairs(helpers.group_by_tag(files)) do
     for _, f in ipairs(g.files) do
       items[#items + 1] = {
         label = f.name,
-        detail = "(" .. f.size .. " bytes)",
+        detail = helpers.format_size(f.size),
         section = g.tag,
         section_detail = "(" .. #g.files .. ")",
       }
     end
   end
-  return items, warnings
+  return items
+end
+
+local VIEWS = {
+  { id = "flat", rows = flat_rows },
+  { id = "grouped", rows = grouped_rows },
+}
+
+-- Remembered across runs, so /memory opens the way you left it. A preference
+-- and not project data, so it lives with maki's other state and not in the
+-- memories directory.
+local function view_pref_path()
+  local state = maki.env.state_dir()
+  return state and maki.fs.joinpath(state, "memory", VIEW_PREF_FILE)
+end
+
+local function load_view()
+  local path = view_pref_path()
+  local saved = path and maki.fs.read(path)
+  for i, v in ipairs(VIEWS) do
+    if v.id == saved then
+      return i
+    end
+  end
+  return 1
+end
+
+local function save_view(view)
+  local path = view_pref_path()
+  if not path then
+    return
+  end
+  local _, err = maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
+  if not err then
+    _, err = maki.fs.write(path, VIEWS[view].id)
+  end
+  if err then
+    maki.log.warn("memory: cannot save the picker view to " .. path .. ": " .. tostring(err))
+  end
 end
 
 maki.api.register_command({
@@ -237,27 +341,43 @@ maki.api.register_command({
       return
     end
 
-    local items, warnings = popup_build_items(dir)
+    local view = load_view()
+    -- The only place rows are built, so the two views can never disagree about
+    -- what is on disk.
+    local function build()
+      local files, warnings = helpers.files_with_tags(dir)
+      if #warnings > 0 then
+        notify(#warnings .. " unreadable memory file(s)")
+      end
+      return VIEWS[view].rows(files)
+    end
+
+    local items = build()
     if #items == 0 then
       maki.ui.flash("No memories yet")
       return
     end
-    if #warnings > 0 then
-      maki.ui.flash(#warnings .. " unreadable memory file(s)")
-    end
     local last_cursor = 1
     while true do
-      if last_cursor > #items then
-        last_cursor = math.max(1, #items)
-      end
       local event = ListPicker.open(items, {
         title = " Memory Files ",
         cursor = last_cursor,
-        submit_keys = { "ctrl+o" },
+        key = function(item)
+          return item.label
+        end,
+        submit_keys = { "<C-o>" },
+        live_keys = {
+          ["<Tab>"] = function()
+            view = view % #VIEWS + 1
+            save_view(view)
+            return build()
+          end,
+        },
         footer = {
           { "Enter", "open" },
           { "Ctrl+O", "edit" },
           { "Ctrl+D", "delete" },
+          { "Tab", "switch view" },
         },
       })
 
@@ -267,25 +387,20 @@ maki.api.register_command({
 
       last_cursor = event.index
       if event.type == "choice" then
-        local item = items[event.index]
-        if item then
-          local path = maki.fs.joinpath(dir, item.label)
-          local code = maki.ui.open_editor(path)
-          if code == 0 then
-            items = popup_build_items(dir)
-          end
+        local path = maki.fs.joinpath(dir, event.item.label)
+        if maki.ui.open_editor(path) == 0 then
+          items = build()
         end
       elseif event.type == "delete" then
-        local item = items[event.index]
-        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, item.label))
+        local ok, err = maki.fs.rm(maki.fs.joinpath(dir, event.item.label))
         if ok then
-          maki.ui.flash("Deleted " .. item.label)
-          items = popup_build_items(dir)
+          notify("Deleted " .. event.item.label)
+          items = build()
           if #items == 0 then
             break
           end
         else
-          maki.ui.flash("Delete failed: " .. tostring(err))
+          notify("Delete failed: " .. tostring(err))
         end
       else
         break

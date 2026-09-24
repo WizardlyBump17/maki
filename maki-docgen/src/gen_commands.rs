@@ -4,6 +4,33 @@ use maki_ui::BUILTIN_COMMANDS;
 
 use crate::lua_util;
 
+const ALIASING: &str = r#"## Aliasing commands
+
+Prefer a different name for a command? `maki.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+
+```lua
+-- ~/.config/maki/init.lua
+local aliases = {
+    { name = "/clear", target = "/new", description = "Alias for /new" },
+    { name = "/resume", target = "/sessions", description = "Alias for /sessions" },
+}
+
+for _, alias in ipairs(aliases) do
+    maki.api.register_command({
+        name = alias.name,
+        description = alias.description,
+        handler = function()
+            local ok, err = maki.api.run_command(alias.target)
+            if not ok then
+                maki.ui.flash("could not run " .. alias.target .. ": " .. err)
+            end
+        end,
+    })
+end
+```
+
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
+
 fn write_row(out: &mut String, name: &str, description: &str) {
     writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
 }
@@ -51,17 +78,17 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "- **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`."
+        "- **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`."
     )
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
+        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
     )
     .unwrap();
     writeln!(
         out,
-        "- **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`."
+        "- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`."
     )
     .unwrap();
     writeln!(
@@ -163,6 +190,9 @@ pub fn generate() -> String {
         "For example, `/project:review main.rs` replaces `$ARGUMENTS` with `main.rs`."
     )
     .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{ALIASING}").unwrap();
+
     writeln!(out).unwrap();
     writeln!(
         out,

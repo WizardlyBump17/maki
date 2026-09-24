@@ -14,16 +14,19 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
-use tracing::warn;
+use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::id::{MakiId, MakiIdParseError};
+use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::lock::{Lock, LockError};
 use crate::{StateDir, StorageError, atomic_write, now_epoch};
 
 const SESSION_VERSION: u32 = 1;
@@ -34,6 +37,10 @@ const CWD_INDEX_STEM: &str = "cwd_latest";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
+/// Printed on stderr when a transcript never reached disk. Nobody reads a
+/// `warn!` in a scripted run or a status bar that is about to close, and the
+/// next `-c` would quietly continue a session missing a turn.
+pub const SAVE_FAILED: &str = "maki: failed to save session ";
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 const EPOCH_CHANGED: &str = "messages were rewritten";
@@ -43,6 +50,20 @@ const LOG_BLOATED: &str = "too many stale meta records";
 /// Every append leaves a whole meta record behind and only the last one is ever
 /// read. Past this many, the log is rewritten and they all go away at once.
 const MAX_APPENDS: usize = 512;
+/// Where a shrink rewrite parks the log it is about to drop, as `archive/<id>/`.
+const ARCHIVE_DIR: &str = "archive";
+/// Where [`SessionClaim`] keeps its lock files, as `locks/<id>`. Not `<id>.lock`
+/// next to the log, because [`session_entries`] reads the sessions dir on every
+/// scan and would wade through one lock file per session.
+const LOCKS_DIR: &str = "locks";
+/// Archives kept per session. The extra ones go on the next archive, not on a
+/// timer.
+const ARCHIVE_KEEP: usize = 3;
+/// Three copies of a log full of tool output add up fast, so the bytes get a
+/// budget of their own. The newest archive always survives, whatever it weighs.
+const ARCHIVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// A `msg` line starts with this. Matching the prefix beats parsing the log.
+const MSG_PREFIX: &[u8] = br#"{"t":"msg""#;
 
 /// Hands out the token that tags one append-only run of a message list.
 /// Process wide, so two runs never pick the same number.
@@ -66,14 +87,198 @@ pub enum SessionError {
         raw_id: String,
         source: MakiIdParseError,
     },
+    #[error("session log {path} has no header record")]
+    MissingHeader { path: String },
     #[error("session log diverged ({reason}); rewrite required")]
     LogDiverged { reason: &'static str },
+    #[error("session {id} is open in another maki process")]
+    Busy { id: MakiId },
+    #[error("session {given_id} cannot be written while holding the claim on {claim_id}")]
+    ClaimMismatch { claim_id: MakiId, given_id: MakiId },
+}
+
+impl SessionError {
+    /// "Nothing was ever written here", as opposed to "something is there and
+    /// this process could not read it". A caller that creates a session when
+    /// the load fails has to tell the two apart, or it answers an unreadable
+    /// session by overwriting it.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Storage(StorageError::NotFound(_)))
+    }
+
+    /// Another maki owns this session. Unlike other read failures, the caller
+    /// must not answer this one by starting a new session: the transcript is
+    /// fine, it just belongs to someone else, and moving on quietly would hide
+    /// the conflict.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Busy { .. })
+    }
+}
+
+/// The right to write one session. Every write takes one and reads the id out
+/// of it, so "which session may I replace" has exactly one answer.
+///
+/// Take it before reading the transcript, not just before writing. Two runs
+/// that both read first would still take turns clobbering each other, and the
+/// second would build a whole conversation on a stale copy. That is why
+/// [`Session::claim_and_load`] and [`Session::claim_latest`] do both in one go.
+///
+/// Clones share one lock, released when the last clone drops. That is how a
+/// snapshot queued for the writer thread keeps its session locked until it
+/// lands, without the process ever claiming the same id twice.
+///
+/// The lock is `flock(2)` on unix and `LockFileEx` on windows, through `fs4`.
+/// Both belong to the open file, not the process, so claiming twice in one
+/// process conflicts just like two processes do. That is why holders clone
+/// instead of claiming again, and why the tests need no second process. With
+/// per-process `fcntl` locks those tests would pass without proving anything.
+#[derive(Clone)]
+pub struct SessionClaim(Arc<ClaimInner>);
+
+struct ClaimInner {
+    id: MakiId,
+    /// Lets [`Drop`] check whether the id ever got a transcript.
+    dir: PathBuf,
+    /// `None` where the filesystem cannot lock (some NFS, 9p, a read-only state
+    /// dir). Refusing to run there would break setups that work today, so the
+    /// claim still gates every write but protects nothing.
+    lock: Option<Lock>,
+    /// Where [`SessionClaim::persist`] appends next. It lives on the claim
+    /// because a cursor is only safe while nobody else can write the file. Kept
+    /// past its claim, it could append to a file another process replaced.
+    cursor: Mutex<Option<SessionLog>>,
+}
+
+impl fmt::Debug for SessionClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionClaim")
+            .field("id", &self.0.id)
+            .field("locked", &self.0.lock.is_some())
+            .finish()
+    }
+}
+
+impl SessionClaim {
+    fn new(id: MakiId, dir: PathBuf, lock: Option<Lock>) -> Self {
+        Self(Arc::new(ClaimInner {
+            id,
+            dir,
+            lock,
+            cursor: Mutex::default(),
+        }))
+    }
+
+    pub fn acquire(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
+        Self::acquire_in(id, &dir.ensure_subdir(SESSIONS_DIR)?)
+    }
+
+    /// Retries for a moment before calling the session busy. Claims are dropped
+    /// and retaken all the time (a tab swaps sessions, a delete retakes what a
+    /// closed tab let go), and a tool or MCP server caught between fork and
+    /// exec still holds a copy of the fd we just closed. A real holder outlasts
+    /// the retry, see [`Lock::acquire_retrying`].
+    pub fn acquire_in(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
+        match Lock::acquire_retrying(&lock_path(dir, id)) {
+            Ok(lock) => Ok(Self::new(id, dir.to_path_buf(), Some(lock))),
+            Err(LockError::Held { .. }) => Err(SessionError::Busy { id }),
+            Err(LockError::Io { path, source }) => {
+                warn!(
+                    error = %source,
+                    path = %path.display(),
+                    session_id = %id,
+                    "cannot lock session; concurrent writes to it are unprotected"
+                );
+                Ok(Self::new(id, dir.to_path_buf(), None))
+            }
+        }
+    }
+
+    /// A claim on a newly minted id. Nobody else can hold an id nobody has seen,
+    /// so this never fails.
+    pub fn fresh(dir: &StateDir) -> Self {
+        let id = MakiId::generate();
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        Self::acquire_in(id, &sessions_dir).unwrap_or_else(|e| {
+            warn!(error = %e, session_id = %id, "fresh session left unprotected");
+            Self::new(id, sessions_dir, None)
+        })
+    }
+
+    pub fn id(&self) -> MakiId {
+        self.0.id
+    }
+
+    /// Writes `session` the cheapest sound way: an append while the cursor this
+    /// claim keeps still describes the file, a full rewrite otherwise.
+    pub fn persist<M, U, T>(&self, session: &Session<M, U, T>) -> Result<(), SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
+        let mut cursor = self.0.cursor.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(log) = cursor.as_mut() {
+            // A failed append rolls the file back to the last full record, so
+            // the cursor still fits. Keeping it saves a second full write, the
+            // last thing a failing disk needs. Only divergence makes it stale.
+            match log.append(self, session) {
+                Err(SessionError::LogDiverged { .. }) => {}
+                appended => return appended,
+            }
+        }
+        *cursor = None;
+        *cursor = Some(SessionLog::rewrite_claimed(&self.0.dir, self, session)?);
+        Ok(())
+    }
+
+    /// For writes that bypass [`Self::persist`], which leave the cursor
+    /// pointing at a file that is gone.
+    fn forget_cursor(&self) {
+        *self.0.cursor.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The one check between a claim and a write.
+    fn allows(&self, id: MakiId) -> Result<(), SessionError> {
+        match self.0.id == id {
+            true => Ok(()),
+            false => Err(SessionError::ClaimMismatch {
+                claim_id: self.0.id,
+                given_id: id,
+            }),
+        }
+    }
+}
+
+impl Drop for ClaimInner {
+    /// Every run claims an id before it knows if a turn will happen, so a maki
+    /// opened and quit leaves a lock file for an id with no session, and so
+    /// does a delete. The last holder is the only one who knows nothing will
+    /// write the id again, so it removes the file. Otherwise `locks/` grows by
+    /// one file per session ever created.
+    ///
+    /// The flock is still held here, since fields drop after this body, so a
+    /// process that opened the file before the unlink has to wait for us. It
+    /// then locks a file nobody else can find. That is harmless, because only
+    /// ids without a transcript get here and there is nothing to clobber.
+    fn drop(&mut self) {
+        if self.lock.is_some() && locate_session_file(&self.dir, self.id).is_none() {
+            let _ = fs::remove_file(lock_path(&self.dir, self.id));
+        }
+    }
+}
+
+fn locks_dir(dir: &Path) -> PathBuf {
+    dir.join(LOCKS_DIR)
+}
+
+fn lock_path(dir: &Path, id: MakiId) -> PathBuf {
+    locks_dir(dir).join(id.to_string())
 }
 
 /// Per-model token breakdown entry. Mirrors the four usage counters tracked by
 /// the active provider; kept storage-local to avoid a circular dependency on
 /// `maki-providers`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StoredTokenUsage {
     #[serde(default)]
     pub input: u32,
@@ -83,6 +288,18 @@ pub struct StoredTokenUsage {
     pub cache_creation: u32,
     #[serde(default)]
     pub cache_read: u32,
+    /// What the turns billed, in USD. Prices move (some providers by the hour),
+    /// so re-pricing these counters later would be fiction. `None` on unpriced
+    /// models, and on entries written before we recorded it until the next load
+    /// settles an estimate into them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// What the same turn would have billed at the provider's published list
+    /// price, kept only for subsidised (flat-subscription) models. `None`
+    /// on every ordinary turn, and on entries written before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsidised_list_cost: Option<f64>,
 }
 
 impl StoredTokenUsage {
@@ -103,6 +320,17 @@ impl std::ops::AddAssign for StoredTokenUsage {
         self.output = self.output.saturating_add(rhs.output);
         self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
         self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
+        add_cost(&mut self.cost, rhs.cost);
+        add_cost(&mut self.subsidised_list_cost, rhs.subsidised_list_cost);
+    }
+}
+
+/// The one way costs are summed, re-exported by `maki-providers` so every
+/// running total agrees: `None` until the first priced turn shows up, and from
+/// there it only grows.
+pub fn add_cost(total: &mut Option<f64>, addend: Option<f64>) {
+    if let Some(addend) = addend {
+        *total = Some(total.unwrap_or_default() + addend);
     }
 }
 
@@ -128,6 +356,10 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    /// `None` when the user never set yolo for this session, which is what
+    /// makes `--yolo` a property of the invocation rather than of the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yolo: Option<bool>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -212,6 +444,7 @@ pub struct Session<M, U, T> {
 pub struct SessionSummary {
     pub id: MakiId,
     pub title: String,
+    pub cwd: String,
     pub updated_at: u64,
 }
 
@@ -384,6 +617,12 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Absent on subagents written before this was recorded, and the one flag
+    /// that says whether `fast` below is the subagent's or just a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Deserialize)]
@@ -483,25 +722,189 @@ fn sub_msg_snapshot<M>(map: &HashMap<String, Arc<Vec<M>>>) -> HashMap<String, us
     map.iter().map(|(k, v)| (k.clone(), v.len())).collect()
 }
 
+/// Compaction and rewind hand the log a shorter message list, and writing that
+/// out would take the dropped turns with it, so the old file gets a second name
+/// under `archive/<id>/` first. Its own path is untouched until the rename, so
+/// [`SessionLog::rewrite`] keeps its crash-safety promise.
+fn archive_if_shrinking<M, U, T>(dir: &Path, session: &Session<M, U, T>) {
+    let path = jsonl_path(dir, session.id);
+    let new_count = session.messages.len();
+    if !log_msg_count_exceeds(&path, new_count) {
+        return;
+    }
+
+    let archive_dir = dir.join(ARCHIVE_DIR).join(session.id.to_string());
+    if let Err(e) = fs::create_dir_all(&archive_dir) {
+        warn!(error = %e, session_id = %session.id, "cannot create session archive dir");
+        return;
+    }
+    let existing = archives_newest_first(&archive_dir);
+    let next = existing.first().map_or(0, |a| a.seq) + 1;
+    let archive_path = archive_dir.join(format!("{next}.jsonl"));
+    let bytes = match link_archive(&path, &archive_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                error = %e,
+                session_id = %session.id,
+                "cannot archive session log before shrink rewrite"
+            );
+            return;
+        }
+    };
+    prune_archives(existing, bytes);
+    // The live log is about to be renamed away. If the archive's directory
+    // entry is not durable by then, a crash frees the only inode holding the
+    // dropped turns, which is the loss this whole function exists to prevent.
+    crate::sync_parent_dir(&archive_path);
+    info!(
+        session_id = %session.id,
+        new_msgs = new_count,
+        archive = %archive_path.display(),
+        "archived session log before shrink rewrite"
+    );
+}
+
+/// Whether the log holds more than `limit` messages, which is the whole
+/// question a shrink asks, so the scan stops at the first line past it. A
+/// growing log never trips that, so this still walks to EOF once per rewrite:
+/// it reads bytes into one reused buffer rather than allocating and
+/// UTF-8-validating a `String` per line, which is what made the pass show up
+/// next to the write it rides along with. A missing or unreadable file answers
+/// no and the rewrite goes ahead as before: nobody should lose a save because
+/// the old file would not count.
+fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut count = 0;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if line.starts_with(MSG_PREFIX) {
+            count += 1;
+            if count > limit {
+                return true;
+            }
+        }
+    }
+}
+
+/// The archive is a second name for the log's current inode. The rewrite
+/// renames a fresh file over the path, so the old bytes stay whole under the
+/// new name and not one of them is copied. Filesystems with no links (FAT32 on
+/// a stick) fall back to a plain copy. The size is for the byte budget.
+fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
+    if fs::hard_link(from, to).is_err() {
+        // `create_new` first: the name is only free if the seq scan saw every
+        // archive, and `fs::copy` would truncate the one it collided with.
+        OpenOptions::new().write(true).create_new(true).open(to)?;
+        fs::copy(from, to).inspect_err(|_| {
+            let _ = fs::remove_file(to);
+        })?;
+    }
+    Ok(fs::metadata(to)?.len())
+}
+
+/// `<seq>.jsonl`, counting up. A number cannot step back the way a clock does
+/// after an NTP fix or a suspend, so the order is always the truth and pruning
+/// can never mistake the newest archive for the oldest. The mtime says when.
+struct Archive {
+    seq: u64,
+    size: u64,
+    path: PathBuf,
+}
+
+/// Newest first: the next name comes off the front, pruning walks to the back.
+fn archives_newest_first(archive_dir: &Path) -> Vec<Archive> {
+    let Ok(entries) = fs::read_dir(archive_dir) else {
+        return Vec::new();
+    };
+    let mut archives: Vec<Archive> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_jsonl(&path) {
+                return None;
+            }
+            Some(Archive {
+                seq: path.file_stem()?.to_str()?.parse().ok()?,
+                size: entry.metadata().ok()?.len(),
+                path,
+            })
+        })
+        .collect();
+    archives.sort_unstable_by_key(|a| Reverse(a.seq));
+    archives
+}
+
+/// Walks from the newest and keeps what both budgets allow, so the rest go.
+/// `new_bytes` is the archive we just made: it is not in `existing`, so it can
+/// never be the one dropped.
+fn prune_archives(existing: Vec<Archive>, new_bytes: u64) {
+    let mut total = new_bytes;
+    let mut room = ARCHIVE_KEEP.saturating_sub(1);
+    for archive in existing {
+        total += archive.size;
+        if room > 0 && total <= ARCHIVE_MAX_BYTES {
+            room -= 1;
+            continue;
+        }
+        let _ = fs::remove_file(&archive.path);
+    }
+}
+
 impl SessionLog {
     /// Starts the file over: writes the whole log through a rename, so a crash
     /// mid-write leaves the old one intact, then claims the cwd index and
-    /// sweeps pre-jsonl leftovers. The only way to get a usable cursor onto a
-    /// file this process did not write: a cursor read back from disk describes
-    /// the session that was loaded, never the live one.
-    pub fn rewrite<M, U, T>(dir: &Path, session: &Session<M, U, T>) -> Result<Self, SessionError>
+    /// sweeps pre-jsonl leftovers. A rewrite that drops messages (compaction,
+    /// rewind) parks the previous file under `archive/<id>/` first, keeping the
+    /// newest [`ARCHIVE_KEEP`] of them within [`ARCHIVE_MAX_BYTES`]. The only
+    /// way to get a usable cursor onto a file this process did not write: a
+    /// cursor read back from disk describes the session that was loaded, never
+    /// the live one.
+    ///
+    /// Drops the claim's own cursor, since its file is the one renamed over.
+    pub fn rewrite<M, U, T>(
+        dir: &Path,
+        claim: &SessionClaim,
+        session: &Session<M, U, T>,
+    ) -> Result<Self, SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
     {
+        claim.forget_cursor();
+        Self::rewrite_claimed(dir, claim, session)
+    }
+
+    /// [`Self::rewrite`] for [`SessionClaim::persist`], which holds the cursor
+    /// it is about to replace.
+    fn rewrite_claimed<M, U, T>(
+        dir: &Path,
+        claim: &SessionClaim,
+        session: &Session<M, U, T>,
+    ) -> Result<Self, SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
+        claim.allows(session.id)?;
         let log = Self::write_canonical(dir, session)?;
         update_cwd_index(dir, &session.cwd, session.id)?;
         Ok(log)
     }
 
     /// [`Self::rewrite`] without claiming the cwd index: migrating a legacy
-    /// file on load must not make that session the cwd's latest.
+    /// file on load must not make that session the cwd's latest. Private, so a
+    /// claim is the only way in.
     fn write_canonical<M, U, T>(
         dir: &Path,
         session: &Session<M, U, T>,
@@ -518,6 +921,9 @@ impl SessionLog {
         let mut tmp_file = File::create(&tmp).map_err(StorageError::from)?;
         write_full_session(&mut tmp_file, session)?;
         tmp_file.sync_data().map_err(StorageError::from)?;
+        // Last thing before the rename: a write that never lands must not
+        // spend an archive slot, since taking one prunes the oldest.
+        archive_if_shrinking(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
         crate::sync_parent_dir(&path);
 
@@ -535,12 +941,20 @@ impl SessionLog {
         self.session_id
     }
 
-    pub fn append<M, U, T>(&mut self, session: &Session<M, U, T>) -> Result<(), SessionError>
+    /// The claim looks redundant, since a log only comes from [`Self::rewrite`],
+    /// which took one. It is here so a log kept after its claim was dropped
+    /// cannot append.
+    pub fn append<M, U, T>(
+        &mut self,
+        claim: &SessionClaim,
+        session: &Session<M, U, T>,
+    ) -> Result<(), SessionError>
     where
         M: Serialize,
         U: Serialize,
         T: Serialize,
     {
+        claim.allows(session.id)?;
         self.require_same_id(session)?;
         self.ensure_appendable(session)?;
 
@@ -863,7 +1277,12 @@ where
         }
     }
 
-    let id = id.ok_or(StorageError::NotFound(display_path.to_string()))?;
+    // Not `NotFound`: the file is there and this is the user's only copy of
+    // whatever is in it. A caller that creates a session when nothing was ever
+    // written must not take this for an empty slot.
+    let id = id.ok_or_else(|| SessionError::MissingHeader {
+        path: display_path.to_string(),
+    })?;
 
     Ok(Session {
         version: SESSION_VERSION,
@@ -899,6 +1318,63 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// The directories sessions were recorded in, most recently used first and at
+/// most `limit` of them.
+///
+/// The index is append only and the caller pays filesystem work per entry, so
+/// a limit is what keeps a long history off a startup path. Order comes from
+/// the session id, which is a UUIDv7 and carries the time it was made, so a
+/// history over the limit keeps the directories somebody still works in. A
+/// legacy v4 id has no time in it and sorts last.
+///
+/// Keys go through `canonical_key`, because the index holds whatever string a
+/// session was saved with while callers compare against canonicalized paths: a
+/// symlinked home would otherwise hide a folder's own history from it. A key
+/// that is not valid UTF-8 is dropped, because the callers store what they get
+/// back as text and a lossy path must never stand in for a real one.
+pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
+    let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
+        .into_iter()
+        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
+        .collect();
+    entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    entries.truncate(limit);
+    entries
+        .into_iter()
+        .filter_map(|(_, cwd)| canonical_key(Path::new(&cwd)).to_str().map(str::to_owned))
+        .collect()
+}
+
+/// The newest session for `cwd`, settled from the index and headers so no
+/// transcript is parsed before the caller has claimed the right to write it.
+fn latest_id_in(cwd: &str, dir: &Path) -> Result<Option<MakiId>, SessionError> {
+    let cached = load_cwd_index(dir)
+        .remove(cwd)
+        .and_then(|s| match s.parse::<MakiId>() {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!(error = %e, cwd, "indexed session id unparseable; rescanning");
+                None
+            }
+        });
+    if let Some(id) = cached {
+        match locate_session_file(dir, id).is_some() {
+            true => return Ok(Some(id)),
+            false => warn!(cwd, session_id = %id, "indexed session missing on disk; rescanning"),
+        }
+    }
+
+    Ok(scan_headers(Some(cwd), dir)?
+        .into_iter()
+        .max_by_key(|s| s.updated_at)
+        .map(|s| s.id))
+}
+
+fn session_time(session_id: &str) -> Option<(u64, u32)> {
+    let id: MakiId = session_id.parse().ok()?;
+    Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
+}
+
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let id_str = session_id.to_string();
@@ -927,6 +1403,33 @@ fn remove_legacy_files(dir: &Path, id: MakiId) -> Result<bool, SessionError> {
         removed |= try_remove(&legacy)?;
     }
     Ok(removed)
+}
+
+/// Rewriting a pre-jsonl file as jsonl is a write like any other, so it needs a
+/// claim. A plain read has none to lend and takes its own. A session another
+/// process owns is left for that process to migrate.
+fn migrate_legacy<M, U, T>(dir: &Path, session: &Session<M, U, T>, held: Option<&SessionClaim>)
+where
+    M: Serialize,
+    U: Serialize,
+    T: Serialize,
+{
+    let claim = match held {
+        Some(claim) => claim.clone(),
+        None => match SessionClaim::acquire_in(session.id, dir) {
+            Ok(claim) => claim,
+            Err(e) => {
+                info!(error = %e, session_id = %session.id, "legacy session left for its writer to migrate");
+                return;
+            }
+        },
+    };
+    if let Err(e) = claim
+        .allows(session.id)
+        .and_then(|()| SessionLog::write_canonical(dir, session).map(drop))
+    {
+        warn!(error = %e, "failed migrate to canonical jsonl; keeping legacy file");
+    }
 }
 
 fn try_remove(path: &Path) -> Result<bool, StorageError> {
@@ -1005,7 +1508,7 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
     Some((meta.len(), mtime_ms))
 }
 
-fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
     let mut cache = load_scan_cache(dir);
     let mut fresh = ScanCache::new();
     let mut dirty = false;
@@ -1034,11 +1537,12 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
             }
         };
         if let Some(h) = &entry.header
-            && h.cwd == cwd
+            && cwd.is_none_or(|c| h.cwd == c)
         {
             out.push(SessionSummary {
                 id: h.id,
                 title: normalize_title(&h.title),
+                cwd: h.cwd.clone(),
                 updated_at: h.updated_at,
             });
         }
@@ -1168,6 +1672,9 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
+    // Held across both formats: either one decodes the same image payload once
+    // per record that mentions it.
+    let _intern = crate::intern::Scope::enter();
     let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(&data, &path.display().to_string())?
     } else {
@@ -1228,6 +1735,13 @@ where
         Arc::unwrap_or_clone(self.messages)
     }
 
+    /// Takes the transcript and leaves the session empty. It is for a caller
+    /// that runs on the messages and later writes back into the session, which
+    /// would otherwise have to copy every message to hold both.
+    pub fn drain_messages(&mut self) -> Vec<M> {
+        Arc::unwrap_or_clone(std::mem::take(&mut self.messages))
+    }
+
     pub fn tool_outputs(&self) -> &HashMap<String, Arc<T>> {
         &self.tool_outputs
     }
@@ -1272,6 +1786,25 @@ where
     fn rewrite_messages(&mut self) {
         self.epoch = next_epoch();
         self.rewrite();
+    }
+
+    /// This transcript as a session of its own, under a new id and in the
+    /// directory the forking run works in, so `--continue` there finds the fork
+    /// and the original keeps its own place in the index.
+    ///
+    /// Everything the transcript needs to render travels along, tool outputs
+    /// and subagent histories included. Spending does not: the fork is billed
+    /// for the turns it runs, and counting the original's again would bill them
+    /// twice. The epoch is minted fresh because no append cursor into the file
+    /// this was read from says anything about the new one.
+    pub fn fork(mut self, id: MakiId, cwd: &str) -> Self {
+        self.id = id;
+        self.cwd = cwd.into();
+        self.token_usage = U::default();
+        self.usage_by_model.clear();
+        self.created_at = now_epoch();
+        self.rewrite_messages();
+        self
     }
 
     pub fn push_message(&mut self, msg: M) {
@@ -1331,8 +1864,8 @@ where
 
     /// A change under an existing id is not expressible as an append, so it
     /// voids the cursors; a new id is a pure append.
-    pub fn insert_tool_output(&mut self, id: String, output: T) {
-        if self.tool_outputs.insert(id, Arc::new(output)).is_some() {
+    pub fn insert_tool_output(&mut self, id: String, output: Arc<T>) {
+        if self.tool_outputs.insert(id, output).is_some() {
             self.rewrite();
         } else {
             self.touch();
@@ -1380,6 +1913,13 @@ where
 
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
         &self.usage_by_model
+    }
+
+    /// For settling costs on load; every other write goes through
+    /// [`Self::add_model_usage`].
+    pub fn usage_by_model_mut(&mut self) -> &mut HashMap<String, StoredTokenUsage> {
+        self.touch();
+        &mut self.usage_by_model
     }
 
     pub fn set_title(&mut self, title: String) {
@@ -1437,14 +1977,14 @@ where
         self.rewrite();
     }
 
-    pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
+    pub fn save(&mut self, claim: &SessionClaim, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        self.save_to(&sessions_dir)
+        self.save_to(claim, &sessions_dir)
     }
 
-    pub fn save_to(&mut self, dir: &Path) -> Result<(), SessionError> {
+    pub fn save_to(&mut self, claim: &SessionClaim, dir: &Path) -> Result<(), SessionError> {
         self.updated_at = now_epoch();
-        SessionLog::rewrite(dir, self)?;
+        SessionLog::rewrite(dir, claim, self)?;
         Ok(())
     }
 
@@ -1453,15 +1993,58 @@ where
         Self::load_from(id, &sessions_dir)
     }
 
+    /// Whether the id names a session on disk, without paying to parse it. A
+    /// file that exists but no longer loads still answers `true`, because the
+    /// question callers ask is "would writing here destroy something". Asking
+    /// must not create the directory it looks in, so this is the one entry
+    /// point that joins the path instead of ensuring it.
+    pub fn exists(id: MakiId, dir: &StateDir) -> bool {
+        locate_session_file(&dir.path().join(SESSIONS_DIR), id).is_some()
+    }
+
     pub fn load_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
+        Self::read_from(id, dir, None)
+    }
+
+    /// Reads a session this process means to write, lock first. Reading first
+    /// leaves a window for someone to replace the transcript before the claim.
+    /// It also means a conflict shows up before the user has typed anything.
+    pub fn claim_and_load(
+        id: MakiId,
+        dir: &StateDir,
+    ) -> Result<(Self, SessionClaim), SessionError> {
+        Self::claim_and_load_from(id, &dir.ensure_subdir(SESSIONS_DIR)?)
+    }
+
+    pub fn claim_and_load_from(
+        id: MakiId,
+        dir: &Path,
+    ) -> Result<(Self, SessionClaim), SessionError> {
+        let claim = SessionClaim::acquire_in(id, dir)?;
+        let session = Self::read_from(id, dir, Some(&claim))?;
+        Ok((session, claim))
+    }
+
+    /// Rereads a session under a claim this process already holds. Claiming
+    /// again would conflict with ourselves, and letting go first would let
+    /// another process in.
+    pub fn load_claimed(claim: &SessionClaim, dir: &StateDir) -> Result<Self, SessionError> {
+        Self::read_from(claim.id(), &dir.ensure_subdir(SESSIONS_DIR)?, Some(claim))
+    }
+
+    /// A held claim is passed down so a legacy migration, which is a write,
+    /// does not try to take a lock this process already has.
+    fn read_from(
+        id: MakiId,
+        dir: &Path,
+        claim: Option<&SessionClaim>,
+    ) -> Result<Self, SessionError> {
         let Some(path) = locate_session_file(dir, id) else {
             return Err(StorageError::NotFound(id.to_string()).into());
         };
         let session = load_session_at::<M, U, T>(&path)?;
-        if path != jsonl_path(dir, id)
-            && let Err(e) = SessionLog::write_canonical(dir, &session)
-        {
-            warn!(error = %e, "failed migrate to canonical jsonl; keeping legacy file");
+        if path != jsonl_path(dir, id) {
+            migrate_legacy(dir, &session, claim);
         }
         Ok(session)
     }
@@ -1472,38 +2055,58 @@ where
     }
 
     pub fn list_in(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-        let mut summaries = scan_headers(cwd, dir)?;
+        let mut summaries = scan_headers(Some(cwd), dir)?;
         summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
         Ok(summaries)
     }
 
-    pub fn latest(cwd: &str, dir: &StateDir) -> Result<Option<Self>, SessionError> {
+    pub fn list_all(dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::latest_in(cwd, &sessions_dir)
+        Self::list_all_in(&sessions_dir)
     }
 
-    pub fn latest_in(cwd: &str, dir: &Path) -> Result<Option<Self>, SessionError> {
-        let cached = load_cwd_index(dir)
-            .remove(cwd)
-            .and_then(|s| match s.parse::<MakiId>() {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    warn!(error = %e, cwd, "indexed session id unparseable; rescanning");
-                    None
-                }
-            });
-        if let Some(id) = cached {
-            match Self::load_from(id, dir) {
-                Ok(s) => return Ok(Some(s)),
-                Err(e) => warn!(error = %e, cwd, "indexed session missing on disk; rescanning"),
-            }
-        }
+    pub fn list_all_in(dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut summaries = scan_headers(None, dir)?;
+        summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
+        Ok(summaries)
+    }
 
-        scan_headers(cwd, dir)?
-            .into_iter()
-            .max_by_key(|s| s.updated_at)
-            .map(|s| Self::load_from(s.id, dir).map(Some))
-            .unwrap_or(Ok(None))
+    /// What `--continue` resolves to. The id comes from headers alone, so the
+    /// transcript is only parsed under the lock.
+    pub fn claim_latest(
+        cwd: &str,
+        dir: &StateDir,
+    ) -> Result<Option<(Self, SessionClaim)>, SessionError> {
+        Self::claim_latest_in(cwd, &dir.ensure_subdir(SESSIONS_DIR)?)
+    }
+
+    pub fn claim_latest_in(
+        cwd: &str,
+        dir: &Path,
+    ) -> Result<Option<(Self, SessionClaim)>, SessionError> {
+        let Some(id) = latest_id_in(cwd, dir)? else {
+            return Ok(None);
+        };
+        Self::claim_and_load_from(id, dir).map(Some)
+    }
+
+    /// The session `--continue` points at, claiming nothing. For a run that
+    /// writes somewhere else and only needs to know what to copy.
+    pub fn latest_id(cwd: &str, dir: &StateDir) -> Result<Option<MakiId>, SessionError> {
+        latest_id_in(cwd, &dir.ensure_subdir(SESSIONS_DIR)?)
+    }
+
+    /// Reads a session another process may be writing, to copy it. Takes no
+    /// lock and never writes: a legacy file stays for its owner to migrate, and
+    /// a torn last line is dropped in memory like on any load.
+    pub fn read_only(id: MakiId, dir: &StateDir) -> Result<Self, SessionError> {
+        Self::read_only_from(id, &dir.path().join(SESSIONS_DIR))
+    }
+
+    pub fn read_only_from(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
+        let path =
+            locate_session_file(dir, id).ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+        load_session_at(&path)
     }
 
     pub fn update_title_if_default(&mut self) {
@@ -1512,14 +2115,26 @@ where
         }
     }
 
-    pub fn delete(id: MakiId, dir: &StateDir) -> Result<(), SessionError> {
+    pub fn delete(claim: &SessionClaim, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::delete_from(id, &sessions_dir)
+        Self::delete_from(claim, &sessions_dir)
     }
 
-    pub fn delete_from(id: MakiId, dir: &Path) -> Result<(), SessionError> {
+    pub fn delete_from(claim: &SessionClaim, dir: &Path) -> Result<(), SessionError> {
+        let id = claim.id();
+        // The lock file stays. Another holder of this claim may still write the
+        // id, and the last one to let go removes it.
+        claim.forget_cursor();
         let mut removed = try_remove(&jsonl_path(dir, id))?;
         removed |= remove_legacy_files(dir, id)?;
+        // Backups, not the session: failing to sweep them must not fail a
+        // delete whose log is already gone, and their presence alone does not
+        // make a session exist.
+        if let Err(e) = fs::remove_dir_all(dir.join(ARCHIVE_DIR).join(id.to_string()))
+            && e.kind() != ErrorKind::NotFound
+        {
+            warn!(error = %e, session_id = %id, "session archives remain after delete");
+        }
         if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
         }
@@ -1533,21 +2148,25 @@ mod tests {
     use super::Effort;
     use super::StoredThinking;
     use super::ThinkingParseError;
+    #[cfg(unix)]
+    use super::canonical_key;
     use super::{
-        CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, SESSION_VERSION,
-        StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index,
+        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
+        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
         next_epoch, update_cwd_index, write_full_session,
     };
     use super::{
-        HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
-        StorageError, TitleSource,
+        HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,
+        SessionMeta, StorageError, TitleSource,
     };
+    use crate::StateDir;
     use crate::id::MakiId;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1555,8 +2174,19 @@ mod tests {
     type TestSession = Session<Value, Value, Value>;
 
     const LEGACY_HEX_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const SONNET_COST: f64 = 0.42;
+    const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
+    const LOCK_WHILE_HELD: &str = "a held claim is a lock file another process can see";
+    const NO_ORPHAN_LOCK: &str = "an id with no transcript must not leave a lock behind";
+    const UNCLAIMED: &str = "a session nothing else is writing";
+    const READ_UNDER_CLAIM: &str = "the transcript must be read under a claim still held";
+    const SHARED_CLAIM_HELD: &str = "a claim is held until its last clone drops";
     const PENDING_DRAFT: &str = "half typed thought";
+    /// Two of these already break the byte budget.
+    const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
+    const EXISTING_ARCHIVE_SEQ: u64 = 7;
+    const ALL_RECORDED: usize = usize::MAX;
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -1589,6 +2219,18 @@ mod tests {
         })
     }
 
+    fn claim_id(dir: &Path, id: MakiId) -> SessionClaim {
+        SessionClaim::acquire_in(id, dir).expect(UNCLAIMED)
+    }
+
+    fn claim_for(dir: &Path, session: &TestSession) -> SessionClaim {
+        claim_id(dir, session.id)
+    }
+
+    fn claim_in(dir: &StateDir, session: &TestSession) -> SessionClaim {
+        SessionClaim::acquire(session.id, dir).expect(UNCLAIMED)
+    }
+
     fn write_legacy_jsonl(path: &Path, session: &TestSession) {
         let mut file = std::fs::File::create(path).unwrap();
         write_full_session(&mut file, session).unwrap();
@@ -1611,6 +2253,8 @@ mod tests {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
+                thinking: None,
+                fast: false,
             }
         }
 
@@ -1624,7 +2268,7 @@ mod tests {
             .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
         session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
         for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
-            session.insert_tool_output(id.into(), Value::Null);
+            session.insert_tool_output(id.into(), Arc::new(Value::Null));
         }
 
         session.prune_orphans(ids);
@@ -1655,7 +2299,7 @@ mod tests {
             "tool-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
         );
-        session.save_to(dir).unwrap();
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.id, session.id);
@@ -1678,6 +2322,8 @@ mod tests {
                 output: 20,
                 cache_creation: 5,
                 cache_read: 40,
+                cost: Some(SONNET_COST),
+                ..Default::default()
             },
         );
         session.add_model_usage(
@@ -1685,10 +2331,11 @@ mod tests {
             super::StoredTokenUsage {
                 input: 30,
                 output: 10,
+                cost: Some(HAIKU_COST),
                 ..Default::default()
             },
         );
-        session.save_to(dir).unwrap();
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         let sonnet = &loaded.usage_by_model()["claude-sonnet-4"];
@@ -1696,7 +2343,96 @@ mod tests {
         assert_eq!(sonnet.output, 20);
         assert_eq!(sonnet.cache_read, 40);
         assert_eq!(sonnet.total_input(), 145);
+        assert_eq!(sonnet.cost, Some(SONNET_COST));
         assert_eq!(loaded.usage_by_model()["claude-haiku-4"].total(), 40);
+        assert_eq!(
+            loaded.usage_by_model()["claude-haiku-4"].cost,
+            Some(HAIKU_COST)
+        );
+    }
+
+    /// A turn that reports no price must not erase what was already billed.
+    #[test_case(None, None, None ; "unpriced_stays_unpriced")]
+    #[test_case(None, Some(SONNET_COST), Some(SONNET_COST) ; "first_price_starts_the_total")]
+    #[test_case(Some(SONNET_COST), Some(HAIKU_COST), Some(SONNET_COST + HAIKU_COST) ; "priced_turns_accumulate")]
+    #[test_case(Some(SONNET_COST), None, Some(SONNET_COST) ; "unpriced_turn_keeps_the_total")]
+    fn add_cost_only_grows_a_total(
+        mut total: Option<f64>,
+        addend: Option<f64>,
+        expected: Option<f64>,
+    ) {
+        super::add_cost(&mut total, addend);
+        assert_eq!(total, expected);
+    }
+
+    fn usage(input: u32, cost: Option<f64>) -> super::StoredTokenUsage {
+        super::StoredTokenUsage {
+            input,
+            cost,
+            ..Default::default()
+        }
+    }
+
+    fn saved_usage_by_model(dir: &Path, id: MakiId) -> Value {
+        let text = fs::read_to_string(jsonl_path(dir, id)).unwrap();
+        let meta = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["t"] == "meta")
+            .expect("saved session has a meta record");
+        meta["usage_by_model"].clone()
+    }
+
+    /// Session files predate `cost`, so an entry without the key loads unpriced
+    /// with its counters intact, and saving it back must not mint one: older
+    /// builds still read these files.
+    #[test]
+    fn legacy_usage_entry_loads_unpriced_and_stays_that_way_on_disk() {
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let json = format!(
+            r#"{{"t":"header","v":2,"id":"{LEGACY_HEX_ID}","model":"m","cwd":"/","created_at":0}}
+{{"t":"meta","title":"t","token_usage":null,"updated_at":0,"usage_by_model":{{"m":{{"input":7,"output":3}}}}}}"#
+        );
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(format!("{LEGACY_HEX_ID}.jsonl")), json).unwrap();
+
+        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        let entry = loaded.usage_by_model()["m"];
+        assert_eq!(entry.cost, None, "no key means unpriced, not free");
+        assert_eq!((entry.input, entry.output), (7, 3));
+
+        let dir = tmp.path().join("rewritten");
+        fs::create_dir(&dir).unwrap();
+        loaded.save_to(&claim_for(&dir, &loaded), &dir).unwrap();
+        assert!(
+            saved_usage_by_model(&dir, id)["m"].get("cost").is_none(),
+            "an unpriced entry writes no cost key"
+        );
+    }
+
+    /// What a turn billed is written verbatim, read back verbatim, and keeps
+    /// adding up after a reload. A later unpriced turn must not throw away what
+    /// the earlier ones paid.
+    #[test]
+    fn recorded_costs_survive_a_reload_and_keep_adding_up() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
+        session.add_model_usage("claude-sonnet-4", usage(100, Some(SONNET_COST)));
+        session.add_model_usage("claude-haiku-4", usage(30, None));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let on_disk = saved_usage_by_model(dir, session.id);
+        assert_eq!(on_disk["claude-sonnet-4"]["cost"], Value::from(SONNET_COST));
+
+        let mut loaded = TestSession::load_from(session.id, dir).unwrap();
+        loaded.add_model_usage("claude-sonnet-4", usage(50, None));
+        loaded.add_model_usage("claude-haiku-4", usage(10, Some(HAIKU_COST)));
+
+        let sonnet = loaded.usage_by_model()["claude-sonnet-4"];
+        assert_eq!((sonnet.input, sonnet.cost), (150, Some(SONNET_COST)));
+        let haiku = loaded.usage_by_model()["claude-haiku-4"];
+        assert_eq!((haiku.input, haiku.cost), (40, Some(HAIKU_COST)));
     }
 
     #[test]
@@ -1738,11 +2474,34 @@ mod tests {
 
         let dir = tmp.path().join("rewritten");
         fs::create_dir(&dir).unwrap();
-        loaded.save_to(&dir).unwrap();
+        loaded.save_to(&claim_for(&dir, &loaded), &dir).unwrap();
         let reloaded = TestSession::load_from(id, &dir).unwrap();
         assert_same_session(&reloaded, &loaded);
         assert_eq!(reloaded.subagents(), loaded.subagents());
         assert_eq!(reloaded.usage_by_model(), loaded.usage_by_model());
+    }
+
+    /// A fork opens with the conversation it copied, in the directory that
+    /// asked for it, owing nothing for the turns it did not run.
+    #[test]
+    fn fork_carries_the_transcript_and_none_of_the_spending() {
+        const FORK_CWD: &str = "/project/fork";
+        const TOOL_ID: &str = "tool-1";
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("first"));
+        session.insert_tool_output(TOOL_ID.into(), Arc::new(Value::from("out")));
+        session.token_usage = Value::from(1_000);
+        session.add_model_usage("m", usage(1_000, Some(SONNET_COST)));
+        let id = MakiId::generate();
+
+        let forked = session.fork(id, FORK_CWD);
+
+        assert_eq!(forked.id, id);
+        assert_eq!(forked.cwd, FORK_CWD);
+        assert_eq!(forked.messages().len(), 1);
+        assert!(forked.tool_outputs().contains_key(TOOL_ID));
+        assert_eq!(forked.token_usage, Value::default());
+        assert!(forked.usage_by_model().is_empty());
     }
 
     #[test]
@@ -1752,7 +2511,7 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("first"));
 
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         session.push_message(assistant_message("reply"));
         session.push_message(user_message("second"));
@@ -1763,14 +2522,14 @@ mod tests {
         session
             .subagent_messages
             .insert("sub-1".into(), Arc::new(vec![user_message("sub-prompt")]));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         Arc::make_mut(session.subagent_messages.get_mut("sub-1").unwrap())
             .push(assistant_message("sub-reply"));
         session
             .subagent_messages
             .insert("sub-2".into(), Arc::new(vec![user_message("sub-2-prompt")]));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.messages().len(), 3);
@@ -1796,7 +2555,7 @@ mod tests {
         Session::checkpoint(&mut session, Some(&run), meta.clone(), Value::Null);
         Arc::make_mut(&mut session)
             .set_subagent_messages("sub-1".into(), vec![user_message("old")]);
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         Arc::make_mut(&mut session)
             .set_subagent_messages("sub-1".into(), vec![user_message("new")]);
@@ -1816,7 +2575,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         session.set_subagent_messages("sub-1".into(), vec![user_message("old")]);
         write_through(&mut log, dir, &session);
@@ -1833,16 +2592,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         for i in 0..MAX_APPENDS {
             session.push_message(user_message(&format!("m{i}")));
-            log.append(&session).unwrap();
+            log.append(&claim_for(dir, &session), &session).unwrap();
         }
         session.push_message(user_message("one too many"));
 
         assert!(matches!(
-            log.append(&session),
+            log.append(&claim_for(dir, &session), &session),
             Err(SessionError::LogDiverged {
                 reason: LOG_BLOATED
             })
@@ -1857,15 +2616,15 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/old");
         session.push_message(user_message("hi"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         session.set_model("m2".into());
         session.set_cwd("/new".into());
         assert!(matches!(
-            log.append(&session),
+            log.append(&claim_for(dir, &session), &session),
             Err(SessionError::LogDiverged { .. })
         ));
-        drop(SessionLog::rewrite(dir, &session).unwrap());
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.model, "m2");
@@ -1882,9 +2641,11 @@ mod tests {
         let dir = tmp.path();
         let session_a: TestSession = Session::new("m", "/project");
         let session_b: TestSession = Session::new("m", "/project");
-        let mut log = SessionLog::rewrite(dir, &session_a).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session_a), &session_a).unwrap();
 
-        let err = log.append(&session_b).unwrap_err();
+        let err = log
+            .append(&claim_for(dir, &session_b), &session_b)
+            .unwrap_err();
         assert!(matches!(err, SessionError::IdMismatch { .. }));
     }
 
@@ -1894,7 +2655,7 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("survives"));
-        session.save_to(dir).unwrap();
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -1916,21 +2677,204 @@ mod tests {
             "sub-1".into(),
             vec![user_message("sub-prompt"), assistant_message("sub-reply")],
         );
-        drop(SessionLog::rewrite(dir, &session).unwrap());
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
 
         session.truncate_messages(5);
         session.tool_outputs.clear();
         session.subagent_messages.remove("sub-1");
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         session.push_message(user_message("after-compact-1"));
         session.push_message(user_message("after-compact-2"));
         session.push_message(user_message("after-compact-3"));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.messages().len(), 8);
         assert!(loaded.subagent_messages().is_empty());
+    }
+
+    fn archive_dir_for(dir: &Path, id: MakiId) -> PathBuf {
+        dir.join(ARCHIVE_DIR).join(id.to_string())
+    }
+
+    fn archive_paths(dir: &Path, id: MakiId) -> Vec<PathBuf> {
+        let mut paths = fs::read_dir(archive_dir_for(dir, id))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn msg_line_count(path: &Path) -> usize {
+        fs::read(path)
+            .unwrap()
+            .split(|&b| b == b'\n')
+            .filter(|line| line.starts_with(MSG_PREFIX))
+            .count()
+    }
+
+    #[test]
+    fn rewrite_dropping_messages_archives_the_old_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        for i in 0..5 {
+            session.push_message(user_message(&format!("turn {i}")));
+        }
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let live = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(live.messages().len(), 1);
+        let archives = archive_paths(dir, session.id);
+        assert_eq!(archives.len(), 1);
+        assert_eq!(msg_line_count(&archives[0]), 5);
+    }
+
+    #[test]
+    fn rewrite_without_shrink_does_not_archive() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        assert!(!archive_dir_for(dir, session.id).exists());
+    }
+
+    #[test]
+    fn archived_file_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        let pre: Vec<Value> = (0..3).map(|i| user_message(&format!("turn {i}"))).collect();
+        for msg in &pre {
+            session.push_message(msg.clone());
+        }
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        session.replace_messages(vec![assistant_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let scratch = TempDir::new().unwrap();
+        let archives = archive_paths(dir, session.id);
+        assert_eq!(archives.len(), 1);
+        fs::copy(
+            &archives[0],
+            scratch.path().join(format!("{}.jsonl", session.id)),
+        )
+        .unwrap();
+        let archived = TestSession::load_from(session.id, scratch.path()).unwrap();
+        assert_eq!(archived.messages(), pre.as_slice());
+    }
+
+    #[test]
+    fn archive_retention_keeps_newest_three() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("seed"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        for round in 1..=5 {
+            for _ in 0..round {
+                session.push_message(user_message(&format!("turn {round}")));
+            }
+            session.save_to(&claim_for(dir, &session), dir).unwrap();
+            session.replace_messages(vec![user_message(&format!("summary {round}"))]);
+            session.save_to(&claim_for(dir, &session), dir).unwrap();
+        }
+
+        let archives = archive_paths(dir, session.id);
+        assert_eq!(archives.len(), ARCHIVE_KEEP);
+        let mut msg_counts: Vec<usize> = archives.iter().map(|p| msg_line_count(p)).collect();
+        msg_counts.sort_unstable();
+        assert_eq!(msg_counts, [4, 5, 6]);
+    }
+
+    /// A new name has to beat every name already there, or pruning would read
+    /// the fresh archive as the oldest and eat it.
+    #[test]
+    fn archive_names_count_up_from_the_newest() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let archive_dir = archive_dir_for(dir, session.id);
+        fs::create_dir_all(&archive_dir).unwrap();
+        let existing = archive_dir.join(format!("{EXISTING_ARCHIVE_SEQ}.jsonl"));
+        fs::write(&existing, "").unwrap();
+
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let fresh = archive_dir.join(format!("{}.jsonl", EXISTING_ARCHIVE_SEQ + 1));
+        assert_eq!(
+            archive_paths(dir, session.id),
+            vec![existing, fresh.clone()]
+        );
+        assert_eq!(msg_line_count(&fresh), 2);
+    }
+
+    #[test]
+    fn archive_retention_honors_the_byte_budget() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let archive_dir = archive_dir_for(dir, session.id);
+        fs::create_dir_all(&archive_dir).unwrap();
+        let fakes: Vec<PathBuf> = (1..=3)
+            .map(|ms| {
+                let path = archive_dir.join(format!("{ms}.jsonl"));
+                // Sparse: the length is all the budget looks at.
+                fs::File::create(&path)
+                    .unwrap()
+                    .set_len(FAKE_ARCHIVE_BYTES)
+                    .unwrap();
+                path
+            })
+            .collect();
+
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let archives = archive_paths(dir, session.id);
+        assert_eq!(archives.len(), 2);
+        assert!(archives.contains(&fakes[2]));
+        assert!(!fakes[0].exists());
+        assert!(!fakes[1].exists());
+    }
+
+    #[test]
+    fn delete_removes_archive_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("model", "/p");
+        session.push_message(user_message("one"));
+        session.push_message(user_message("two"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        session.replace_messages(vec![user_message("summary")]);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        let archive_dir = archive_dir_for(dir, session.id);
+        assert!(archive_dir.exists());
+
+        TestSession::delete_from(&claim_id(dir, session.id), dir).unwrap();
+        assert!(!archive_dir.exists());
+        assert!(!jsonl_path(dir, session.id).exists());
     }
 
     /// A rename with no new messages must survive restart, while a no-op
@@ -1941,16 +2885,16 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("hi"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         let path = jsonl_path(dir, session.id);
         let size_before = fs::metadata(&path).unwrap().len();
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), size_before);
 
         session.title = "renamed".into();
         session.updated_at = 42;
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.title, "renamed");
@@ -1971,7 +2915,7 @@ mod tests {
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.messages().len(), 1);
 
-        let _log = SessionLog::rewrite(dir, &loaded).unwrap();
+        let _log = SessionLog::rewrite(dir, &claim_for(dir, &loaded), &loaded).unwrap();
 
         assert!(!json_path.exists());
         assert!(jsonl_path(dir, session.id).exists());
@@ -2021,13 +2965,34 @@ mod tests {
         let mut s1: TestSession = Session::new("m", "/project-a");
         let mut s2: TestSession = Session::new("m", "/project-b");
         let mut s3: TestSession = Session::new("m", "/project-a");
-        s1.save_to(dir).unwrap();
-        s2.save_to(dir).unwrap();
-        s3.save_to(dir).unwrap();
+        s1.save_to(&claim_for(dir, &s1), dir).unwrap();
+        s2.save_to(&claim_for(dir, &s2), dir).unwrap();
+        s3.save_to(&claim_for(dir, &s3), dir).unwrap();
 
         let list = TestSession::list_in("/project-a", dir).unwrap();
         assert_eq!(list.len(), 2);
-        assert!(list.iter().all(|s| s.id != s2.id));
+        assert!(list.iter().all(|s| s.id != s2.id && s.cwd == "/project-a"));
+    }
+
+    #[test]
+    fn list_all_spans_cwds_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // `SessionLog::rewrite` persists `updated_at` verbatim; `save_to`
+        // would stamp both sessions with the same wall-clock second.
+        let mut older: TestSession = Session::new("m", "/project-a");
+        older.updated_at = 100;
+        SessionLog::rewrite(dir, &claim_for(dir, &older), &older).unwrap();
+        let mut newer: TestSession = Session::new("m", "/project-b");
+        newer.updated_at = 200;
+        SessionLog::rewrite(dir, &claim_for(dir, &newer), &newer).unwrap();
+
+        let list = TestSession::list_all_in(dir).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, newer.id);
+        assert_eq!(list[0].cwd, "/project-b");
+        assert_eq!(list[1].id, older.id);
+        assert_eq!(list[1].cwd, "/project-a");
     }
 
     /// Rewrites the scan-cache title of `id` without touching the session
@@ -2052,9 +3017,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut a: TestSession = Session::new("m", "/project-a");
-        a.save_to(dir).unwrap();
+        a.save_to(&claim_for(dir, &a), dir).unwrap();
         let mut b: TestSession = Session::new("m", "/project-b");
-        b.save_to(dir).unwrap();
+        b.save_to(&claim_for(dir, &b), dir).unwrap();
         TestSession::list_in("/project-a", dir).unwrap();
 
         tamper_cached_title(dir, a.id);
@@ -2071,14 +3036,14 @@ mod tests {
         let dir = tmp.path();
         let mut s1: TestSession = Session::new("m", "/project");
         s1.push_message(user_message("hi"));
-        let mut log = SessionLog::rewrite(dir, &s1).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &s1), &s1).unwrap();
         let s2: TestSession = Session::new("m", "/project");
-        SessionLog::rewrite(dir, &s2).unwrap();
+        SessionLog::rewrite(dir, &claim_for(dir, &s2), &s2).unwrap();
         TestSession::list_in("/project", dir).unwrap();
 
         s1.title = "renamed".into();
-        log.append(&s1).unwrap();
-        TestSession::delete_from(s2.id, dir).unwrap();
+        log.append(&claim_for(dir, &s1), &s1).unwrap();
+        TestSession::delete_from(&claim_id(dir, s2.id), dir).unwrap();
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
@@ -2095,9 +3060,9 @@ mod tests {
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
         s.push_message(user_message("hi"));
-        let mut log = SessionLog::rewrite(dir, &s).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &s), &s).unwrap();
         s.title = "line one\n\n\tline two".into();
-        log.append(&s).unwrap();
+        log.append(&claim_for(dir, &s), &s).unwrap();
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list[0].title, NORMALIZED);
@@ -2110,7 +3075,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s: TestSession = Session::new("m", "/project");
-        s.save_to(dir).unwrap();
+        s.save_to(&claim_for(dir, &s), dir).unwrap();
         if let Some(content) = content {
             fs::write(dir.join(SCAN_CACHE_FILE), content).unwrap();
         }
@@ -2122,7 +3087,7 @@ mod tests {
 
     fn save_with_time(session: &mut TestSession, dir: &Path, time: u64) {
         session.updated_at = time;
-        SessionLog::rewrite(dir, session).unwrap();
+        SessionLog::rewrite(dir, &claim_for(dir, session), session).unwrap();
         update_cwd_index(dir, &session.cwd, session.id).unwrap();
     }
 
@@ -2141,7 +3106,10 @@ mod tests {
         s3.title = "latest".into();
         save_with_time(&mut s3, dir, 3000);
 
-        let latest = TestSession::latest_in("/project", dir).unwrap().unwrap();
+        let latest = TestSession::claim_latest_in("/project", dir)
+            .unwrap()
+            .unwrap()
+            .0;
         assert_eq!(latest.title, "latest");
     }
 
@@ -2150,13 +3118,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        session.save_to(dir).unwrap();
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let index_path = dir.join(CWD_INDEX_FILE);
         let stale: HashMap<String, String> = [("/project".into(), "deleted-id".into())].into();
         fs::write(&index_path, serde_json::to_vec(&stale).unwrap()).unwrap();
 
-        let latest = TestSession::latest_in("/project", dir).unwrap().unwrap();
+        let latest = TestSession::claim_latest_in("/project", dir)
+            .unwrap()
+            .unwrap()
+            .0;
         assert_eq!(latest.id, session.id);
     }
 
@@ -2182,22 +3153,193 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut s1: TestSession = Session::new("m", "/project");
-        s1.save_to(dir).unwrap();
+        s1.save_to(&claim_for(dir, &s1), dir).unwrap();
         let mut s2: TestSession = Session::new("m", "/other");
-        s2.save_to(dir).unwrap();
+        s2.save_to(&claim_for(dir, &s2), dir).unwrap();
 
-        TestSession::delete_from(s1.id, dir).unwrap();
+        TestSession::delete_from(&claim_id(dir, s1.id), dir).unwrap();
         assert!(!jsonl_path(dir, s1.id).exists());
         let index = load_cwd_index(dir);
         assert!(!index.values().any(|v| *v == s1.id.to_string()));
         assert_eq!(index.get("/other"), Some(&s2.id.to_string()));
     }
 
+    /// Clones share one lock, so a snapshot still queued keeps its session
+    /// busy after the tab that sent it let go.
+    #[test]
+    fn a_claim_stays_busy_until_its_last_clone_drops() {
+        let tmp = TempDir::new().unwrap();
+        let id = MakiId::generate();
+        let claim = claim_id(tmp.path(), id);
+        let queued = claim.clone();
+
+        drop(claim);
+        let err = SessionClaim::acquire_in(id, tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, SessionError::Busy { id: busy } if busy == id),
+            "{SHARED_CLAIM_HELD}"
+        );
+
+        drop(queued);
+        SessionClaim::acquire_in(id, tmp.path()).expect(SHARED_CLAIM_HELD);
+    }
+
+    #[test]
+    fn a_claim_does_not_cover_another_session() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut mine: TestSession = Session::new("m", "/project");
+        let theirs: TestSession = Session::new("m", "/project");
+
+        let err = mine.save_to(&claim_for(dir, &theirs), dir).unwrap_err();
+
+        assert!(matches!(err, SessionError::ClaimMismatch { .. }));
+        assert!(!jsonl_path(dir, mine.id).exists());
+    }
+
+    /// A plain file where `locks/` belongs stands in for NFS or a read-only
+    /// state dir. Maki still writes there, just without the protection.
+    #[test]
+    fn a_session_is_still_written_where_locking_is_impossible() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::write(locks_dir(dir), "").unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hi"));
+
+        let claim = SessionClaim::acquire_in(session.id, dir).expect("an unprotected claim");
+        session.save_to(&claim, dir).unwrap();
+
+        assert_eq!(
+            TestSession::load_from(session.id, dir).unwrap().messages(),
+            session.messages()
+        );
+    }
+
+    /// A maki opened and quit never writes, and no delete will ever come for
+    /// its id, so the claim must take its lock file along. A written session
+    /// keeps its lock file, or a process already waiting on it could end up
+    /// holding a lock nobody else can see.
+    #[test_case(false ; "an id nothing was written under")]
+    #[test_case(true ; "a written session")]
+    fn the_last_claim_keeps_its_lock_file_only_for_a_written_session(written: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let claim = claim_for(dir, &session);
+        assert!(lock_path(dir, session.id).exists(), "{LOCK_WHILE_HELD}");
+        if written {
+            session.save_to(&claim, dir).unwrap();
+        }
+
+        drop(claim);
+
+        assert_eq!(lock_path(dir, session.id).exists(), written);
+    }
+
+    #[test]
+    fn claim_and_load_refuses_a_held_session() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hi"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+        let _elsewhere = claim_id(dir, session.id);
+
+        let err = TestSession::claim_and_load_from(session.id, dir).unwrap_err();
+
+        assert!(err.is_busy(), "{err}");
+    }
+
+    #[test]
+    fn claim_latest_hands_back_the_claim_it_read_under() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("hi"));
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
+
+        let (latest, claim) = TestSession::claim_latest_in("/project", dir)
+            .unwrap()
+            .expect("the session is the cwd's latest");
+
+        assert_eq!(latest.id, session.id);
+        assert_eq!(claim.id(), session.id);
+        assert!(
+            SessionClaim::acquire_in(session.id, dir).is_err(),
+            "{READ_UNDER_CLAIM}"
+        );
+    }
+
+    /// Copying a session must not touch it, whoever holds it. A plain load
+    /// would migrate this legacy file in place.
+    #[test_case(false ; "a free session")]
+    #[test_case(true ; "a session another process holds")]
+    fn read_only_leaves_the_file_as_it_found_it(held_elsewhere: bool) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id: MakiId = LEGACY_HEX_ID.parse().unwrap();
+        let mut session: TestSession = Session::new("m", "/project");
+        session.id = id;
+        session.push_message(user_message("legacy"));
+        let legacy_path = dir.join(format!("{LEGACY_HEX_ID}.jsonl"));
+        write_legacy_jsonl(&legacy_path, &session);
+        let before = fs::read(&legacy_path).unwrap();
+        let _elsewhere = held_elsewhere.then(|| claim_id(dir, id));
+
+        let read = TestSession::read_only_from(id, dir).unwrap();
+
+        assert_eq!(read.messages().len(), 1);
+        assert_eq!(fs::read(&legacy_path).unwrap(), before);
+        assert!(!jsonl_path(dir, id).exists());
+    }
+
+    /// Unlinking the lock while another holder still writes the id would let a
+    /// third process lock a fresh file next to it.
+    #[test]
+    fn a_delete_leaves_the_lock_file_to_the_last_holder() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let claim = claim_for(dir, &session);
+        session.save_to(&claim, dir).unwrap();
+        let other_holder = claim.clone();
+
+        TestSession::delete_from(&claim, dir).unwrap();
+        drop(claim);
+        assert!(lock_path(dir, session.id).exists(), "{LOCK_WHILE_HELD}");
+
+        drop(other_holder);
+        assert!(!lock_path(dir, session.id).exists(), "{NO_ORPHAN_LOCK}");
+    }
+
+    /// The rewrite renames a new file over the one the cursor holds open, so an
+    /// append through that cursor would land in a file nothing reads.
+    #[test]
+    fn persist_after_a_rewrite_lands_in_the_live_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let claim = claim_for(dir, &session);
+        session.push_message(user_message("first"));
+        claim.persist(&session).unwrap();
+        session.push_message(user_message("second"));
+        session.save_to(&claim, dir).unwrap();
+
+        session.push_message(user_message("third"));
+        claim.persist(&session).unwrap();
+
+        assert_eq!(
+            TestSession::load_from(session.id, dir).unwrap().messages(),
+            session.messages()
+        );
+    }
+
     #[test]
     fn delete_nonexistent_returns_not_found() {
         let tmp = TempDir::new().unwrap();
         let id = MakiId::generate();
-        let err = TestSession::delete_from(id, tmp.path()).unwrap_err();
+        let err = TestSession::delete_from(&claim_id(tmp.path(), id), tmp.path()).unwrap_err();
         assert!(matches!(
             err,
             SessionError::Storage(StorageError::NotFound(_))
@@ -2217,7 +3359,7 @@ mod tests {
         let legacy_path = dir.join(format!("{legacy}.jsonl"));
         write_legacy_jsonl(&legacy_path, &session);
 
-        TestSession::delete_from(id, dir).unwrap();
+        TestSession::delete_from(&claim_id(dir, id), dir).unwrap();
         assert!(!legacy_path.exists());
         let canonical = jsonl_path(dir, id);
         assert!(!canonical.exists());
@@ -2235,7 +3377,7 @@ mod tests {
         let json_file = json_path(dir, session.id);
         fs::write(&json_file, serde_json::to_vec(&session).unwrap()).unwrap();
 
-        TestSession::delete_from(session.id, dir).unwrap();
+        TestSession::delete_from(&claim_id(dir, session.id), dir).unwrap();
         assert!(!jsonl_file.exists());
         assert!(!json_file.exists());
     }
@@ -2309,7 +3451,7 @@ mod tests {
         let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
         fs::write(&legacy_json, serde_json::to_vec(&session).unwrap()).unwrap();
 
-        TestSession::delete_from(id, dir).unwrap();
+        TestSession::delete_from(&claim_id(dir, id), dir).unwrap();
         assert!(!legacy_jsonl.exists());
         assert!(!legacy_json.exists());
     }
@@ -2330,7 +3472,7 @@ mod tests {
         let legacy_json = dir.join(format!("{LEGACY_HEX_ID}.json"));
         fs::write(&legacy_json, serde_json::to_vec(&session).unwrap()).unwrap();
 
-        let _log = SessionLog::rewrite(dir, &session).unwrap();
+        let _log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         assert!(!legacy_jsonl.exists());
         assert!(!legacy_json.exists());
@@ -2358,7 +3500,10 @@ mod tests {
         assert_eq!(loaded.title, "older");
         assert!(!json_path.exists());
 
-        let latest = TestSession::latest_in("/project", dir).unwrap().unwrap();
+        let latest = TestSession::claim_latest_in("/project", dir)
+            .unwrap()
+            .unwrap()
+            .0;
         assert_eq!(latest.title, "newest");
     }
 
@@ -2407,6 +3552,70 @@ mod tests {
     }
 
     #[test]
+    fn recorded_cwds_lists_the_directory_a_session_ran_in() {
+        const SESSION_CWD: &str = "/project/src";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: TestSession = Session::new("m", SESSION_CWD);
+        session.save(&claim_in(&state, &session), &state).unwrap();
+
+        assert_eq!(
+            super::recorded_cwds(&state.path().join(SESSIONS_DIR), ALL_RECORDED),
+            vec![SESSION_CWD.to_owned()]
+        );
+    }
+
+    /// The freeze that reads this index pays filesystem work per entry, and
+    /// the index only ever grows, so it has to stop somewhere. It stops at the
+    /// oldest sessions, which are the directories nobody opens any more.
+    #[test]
+    fn recorded_cwds_keeps_the_most_recent_within_the_limit() {
+        const LIMIT: usize = 3;
+        const OLD: &str = "/project/old";
+        const NEWER: &str = "/project/newer";
+        const NEWEST: &str = "/project/newest";
+        const FORGOTTEN: &str = "/project/forgotten";
+        const SESSIONS: [(&str, &str); 4] = [
+            (OLD, "017f0000-0000-7000-8000-000000000001"),
+            (NEWER, "018f0000-0000-7000-8000-000000000002"),
+            (NEWEST, "019f0000-0000-7000-8000-000000000003"),
+            // A version 4 id from before time-ordered ids, which says nothing
+            // about when it was used and so goes last.
+            (FORGOTTEN, LEGACY_HEX_ID),
+        ];
+        let tmp = TempDir::new().unwrap();
+        for (cwd, id) in SESSIONS {
+            update_cwd_index(tmp.path(), cwd, id.parse().unwrap()).unwrap();
+        }
+
+        assert_eq!(
+            super::recorded_cwds(tmp.path(), LIMIT),
+            vec![NEWEST.to_owned(), NEWER.to_owned(), OLD.to_owned()]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recorded_cwds_resolves_a_session_recorded_through_a_symlink() {
+        const PROJECT_DIR: &str = "project";
+        const LINK_NAME: &str = "link";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join("state"));
+        let root = tmp.path().join(PROJECT_DIR);
+        fs::create_dir_all(&root).unwrap();
+        let link = tmp.path().join(LINK_NAME);
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let mut session: TestSession = Session::new("m", link.to_str().unwrap());
+        session.save(&claim_in(&state, &session), &state).unwrap();
+
+        assert_eq!(
+            super::recorded_cwds(&state.path().join(SESSIONS_DIR), ALL_RECORDED),
+            vec![canonical_key(&root).to_str().unwrap().to_owned()]
+        );
+    }
+
+    #[test]
     fn title_unicode_safe() {
         let input = "あ".repeat(100);
         let title = generate_title(&[user_message(&input)]);
@@ -2421,7 +3630,7 @@ mod tests {
 
         let mut s1: TestSession = Session::new("m", "/project");
         s1.title = "jsonl-session".into();
-        s1.save_to(dir).unwrap();
+        s1.save_to(&claim_for(dir, &s1), dir).unwrap();
 
         let mut s2: TestSession = Session::new("m", "/project");
         s2.title = "json-session".into();
@@ -2457,7 +3666,7 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("first"));
-        drop(SessionLog::rewrite(dir, &session).unwrap());
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2465,9 +3674,9 @@ mod tests {
         drop(file);
 
         session.push_message(assistant_message("reply"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
         session.push_message(user_message("second"));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
         drop(log);
 
         let reloaded = TestSession::load_from(session.id, dir).unwrap();
@@ -2582,6 +3791,7 @@ mod tests {
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
         assert!(!meta.workflow);
+        assert!(meta.yolo.is_none());
     }
 
     #[test]
@@ -2592,7 +3802,8 @@ mod tests {
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
         session.meta.workflow = true;
-        session.save_to(dir).unwrap();
+        session.meta.yolo = Some(true);
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(
@@ -2601,6 +3812,7 @@ mod tests {
         );
         assert!(loaded.meta.fast);
         assert!(loaded.meta.workflow);
+        assert_eq!(loaded.meta.yolo, Some(true));
     }
 
     #[test]
@@ -2612,8 +3824,8 @@ mod tests {
         session
             .tool_outputs
             .insert("t1".into(), Arc::new(serde_json::json!({"result": "ok"})));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
-        log.append(&session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2626,8 +3838,11 @@ mod tests {
         assert!(loaded.tool_outputs().contains_key("t1"));
     }
 
+    /// A log whose header is unreadable is not an empty slot: the file is
+    /// there, and a caller that creates a session on `NotFound` would write
+    /// over whatever it holds.
     #[test]
-    fn corrupt_header_line_only_returns_not_found() {
+    fn corrupt_header_line_only_is_not_reported_as_missing() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let id: MakiId = "01965087-4c71-7f00-8000-000000000000".parse().unwrap();
@@ -2635,10 +3850,8 @@ mod tests {
         fs::write(&path, "NOT_A_HEADER\n").unwrap();
 
         let err = TestSession::load_from(id, dir).unwrap_err();
-        assert!(matches!(
-            err,
-            SessionError::Storage(StorageError::NotFound(_))
-        ));
+        assert!(matches!(err, SessionError::MissingHeader { .. }), "{err}");
+        assert!(!err.is_not_found());
     }
 
     #[test]
@@ -2647,7 +3860,7 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("msg"));
-        session.save_to(dir).unwrap();
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2665,7 +3878,7 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("first"));
-        session.save_to(dir).unwrap();
+        session.save_to(&claim_for(dir, &session), dir).unwrap();
 
         let path = jsonl_path(dir, session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2684,15 +3897,15 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("first"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         session.title = "v1".into();
         session.push_message(assistant_message("reply"));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         session.title = "v2".into();
         session.push_message(user_message("second"));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
@@ -2719,12 +3932,12 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("msg"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         session.title = "big-meta".into();
         session.meta.input_draft = Some("x".repeat(TAIL_BUF as usize * 2));
         session.push_message(assistant_message("reply"));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         let list = TestSession::list_in("/project", dir).unwrap();
         assert_eq!(list.len(), 1);
@@ -2768,9 +3981,10 @@ mod tests {
     /// What the storage writer does: append while the epoch holds, rewrite the
     /// whole file otherwise.
     fn write_through(log: &mut SessionLog, dir: &Path, session: &TestSession) {
-        match log.append(session) {
+        let claim = claim_for(dir, session);
+        match log.append(&claim, session) {
             Err(SessionError::LogDiverged { .. }) => {
-                *log = SessionLog::rewrite(dir, session).unwrap()
+                *log = SessionLog::rewrite(dir, &claim, session).unwrap()
             }
             other => other.unwrap(),
         }
@@ -2798,7 +4012,7 @@ mod tests {
                 session.push_message(tool_message(&slot));
                 session.push_message(assistant_message("reply"));
             }
-            2 => session.insert_tool_output(slot, Value::from(format!("out-{step}"))),
+            2 => session.insert_tool_output(slot, Arc::new(Value::from(format!("out-{step}")))),
             3 => {
                 let len = rng.below(4) as usize;
                 let msgs = (0..len)
@@ -2830,7 +4044,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
         let mut rng = Rng(PROPERTY_SEED);
 
         for step in 0..PROPERTY_STEPS {
@@ -2864,7 +4078,7 @@ mod tests {
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("hello"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         let path = jsonl_path(dir, session.id);
         OpenOptions::new()
@@ -2876,10 +4090,10 @@ mod tests {
 
         session.push_message(assistant_message("reply"));
         assert!(matches!(
-            log.append(&session),
+            log.append(&claim_for(dir, &session), &session),
             Err(SessionError::LogDiverged { .. }),
         ));
-        drop(SessionLog::rewrite(dir, &session).unwrap());
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_same_session(&loaded, &session);
@@ -2943,7 +4157,7 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         session.push_message(user_message("a"));
         session.push_message(assistant_message("b"));
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
         let (revision, updated_at, epoch) = (session.revision(), session.updated_at, session.epoch);
 
         session.set_title(session.title.clone());
@@ -2956,7 +4170,7 @@ mod tests {
         assert_eq!(session.epoch, epoch);
 
         session.push_message(user_message("c"));
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_same_session(&loaded, &session);
     }
@@ -2972,11 +4186,11 @@ mod tests {
         let meta = session.meta.clone();
         Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
 
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
         for step in 0..3 {
             Arc::make_mut(&mut produced.messages).push(assistant_message(&format!("reply-{step}")));
             Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
-            log.append(&session).unwrap();
+            log.append(&claim_for(dir, &session), &session).unwrap();
         }
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
@@ -2992,16 +4206,16 @@ mod tests {
         let dir = tmp.path();
         let mut base: TestSession = Session::new("m", "/project");
         base.push_message(user_message("a"));
-        let mut log = SessionLog::rewrite(dir, &base).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &base), &base).unwrap();
 
         let mut session = Arc::new(base);
         let held = Arc::clone(&session);
         let live = Arc::make_mut(&mut session);
         live.push_message(assistant_message("b"));
-        live.insert_tool_output("t1".into(), Value::from("out"));
+        live.insert_tool_output("t1".into(), Arc::new(Value::from("out")));
         live.set_subagent_messages("s1".into(), vec![user_message("sub")]);
 
-        log.append(&session).unwrap();
+        log.append(&claim_for(dir, &session), &session).unwrap();
 
         assert_eq!(held.messages().len(), 1, "the writer's snapshot is frozen");
         let loaded = TestSession::load_from(session.id, dir).unwrap();
@@ -3025,7 +4239,7 @@ mod tests {
         let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
         let meta = session.meta.clone();
         Session::checkpoint(&mut session, Some(&produced), meta.clone(), Value::Null);
-        let mut log = SessionLog::rewrite(dir, &session).unwrap();
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
 
         let live = Arc::make_mut(&mut session);
         live.truncate_messages(1);
@@ -3036,7 +4250,7 @@ mod tests {
         let path = jsonl_path(dir, session.id);
         let size_before = fs::metadata(&path).unwrap().len();
         assert!(matches!(
-            log.append(&session),
+            log.append(&claim_for(dir, &session), &session),
             Err(SessionError::LogDiverged { .. }),
         ));
         assert_eq!(
@@ -3044,7 +4258,7 @@ mod tests {
             size_before,
             "a refused append must not have written half of itself"
         );
-        drop(SessionLog::rewrite(dir, &session).unwrap());
+        drop(SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap());
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_same_session(&loaded, &session);

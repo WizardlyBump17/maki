@@ -1,4 +1,5 @@
 use crate::components::keybindings::key;
+use crate::repaint::{Cadence, Dirty};
 use crate::theme::{self, lerp_u8};
 use crate::update;
 use ratatui::buffer::Buffer;
@@ -8,6 +9,7 @@ use std::time::Instant;
 
 const LOGO: &str = "maki";
 const TAGLINE: &str = "the efficient coder";
+const UPDATE_HINT: &str = " run maki update to get v";
 const HELP_SEGMENTS: &[(&str, bool)] = &[
     (key::HELP.label, true),
     (" help", false),
@@ -21,7 +23,7 @@ const TIPS: &[(&str, &str)] = &[
         key::FILE_PICKER.label,
         "to grab file paths with fuzzy search",
     ),
-    (key::TASKS.label, "to see what your subagents are up to"),
+    ("/tasks", "to see what your subagents are up to"),
     (key::SEARCH.label, "to find things in the conversation"),
     ("/btw", "to ask something without interrupting the session"),
     ("/memory", "to view, edit, and delete persistent notes"),
@@ -47,6 +49,16 @@ const INTENSITY_SCALE: f32 = 0.3;
 const VIGNETTE_SCALE: f32 = 0.25;
 /// Base opacity for the dimmest field character (0.0–1.0). Higher = less contrast between chars.
 const FIELD_BASE_OPACITY: f32 = 0.5;
+/// How far accent-colored text is blended up from the background.
+const ACCENT_ALPHA: f32 = 0.75;
+/// The same, for secondary text that should recede.
+const MUTED_ALPHA: f32 = 0.5;
+const VERSION_ALPHA: f32 = 0.4;
+/// Peak brightness of the logo, which never reaches the full accent color.
+const LOGO_ALPHA: f32 = 0.85;
+/// The logo's blue channel is nudged up so it reads slightly cooler than the
+/// raw accent.
+const LOGO_BLUE_LIFT: u8 = 15;
 
 const INV_TAU: f32 = 1.0 / std::f32::consts::TAU;
 const TAU: f32 = std::f32::consts::TAU;
@@ -67,50 +79,52 @@ fn fast_sincos(x: f32) -> (f32, f32) {
     (fast_sin(x), fast_sin(x + FRAC_PI_2))
 }
 
+/// Crossfading needs numbers to interpolate, so a palette color has nowhere to
+/// go: it snaps and stays symbolic rather than being flattened to a guess at
+/// what the terminal would have drawn.
 pub struct ColorTransition {
-    from: (u8, u8, u8),
-    to: (u8, u8, u8),
+    from: Color,
+    to: Color,
     start: Instant,
 }
 
 impl ColorTransition {
     pub fn new(color: Color) -> Self {
-        let rgb = extract_rgb(color, (100, 140, 255));
         Self {
-            from: rgb,
-            to: rgb,
+            from: color,
+            to: color,
             start: Instant::now() - std::time::Duration::from_secs_f32(COLOR_TRANSITION_SECS),
         }
     }
 
     pub fn set(&mut self, color: Color) {
-        let rgb = extract_rgb(color, (100, 140, 255));
-        if rgb == self.to {
+        if color == self.to {
             return;
         }
         let now = Instant::now();
-        self.from = self.resolve_rgb(now);
-        self.to = rgb;
+        self.from = self.resolve_at(now);
+        self.to = color;
         self.start = now;
     }
 
+    /// A snapped transition has nothing left to draw, so it must not keep the
+    /// repaint loop awake for the rest of its window.
     pub fn is_animating(&self) -> bool {
-        Instant::now().duration_since(self.start).as_secs_f32() < COLOR_TRANSITION_SECS
+        matches!((self.from, self.to), (Color::Rgb(..), Color::Rgb(..)))
+            && Instant::now().duration_since(self.start).as_secs_f32() < COLOR_TRANSITION_SECS
     }
 
     pub fn resolve(&self) -> Color {
-        let (r, g, b) = self.resolve_rgb(Instant::now());
-        Color::Rgb(r, g, b)
+        self.resolve_at(Instant::now())
     }
 
-    fn resolve_rgb(&self, now: Instant) -> (u8, u8, u8) {
+    fn resolve_at(&self, now: Instant) -> Color {
+        let (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) = (self.from, self.to) else {
+            return self.to;
+        };
         let t = (now.duration_since(self.start).as_secs_f32() / COLOR_TRANSITION_SECS).min(1.0);
         let p = ease_out_cubic(t);
-        (
-            lerp_u8(self.from.0, self.to.0, p),
-            lerp_u8(self.from.1, self.to.1, p),
-            lerp_u8(self.from.2, self.to.2, p),
-        )
+        Color::Rgb(lerp_u8(fr, tr, p), lerp_u8(fg, tg, p), lerp_u8(fb, tb, p))
     }
 }
 
@@ -119,6 +133,7 @@ pub struct Splash {
     field_offset: f32,
     animate: bool,
     tip_idx: usize,
+    latest_version: Option<&'static str>,
 }
 
 impl Default for Splash {
@@ -137,7 +152,30 @@ impl Splash {
             field_offset: (u64::from_le_bytes(rng) % 10_000) as f32,
             animate,
             tip_idx,
+            latest_version: None,
         }
+    }
+
+    /// The update check answers long after the splash is first painted, and
+    /// storing its answer wakes nothing. Reading it in [`Self::render`] would
+    /// put a version on screen that no poller ever saw, so a still splash
+    /// (`splash_animation = false`) would never show the notice at all.
+    pub fn poll_update(&mut self, latest: Option<&'static str>) -> Dirty {
+        if self.latest_version == latest {
+            return Dirty::NO;
+        }
+        self.latest_version = latest;
+        Dirty::YES
+    }
+
+    /// The starfield drifts for as long as the splash is up. With it off the
+    /// only motion left is the entry fade, which ends, so the loop settles on
+    /// the start screen instead of burning a core on a still picture.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(
+            self.animate || self.start.elapsed().as_secs_f32() < FADE_DURATION,
+            Cadence::SMOOTH,
+        )
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer, accent: Color) {
@@ -152,7 +190,6 @@ impl Splash {
             ease_out_cubic(t / FADE_DURATION)
         };
 
-        let new_version = update::latest_version();
         let block_height = 8;
         let top_y = area.y + area.height.saturating_sub(block_height) / 2;
         let tag_y = top_y + 1;
@@ -166,13 +203,19 @@ impl Splash {
         render_centered_faded(area, buf, fade, 0.75, tag_y, TAGLINE);
         self.render_help(area, buf, fade, help_y, accent);
         self.render_tip(area, buf, fade, tip_y, accent);
-        render_version(area, buf, fade, area.y, new_version);
+        render_version(area, buf, fade, area.y, self.latest_version);
     }
 
+    /// The field is a gradient of intensities between the background and the
+    /// accent, so it needs both as numbers. On a palette theme there is
+    /// nothing to interpolate and the splash simply draws without it.
     fn render_field(&self, area: Rect, buf: &mut Buffer, t: f32, fade: f32, accent: Color) {
         let theme = theme::current();
-        let (ac_r, ac_g, ac_b) = extract_rgb(accent, (100, 140, 255));
-        let (bg_r, bg_g, bg_b) = extract_rgb(theme.background, (15, 15, 25));
+        let (Color::Rgb(ac_r, ac_g, ac_b), Color::Rgb(bg_r, bg_g, bg_b)) =
+            (accent, theme.background)
+        else {
+            return;
+        };
 
         let w = area.width as usize;
         let h = area.height as usize;
@@ -315,19 +358,15 @@ impl Splash {
     ) {
         let theme = theme::current();
         let bg = theme.background;
-        let (ac_r, ac_g, ac_b) = extract_rgb(accent, (100, 140, 255));
-        let (bg_r, bg_g, bg_b) = extract_rgb(bg, (15, 15, 25));
 
         let logo_x = area.x + (area.width.saturating_sub(LOGO.len() as u16)) / 2;
-        let alpha = 0.85 * ease_out_cubic(((t - LOGO_DELAY) / LOGO_RAMP).clamp(0.0, 1.0)) * fade;
-        let style = Style::new()
-            .fg(Color::Rgb(
-                lerp_u8(bg_r, ac_r, alpha),
-                lerp_u8(bg_g, ac_g, alpha),
-                lerp_u8(bg_b, ac_b.saturating_add(15), alpha),
-            ))
-            .bg(bg)
-            .add_modifier(Modifier::BOLD);
+        let alpha =
+            LOGO_ALPHA * ease_out_cubic(((t - LOGO_DELAY) / LOGO_RAMP).clamp(0.0, 1.0)) * fade;
+        let lifted = match accent {
+            Color::Rgb(r, g, b) => Color::Rgb(r, g, b.saturating_add(LOGO_BLUE_LIFT)),
+            symbolic => symbolic,
+        };
+        let style = faded_style(lifted, bg, alpha).add_modifier(Modifier::BOLD);
 
         for (col, ch) in LOGO.chars().enumerate() {
             let x = logo_x + col as u16;
@@ -347,9 +386,6 @@ impl Splash {
 
         let theme = theme::current();
         let bg = theme.background;
-        let ac = extract_rgb(accent, (100, 140, 255));
-        let fg = extract_rgb(theme.foreground, (200, 200, 200));
-        let bg_rgb = extract_rgb(bg, (15, 15, 25));
 
         let total_width: u16 = HELP_SEGMENTS.iter().map(|(s, _)| s.len() as u16).sum();
         let x_start = area.x + area.width.saturating_sub(total_width) / 2;
@@ -357,8 +393,12 @@ impl Splash {
         let segments: Vec<_> = HELP_SEGMENTS
             .iter()
             .map(|&(text, highlighted)| {
-                let (target, alpha) = if highlighted { (ac, 0.75) } else { (fg, 0.5) };
-                (text, faded_style(bg_rgb, target, alpha * fade, bg))
+                let (target, alpha) = if highlighted {
+                    (accent, ACCENT_ALPHA)
+                } else {
+                    (theme.foreground, MUTED_ALPHA)
+                };
+                (text, faded_style(target, bg, alpha * fade))
             })
             .collect();
 
@@ -372,13 +412,7 @@ impl Splash {
 
         let theme = theme::current();
         let bg = theme.background;
-        let tip_rgb = extract_rgb(
-            theme.todo_in_progress.fg.unwrap_or(Color::Yellow),
-            (249, 226, 175),
-        );
-        let ac = extract_rgb(accent, (100, 140, 255));
-        let fg = extract_rgb(theme.foreground, (200, 200, 200));
-        let bg_rgb = extract_rgb(bg, (15, 15, 25));
+        let tip_fg = theme.todo_in_progress.fg.unwrap_or(Color::Yellow);
 
         let (label, desc) = TIPS[self.tip_idx];
         let total_width = (5 + label.len() + 1 + desc.len()) as u16;
@@ -387,11 +421,11 @@ impl Splash {
         let segments: &[(&str, Style)] = &[
             (
                 "tip: ",
-                faded_style(bg_rgb, tip_rgb, 0.75 * fade, bg).add_modifier(Modifier::BOLD),
+                faded_style(tip_fg, bg, ACCENT_ALPHA * fade).add_modifier(Modifier::BOLD),
             ),
-            (label, faded_style(bg_rgb, ac, 0.75 * fade, bg)),
+            (label, faded_style(accent, bg, ACCENT_ALPHA * fade)),
             (" ", Style::default()),
-            (desc, faded_style(bg_rgb, fg, 0.5 * fade, bg)),
+            (desc, faded_style(theme.foreground, bg, MUTED_ALPHA * fade)),
         ];
 
         render_segments(area, buf, tip_y, x_start, segments);
@@ -405,15 +439,10 @@ fn render_version(area: Rect, buf: &mut Buffer, fade: f32, y: u16, new_version: 
     let theme = theme::current();
     let bg = theme.background;
     let text = match new_version {
-        Some(v) => format!("v{} run maki update to get v{}", update::CURRENT, v),
+        Some(v) => format!("v{}{UPDATE_HINT}{v}", update::CURRENT),
         None => format!("v{}", update::CURRENT),
     };
-    let style = faded_style(
-        extract_rgb(bg, (15, 15, 25)),
-        extract_rgb(theme.foreground, (200, 200, 200)),
-        0.4 * fade,
-        bg,
-    );
+    let style = faded_style(theme.foreground, bg, VERSION_ALPHA * fade);
     let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16 + 1);
     render_segments(area, buf, y, x_start, &[(&text, style)]);
 }
@@ -431,31 +460,24 @@ fn render_centered_faded(
     }
     let theme = theme::current();
     let bg = theme.background;
-    let style = faded_style(
-        extract_rgb(bg, (15, 15, 25)),
-        extract_rgb(theme.foreground, (200, 200, 200)),
-        intensity * fade,
-        bg,
-    );
+    let style = faded_style(theme.foreground, bg, intensity * fade);
     let x_start = area.x + area.width.saturating_sub(text.chars().count() as u16) / 2;
     render_segments(area, buf, y, x_start, &[(text, style)]);
 }
 
-fn extract_rgb(color: Color, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => fallback,
+/// Fading means blending toward the background, which needs both ends as
+/// numbers. A palette color has no value to blend, so it is drawn flat instead
+/// of being resolved to a guess at what the terminal would have shown.
+fn faded_style(fg: Color, bg: Color, alpha: f32) -> Style {
+    let style = Style::new().bg(bg);
+    match (fg, bg) {
+        (Color::Rgb(fr, fg_, fb), Color::Rgb(br, bg_, bb)) => style.fg(Color::Rgb(
+            lerp_u8(br, fr, alpha),
+            lerp_u8(bg_, fg_, alpha),
+            lerp_u8(bb, fb, alpha),
+        )),
+        _ => style.fg(fg),
     }
-}
-
-fn faded_style(bg: (u8, u8, u8), fg: (u8, u8, u8), alpha: f32, bg_color: Color) -> Style {
-    Style::new()
-        .fg(Color::Rgb(
-            lerp_u8(bg.0, fg.0, alpha),
-            lerp_u8(bg.1, fg.1, alpha),
-            lerp_u8(bg.2, fg.2, alpha),
-        ))
-        .bg(bg_color)
 }
 
 fn render_segments(area: Rect, buf: &mut Buffer, y: u16, x_start: u16, segments: &[(&str, Style)]) {
@@ -482,28 +504,31 @@ fn ease_out_cubic(t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::buffer_text;
+    use crate::repaint::expect::{OWED, QUIET};
     use std::time::Duration;
+    use test_case::test_case;
 
-    fn transition_at(from: (u8, u8, u8), to: (u8, u8, u8), offset: Duration) -> (u8, u8, u8) {
+    fn transition_at(from: (u8, u8, u8), to: (u8, u8, u8), offset: Duration) -> Color {
         let mut ct = ColorTransition::new(Color::Rgb(from.0, from.1, from.2));
         ct.set(Color::Rgb(to.0, to.1, to.2));
-        ct.resolve_rgb(ct.start + offset)
+        ct.resolve_at(ct.start + offset)
     }
 
     #[test]
     fn interpolation_over_time() {
         let start = transition_at((0, 0, 0), (200, 200, 200), Duration::ZERO);
-        assert_eq!(start, (0, 0, 0));
+        assert_eq!(start, Color::Rgb(0, 0, 0));
 
-        let mid = transition_at((0, 0, 0), (200, 200, 200), Duration::from_millis(200));
-        assert!(
-            mid.0 > 0 && mid.0 < 200,
-            "expected interpolated, got {}",
-            mid.0
-        );
+        let Color::Rgb(mid, _, _) =
+            transition_at((0, 0, 0), (200, 200, 200), Duration::from_millis(200))
+        else {
+            panic!("an rgb transition stays rgb");
+        };
+        assert!(mid > 0 && mid < 200, "expected interpolated, got {mid}");
 
         let done = transition_at((0, 0, 0), (255, 255, 255), Duration::from_millis(500));
-        assert_eq!(done, (255, 255, 255));
+        assert_eq!(done, Color::Rgb(255, 255, 255));
     }
 
     #[test]
@@ -512,8 +537,50 @@ mod tests {
         ct.set(Color::Rgb(200, 100, 50));
         ct.set(Color::Rgb(10, 20, 30));
 
-        let done = ct.resolve_rgb(ct.start + Duration::from_secs(1));
-        assert_eq!(done, (10, 20, 30));
+        let done = ct.resolve_at(ct.start + Duration::from_secs(1));
+        assert_eq!(done, Color::Rgb(10, 20, 30));
+    }
+
+    const NEW_VERSION: &str = "99.9.9";
+    const UNPOLLED: &str = "an unpolled version must not appear on screen";
+    const POLLED: &str = "a polled version must appear on screen";
+
+    fn rendered(splash: &Splash) -> String {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        splash.render(area, &mut buf, Color::Blue);
+        buffer_text(&buf)
+    }
+
+    /// The check answers on its own, so the notice only reaches the screen
+    /// because a poll reported it. A still splash owes no other frame, so
+    /// reading the answer in `render` would hide it until the user typed.
+    #[test]
+    fn an_update_notice_reaches_the_screen_only_after_a_poll() {
+        let mut splash = Splash::new(false);
+        assert_eq!(splash.poll_update(None), Dirty::NO, "{QUIET}");
+        assert!(!rendered(&splash).contains(NEW_VERSION), "{UNPOLLED}");
+
+        assert_eq!(splash.poll_update(Some(NEW_VERSION)), Dirty::YES, "{OWED}");
+        assert_eq!(splash.poll_update(Some(NEW_VERSION)), Dirty::NO, "{QUIET}");
+
+        let screen = rendered(&splash);
+        assert!(screen.contains(UPDATE_HINT.trim_end()), "{POLLED}");
+        assert!(screen.contains(NEW_VERSION), "{POLLED}");
+    }
+
+    /// `splash_animation = false` is what a user on a slow machine reaches
+    /// for, so the start screen really has to stop painting once the entry
+    /// fade is over.
+    #[test_case(false, false => Cadence::SMOOTH ; "entry_fade_is_running")]
+    #[test_case(false, true  => Cadence::IDLE   ; "still_splash_settles_after_the_fade")]
+    #[test_case(true,  true  => Cadence::SMOOTH ; "starfield_drifts_for_as_long_as_it_is_up")]
+    fn splash_cadence(animate: bool, faded: bool) -> Cadence {
+        let mut splash = Splash::new(animate);
+        if faded {
+            splash.start -= Duration::from_secs_f32(FADE_DURATION);
+        }
+        splash.cadence()
     }
 
     #[test]
@@ -526,12 +593,53 @@ mod tests {
         assert!(ct.is_animating(), "animating after set");
     }
 
-    #[test]
-    fn non_rgb_color_uses_fallback() {
-        let ct = ColorTransition::new(Color::Blue);
-        assert_eq!(
-            ct.resolve_rgb(ct.start + Duration::from_secs(1)),
-            (100, 140, 255)
+    /// Resolving a palette color to rgb here would defeat the point of asking
+    /// for it, so it crosses the transition untouched.
+    #[test_case(Color::Blue, Color::Rgb(1, 2, 3); "into rgb")]
+    #[test_case(Color::Rgb(1, 2, 3), Color::Blue; "out of rgb")]
+    fn a_palette_color_snaps_instead_of_blending(from: Color, to: Color) {
+        let mut ct = ColorTransition::new(from);
+        ct.set(to);
+        assert_eq!(ct.resolve_at(ct.start), to);
+        assert!(
+            !ct.is_animating(),
+            "a snapped transition must not keep asking for frames"
         );
+    }
+
+    const ANSI_THEME_NAME: &str = "an all-ansi theme must parse";
+    const ANSI_THEME: &str = r#"
+[palette]
+background = "black"
+foreground = "white"
+
+[ui]
+background = { bg = "background" }
+foreground = { fg = "foreground" }
+todo_in_progress = { fg = "yellow" }
+"#;
+
+    /// The starfield needs numbers to build its gradient; on a palette theme
+    /// the splash draws flat rather than inventing truecolor for it. The theme
+    /// is installed here rather than inherited, because the default one is
+    /// truecolor and would make this pass or fail on test ordering.
+    #[test]
+    fn a_palette_accent_keeps_the_splash_free_of_truecolor() {
+        theme::set(theme::Theme::from_toml(ANSI_THEME).expect(ANSI_THEME_NAME));
+
+        let mut splash = Splash::new(true);
+        // At t=0 the entry fade has not started painting, so the assertion
+        // below would hold no matter what the field did.
+        splash.start -= Duration::from_secs_f32(FADE_DURATION);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        splash.render(area, &mut buf, Color::Blue);
+
+        let rgb = buf
+            .content
+            .iter()
+            .filter_map(|c| c.style().fg)
+            .find(|fg| matches!(fg, Color::Rgb(..)));
+        assert_eq!(rgb, None, "a palette theme must not produce rgb cells");
     }
 }

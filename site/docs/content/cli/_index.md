@@ -22,14 +22,15 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 |------|-----|-----------|---------------------|
 | `-m` / `--model` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
-| `--no-plugins` / `--no-commands` / `--no-rtk` / `--no-jit` | yes | yes | yes |
+| `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
-| `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
+| `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
-| `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
+| `--session-id`, `--fork-session` | yes | yes | yes |
+| `--max-turns` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -41,20 +42,20 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
-| `-c`, `--continue` | Resume the most recent session in this directory (TUI / SDK only) |
-| `-s`, `--session` / `--resume <ID>` | Resume a specific session (TUI / SDK only) |
+| `-c`, `--continue` | Resume the most recent session in this directory |
+| `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from `.maki/commands`, `.claude/commands`, etc. |
-| `--no-rtk` | Disable [rtk](https://github.com/rtk-ai/rtk) command rewriting |
 | `--no-plugins` | Skip user `init.lua` (global and project); keep the Lua host and builtin plugins so tools and the default keymap still load |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
+| `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
-| `--session-id <ID>` | Session id for SDK mode |
-| `--fork-session` | Load a session's history under a new id (SDK) |
+| `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
+| `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
@@ -63,7 +64,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
+`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
 
 ### Permission modes (SDK)
 
@@ -94,7 +95,22 @@ maki auth status
 
 ### `maki models`
 
-Lists every model Maki currently knows about (built-ins, discovered, catalog). One model spec per line. Warnings from discovery go to stderr.
+```bash
+maki models
+maki models --refresh    # refetch the models.dev catalog
+```
+
+One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
+
+### `maki session`
+
+```bash
+maki session list            # sessions for the current directory
+maki session list --global   # sessions from all projects
+maki session delete <id>     # asks first, -f skips
+```
+
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --resume <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
 ### `maki mcp`
 
@@ -155,6 +171,20 @@ maki migrate xdg
 ```
 
 Moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+
+### `maki trust`
+
+```bash
+maki trust add [PATH]
+maki trust add [PATH] --yes
+maki trust remove [PATH]
+maki trust list
+```
+
+Records whether a folder's `.maki` configuration may load. `PATH` defaults to
+the current directory, `--yes` skips the confirmation, and `list` shows trusted
+and rejected folders. See [Folder Trust](/docs/folder-trust/) for what is gated
+and for the `--trust` flag that grants trust for a single run.
 
 ## Everyday examples
 

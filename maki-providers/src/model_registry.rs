@@ -20,8 +20,8 @@ use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use maki_storage::{StateDir, atomic_write};
 use tracing::warn;
 
-use crate::manifest::ManifestRegistry;
 use crate::model::{ModelInfo, ModelTier};
+use crate::spec::ProviderRegistry;
 
 const TIERS_FILE: &str = "model-tiers";
 
@@ -49,6 +49,10 @@ pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
     read().discovered(provider, model_id).cloned()
+}
+
+pub fn discovery_complete(provider: &str) -> bool {
+    read().known_models.contains_key(provider)
 }
 
 /// Typed `provider_info` for a discovered model. Key by the builtin slug, not
@@ -252,7 +256,7 @@ impl ModelRegistry {
 /// discovered list for tier auto-assignment; curated providers keep their
 /// static tier tables.
 fn tiers_from_discovery(provider: &str) -> bool {
-    ManifestRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
+    ProviderRegistry::get(provider).is_none_or(|m| m.accepts_arbitrary_models)
 }
 
 fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
@@ -262,9 +266,9 @@ fn static_candidate(provider: &str, tier: ModelTier) -> Option<String> {
 }
 
 fn static_prefixes(provider: &str, tier: ModelTier) -> impl Iterator<Item = &'static str> {
-    ManifestRegistry::get(provider)
+    ProviderRegistry::get(provider)
         .into_iter()
-        .flat_map(|manifest| manifest.models)
+        .flat_map(|spec| spec.models())
         .filter(move |entry| entry.default && entry.tier == tier)
         .flat_map(|entry| entry.prefixes.iter().copied())
 }
@@ -409,7 +413,7 @@ mod tests {
         );
     }
 
-    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/gpt-5.4"; "curated default beats discovered tier")]
+    #[test_case(&[("gpt-5.4", ModelTier::Strong), ("claude-opus-4.7", ModelTier::Strong)], "copilot/claude-opus-4.7"; "curated default beats discovered tier")]
     #[test_case(&[("claude-opus-4.6", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/claude-opus-4.6"; "later curated prefix when first is unavailable")]
     #[test_case(&[("zeta", ModelTier::Strong), ("alpha", ModelTier::Strong)], "copilot/alpha"; "lowest id when no curated default is entitled")]
     fn spec_for_tier_prefers_entitled_curated_default(

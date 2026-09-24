@@ -23,11 +23,12 @@
 //! so the copied text would lose that space unless we put it back. But we
 //! should only add a space for word-boundary wraps, not mid-word ones
 //! (where a long token just overflows the column). `LineBreaks` tracks
-//! both line starts and wrap types: `compute_wrap_types()` walks each
-//! line the same way ratatui does and classifies every break, then
-//! `append_rows` calls `needs_space()` to decide.
+//! both line starts and word wraps: `from_lines()` replays ratatui's wrap
+//! machine through [`crate::wrap`] and marks the rows that start after a
+//! swallowed space, then `append_rows` calls `needs_space()`.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
@@ -35,22 +36,28 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
+use crate::repaint::Cadence;
 use crate::theme;
+use crate::wrap::{self, Break};
 use maki_markdown::render::{CODE_BAR, CODE_BAR_WRAP};
 
-/// Position in doc space (full logical document, not just visible window).
-/// Stored as (row, col) where col is a screen x coordinate.
+/// Position in the full logical document, not just the visible window. For
+/// the messages zone `seg` is the transcript segment and `row` counts inside
+/// it, which is what survives a resize; flat zones leave `seg` at 0. `col` is
+/// a screen x coordinate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocPos {
-    pub row: u32,
+    pub seg: usize,
+    pub row: u16,
     pub col: u16,
 }
 
 impl DocPos {
-    fn new(row: u32, col: u16) -> Self {
-        Self { row, col }
+    /// A position in a zone whose document is one flat list of rows.
+    pub fn flat(row: u16, col: u16) -> Self {
+        Self { seg: 0, row, col }
     }
 }
 
@@ -62,7 +69,29 @@ impl PartialOrd for DocPos {
 
 impl Ord for DocPos {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.row, self.col).cmp(&(other.row, other.col))
+        (self.seg, self.row, self.col).cmp(&(other.seg, other.row, other.col))
+    }
+}
+
+/// Where a [`DocPos`] falls relative to the viewport. `At` counts rows down
+/// from the top of the zone's area, so it is not a screen row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowPos {
+    Above,
+    At(u16),
+    Below,
+}
+
+impl RowPos {
+    /// Projection for a zone whose document is one flat list of rows.
+    pub fn flat(pos: DocPos, area: Rect, scroll: u16) -> Self {
+        if pos.row < scroll {
+            Self::Above
+        } else if pos.row - scroll >= area.height {
+            Self::Below
+        } else {
+            Self::At(pos.row - scroll)
+        }
     }
 }
 
@@ -148,20 +177,17 @@ pub struct Selection {
     pub zone: SelectionZone,
 }
 
-fn screen_to_doc(screen_row: u16, area: Rect, scroll_offset: u32) -> u32 {
-    let clamped = screen_row.clamp(area.y, area.y + area.height.saturating_sub(1));
-    scroll_offset + (clamped - area.y) as u32
+/// Clamps a screen row into `area` and returns how far down it sits.
+pub fn row_in_area(screen_row: u16, area: Rect) -> u16 {
+    screen_row.clamp(area.y, area.y + area.height.saturating_sub(1)) - area.y
 }
 
-fn clamp_col(col: u16, area: Rect) -> u16 {
+pub fn clamp_col(col: u16, area: Rect) -> u16 {
     col.clamp(area.x, area.x + area.width.saturating_sub(1))
 }
 
 impl Selection {
-    pub fn start(row: u16, col: u16, area: Rect, zone: SelectionZone, scroll_offset: u32) -> Self {
-        let doc_row = screen_to_doc(row, area, scroll_offset);
-        let doc_col = clamp_col(col, area);
-        let pos = DocPos::new(doc_row, doc_col);
+    pub fn start(pos: DocPos, area: Rect, zone: SelectionZone) -> Self {
         Self {
             anchor: pos,
             cursor: pos,
@@ -170,11 +196,8 @@ impl Selection {
         }
     }
 
-    pub fn update(&mut self, row: u16, col: u16, scroll_offset: u32) {
-        self.cursor = DocPos::new(
-            screen_to_doc(row, self.area, scroll_offset),
-            clamp_col(col, self.area),
-        );
+    pub fn update(&mut self, pos: DocPos) {
+        self.cursor = pos;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -201,40 +224,26 @@ impl Selection {
         }
     }
 
-    pub fn to_screen(self, scroll_offset: u32) -> Option<ScreenSelection> {
+    /// Clips the selection to the viewport `project` describes. There is
+    /// nothing to draw when all of it sits past one of the edges.
+    pub fn to_screen(self, project: impl Fn(DocPos) -> RowPos) -> Option<ScreenSelection> {
         let (start, end) = self.normalized();
         if start == end {
             return None;
         }
 
-        let view_top = scroll_offset;
-        let view_bottom = scroll_offset + self.area.height as u32;
-
-        if end.row < view_top || start.row >= view_bottom {
-            return None;
-        }
-
-        let project_row = |doc_row: u32| -> u16 {
-            if doc_row < view_top {
-                self.area.y
-            } else if doc_row >= view_bottom {
-                self.area.y + self.area.height.saturating_sub(1)
-            } else {
-                self.area.y + (doc_row - view_top) as u16
-            }
+        let (start_row, start_col) = match project(start) {
+            RowPos::Below => return None,
+            RowPos::Above => (self.area.y, self.area.x),
+            RowPos::At(row) => (self.area.y + row, start.col),
         };
-
-        let start_row = project_row(start.row);
-        let start_col = if start.row < view_top {
-            self.area.x
-        } else {
-            start.col
-        };
-        let end_row = project_row(end.row);
-        let end_col = if end.row >= view_bottom {
-            self.area.x + self.area.width.saturating_sub(1)
-        } else {
-            end.col
+        let (end_row, end_col) = match project(end) {
+            RowPos::Above => return None,
+            RowPos::Below => (
+                self.area.y + self.area.height.saturating_sub(1),
+                self.area.x + self.area.width.saturating_sub(1),
+            ),
+            RowPos::At(row) => (self.area.y + row, end.col),
         };
 
         Some(ScreenSelection {
@@ -281,6 +290,12 @@ impl SelectionState {
 
     pub fn is_pending_copy(&self) -> bool {
         matches!(self, Self::PendingCopy { .. })
+    }
+
+    /// Edge scroll advances on a timer while a drag rests against the edge of
+    /// the viewport, with no further mouse events to wake the loop.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(self.is_edge_scrolling(), Cadence::SMOOTH)
     }
 
     pub fn is_edge_scrolling(&self) -> bool {
@@ -342,19 +357,21 @@ impl LineBreaks {
         let mut word_wraps = Vec::new();
         let mut row: u16 = 0;
         for line in lines {
-            if is_code_wrap_continuation(line) {
-                row += 1;
-                continue;
+            // Continuation rows belong to the line above, so they set no bits
+            // of their own. They are still walked at their real height: a stale
+            // segment holds code wrapped for a wider terminal, and counting one
+            // row each slides every later bit off its row.
+            let starts_line = !is_code_wrap_continuation(line);
+            if starts_line {
+                set_bit(&mut line_starts, row);
             }
-            set_bit(&mut line_starts, row);
-            let wrap_types = compute_wrap_types(line, width);
-            for is_word_wrap in &wrap_types {
-                row += 1;
-                if *is_word_wrap {
+            wrap::breaks(line, width, |kind| {
+                row = row.saturating_add(1);
+                if starts_line && kind == Break::Word {
                     set_bit(&mut word_wraps, row);
                 }
-            }
-            row += 1;
+            });
+            row = row.saturating_add(1);
         }
         Self::Bitmap {
             line_starts,
@@ -375,44 +392,6 @@ impl LineBreaks {
             Self::Bitmap { word_wraps, .. } => get_bit(word_wraps, row),
         }
     }
-}
-
-fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
-    let w = width as usize;
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let chars: Vec<char> = text.chars().collect();
-    let mut wraps = Vec::new();
-    let mut i = 0;
-    let mut col = 0;
-    let mut last_breakable: Option<usize> = None;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        let cw = ch.width().unwrap_or(0);
-
-        if ch == ' ' || ch == '\t' {
-            last_breakable = Some(i);
-        }
-
-        if col + cw > w && col > 0 {
-            if let Some(bp) = last_breakable {
-                wraps.push(true);
-                i = bp + 1;
-                while i < chars.len() && chars[i] == ' ' {
-                    i += 1;
-                }
-            } else {
-                wraps.push(false);
-            }
-            col = 0;
-            last_breakable = None;
-            continue;
-        }
-
-        col += cw;
-        i += 1;
-    }
-    wraps
 }
 
 fn is_code_wrap_continuation(line: &Line<'_>) -> bool {
@@ -439,33 +418,19 @@ pub fn inset_border(area: Rect) -> Rect {
     )
 }
 
-pub(crate) fn range_covers(
-    sel_start: DocPos,
-    sel_end: DocPos,
-    rect_top: u32,
-    rect_bottom_incl: u32,
-    rect_left: u16,
-    rect_right_incl: u16,
-) -> bool {
-    rect_top >= sel_start.row
-        && rect_bottom_incl <= sel_end.row
-        && (rect_top != sel_start.row || sel_start.col <= rect_left)
-        && (rect_bottom_incl != sel_end.row || sel_end.col >= rect_right_incl)
-}
-
 impl ScreenSelection {
+    /// Whether every cell of `area` is selected, so the caller can take its
+    /// text wholesale instead of walking rows.
     pub fn covers_rect(&self, area: Rect) -> bool {
         if area.width == 0 || area.height == 0 {
             return false;
         }
-        range_covers(
-            DocPos::new(self.start_row as u32, self.start_col),
-            DocPos::new(self.end_row as u32, self.end_col),
-            area.y as u32,
-            area.bottom().saturating_sub(1) as u32,
-            area.x,
-            area.x + area.width.saturating_sub(1),
-        )
+        let bottom = area.bottom() - 1;
+        let right = area.right() - 1;
+        area.y >= self.start_row
+            && bottom <= self.end_row
+            && (area.y != self.start_row || self.start_col <= area.x)
+            && (bottom != self.end_row || self.end_col >= right)
     }
 }
 
@@ -484,20 +449,27 @@ pub(crate) fn col_range(ss: &ScreenSelection, left: u16, right: u16, row: u16) -
     (col_start, col_end)
 }
 
+/// A selection carries the geometry of the frame it was dragged in, and by the
+/// time we read it back that frame can be smaller, after a resize or a split
+/// opening. Clipping once here is what lets the loops below index cells
+/// without testing every one.
+#[inline]
+fn clip(buf: &Buffer, area: Rect) -> Rect {
+    area.intersection(*buf.area())
+}
+
 /// Last column is the scrollbar, so we skip it.
 pub fn apply_highlight(buf: &mut Buffer, area: Rect, ss: &ScreenSelection) {
-    if area.width == 0 || area.height == 0 {
+    let area = clip(buf, area);
+    if area.is_empty() {
         return;
     }
     let row_start = ss.start_row.max(area.y);
     let row_end = ss.end_row.min(area.bottom().saturating_sub(1));
-    let right = area.x + area.width.saturating_sub(1);
+    let right = area.right().saturating_sub(1);
     for row in row_start..=row_end {
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         for col in col_start..=col_end {
-            if col >= buf.area().right() || row >= buf.area().bottom() {
-                continue;
-            }
             let cell = &mut buf[(col, row)];
             cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
         }
@@ -524,33 +496,45 @@ pub(crate) fn strip_code_bar_prefix(
     prefix_len
 }
 
+/// What [`append_rows`] hands to itself when one block of text is copied in
+/// several passes: whether anything was emitted yet, so a later pass does not
+/// mistake its first row for the start of the text, and the blank lines still
+/// held back in case content follows.
+#[derive(Default)]
+pub(crate) struct RowCarry {
+    started: bool,
+    pending_newlines: u16,
+}
+
 /// Trailing whitespace is trimmed per line. Consecutive blank lines are
 /// collapsed so we don't emit a wall of empty newlines.
 pub(crate) fn append_rows(
     buf: &Buffer,
     area: Rect,
     ss: &ScreenSelection,
-    from: u16,
-    to: u16,
+    rows: Range<u16>,
     out: &mut String,
     breaks: &LineBreaks,
+    carry: &mut RowCarry,
 ) {
-    if area.width == 0 || area.height == 0 {
+    let top = area.y;
+    let area = clip(buf, area);
+    if area.is_empty() {
         return;
     }
-    let right = area.x + area.width.saturating_sub(1);
-    let row_start = from.max(area.y);
-    let row_end = to.min(area.bottom());
-    let mut pending_newlines = 0u16;
-    let anchor = out.len();
+    let right = area.right().saturating_sub(1);
+    let row_start = rows.start.max(area.y);
+    let row_end = rows.end.min(area.bottom());
     for row in row_start..row_end {
-        let rel_row = row - area.y;
+        let rel_row = row - top;
         let is_new_line = breaks.is_line_start(rel_row);
 
         let (col_start, col_end) = col_range(ss, area.x, right, row);
         let line_start = out.len();
         // Wide chars (CJK, emoji) leave continuation cells with " "; skip them.
-        let mut skip_next: usize = if col_start > area.x {
+        // An empty column range copies nothing from this row, so there is no
+        // cell to its left worth measuring.
+        let mut skip_next: usize = if col_start > area.x && col_start <= col_end {
             UnicodeWidthStr::width(buf[(col_start - 1, row)].symbol()).saturating_sub(1)
         } else {
             0
@@ -575,16 +559,17 @@ pub(crate) fn append_rows(
         let trimmed_len = out[line_start..].trim_end().len() + line_start;
         out.truncate(trimmed_len);
         let has_content = out.len() > line_start;
-        let is_first_row = line_start == anchor;
+        let is_first_row = !carry.started;
+        carry.started |= has_content;
 
         if is_new_line {
             if !has_content && !is_first_row {
-                pending_newlines += 1;
+                carry.pending_newlines += 1;
             } else if !is_first_row {
-                for _ in 0..pending_newlines {
+                for _ in 0..carry.pending_newlines {
                     out.insert(line_start, '\n');
                 }
-                pending_newlines = 0;
+                carry.pending_newlines = 0;
                 out.insert(line_start, '\n');
             }
         } else if has_content && !is_first_row && stripped == 0 && breaks.needs_space(rel_row) {
@@ -627,10 +612,10 @@ pub fn extract_selected_text(
                 buf,
                 region.area,
                 ss,
-                row,
-                chunk_end,
+                row..chunk_end,
                 &mut out,
                 &region.line_breaks,
+                &mut RowCarry::default(),
             );
         }
         row = region_end;
@@ -642,15 +627,21 @@ pub fn extract_selected_text(
 mod tests {
     use super::*;
     use ratatui::style::Style;
+    use ratatui::text::Span;
     use test_case::test_case;
 
-    fn doc(row: u32, col: u16) -> DocPos {
-        DocPos::new(row, col)
+    fn doc(row: u16, col: u16) -> DocPos {
+        DocPos::flat(row, col)
+    }
+
+    fn seg_doc(seg: usize, row: u16, col: u16) -> DocPos {
+        DocPos { seg, row, col }
     }
 
     #[test_case(doc(0, 0), doc(5, 10), (doc(0, 0), doc(5, 10)) ; "forward_selection")]
     #[test_case(doc(5, 10), doc(0, 0), (doc(0, 0), doc(5, 10)) ; "backward_selection")]
     #[test_case(doc(3, 5), doc(3, 5), (doc(3, 5), doc(3, 5))   ; "same_point")]
+    #[test_case(seg_doc(1, 0, 0), doc(99, 99), (doc(99, 99), seg_doc(1, 0, 0)) ; "a_later_segment_outranks_any_row")]
     fn normalized(a: DocPos, c: DocPos, expected: (DocPos, DocPos)) {
         let sel = Selection {
             anchor: a,
@@ -798,24 +789,18 @@ mod tests {
         assert_eq!(text, "Status");
     }
 
-    #[test_case(Rect::new(0,3,80,20), 15, 5, 10, 22 ; "normal_offset")]
-    #[test_case(Rect::new(0,2,80,10), 15, 5,  0,  9 ; "clamped_below_area")]
-    #[test_case(Rect::new(0,5,80,10),  2, 5,  7,  7 ; "clamped_above_area")]
-    fn selection_start_doc_row(
-        area: Rect,
-        screen_row: u16,
-        screen_col: u16,
-        scroll: u32,
-        expected_row: u32,
-    ) {
-        let sel = Selection::start(
-            screen_row,
-            screen_col,
-            area,
-            SelectionZone::Messages,
-            scroll,
-        );
-        assert_eq!(sel.normalized().0.row, expected_row);
+    #[test_case(Rect::new(0,3,80,20), 15, 12 ; "inside_area")]
+    #[test_case(Rect::new(0,2,80,10), 15,  9 ; "clamped_below_area")]
+    #[test_case(Rect::new(0,5,80,10),  2,  0 ; "clamped_above_area")]
+    fn row_in_area_clamps(area: Rect, screen_row: u16, expected: u16) {
+        assert_eq!(row_in_area(screen_row, area), expected);
+    }
+
+    #[test_case(Rect::new(10,5,40,20), 200, 49 ; "past_right_edge")]
+    #[test_case(Rect::new(10,5,40,20),   0, 10 ; "past_left_edge")]
+    #[test_case(Rect::new(10,5,40,20),  20, 20 ; "inside_area")]
+    fn clamp_col_clamps(area: Rect, col: u16, expected: u16) {
+        assert_eq!(clamp_col(col, area), expected);
     }
 
     #[test_case(doc(5,2),  doc(8,10),  Rect::new(0,0,80,20),  0, Some(ss(5,2,8,10))    ; "fully_visible")]
@@ -834,7 +819,7 @@ mod tests {
         anchor: DocPos,
         cursor: DocPos,
         area: Rect,
-        scroll: u32,
+        scroll: u16,
         expected: Option<ScreenSelection>,
     ) {
         let sel = Selection {
@@ -843,27 +828,10 @@ mod tests {
             area,
             zone: SelectionZone::Messages,
         };
-        assert_eq!(sel.to_screen(scroll), expected);
-    }
-
-    #[test_case(Rect::new(0,2,80,20), 10, 5, 25, 5, 0, 19, 5 ; "clamp_row_to_bottom")]
-    #[test_case(Rect::new(5,0,40,20), 10,10, 10,50, 0, 10,44 ; "clamp_col_to_right")]
-    #[test_case(Rect::new(5,0,40,20), 10,10, 10, 2, 0, 10, 5 ; "clamp_col_to_left")]
-    #[allow(clippy::too_many_arguments)]
-    fn update_clamps(
-        area: Rect,
-        start_row: u16,
-        start_col: u16,
-        upd_row: u16,
-        upd_col: u16,
-        scroll: u32,
-        expected_row: u32,
-        expected_col: u16,
-    ) {
-        let mut sel = Selection::start(start_row, start_col, area, SelectionZone::Messages, 0);
-        sel.update(upd_row, upd_col, scroll);
-        assert_eq!(sel.cursor.row, expected_row);
-        assert_eq!(sel.cursor.col, expected_col);
+        assert_eq!(
+            sel.to_screen(|pos| RowPos::flat(pos, area, scroll)),
+            expected
+        );
     }
 
     fn code_bar_buffer() -> (Buffer, Rect) {
@@ -971,23 +939,17 @@ mod tests {
         assert_eq!(zones.zone_at(7, 5).unwrap().zone, SelectionZone::Messages);
     }
 
-    #[test_case(doc(0, 0), doc(2, 9), 0, 2, 0, 9, true  ; "exact_match")]
-    #[test_case(doc(0, 0), doc(5, 9), 1, 3, 0, 9, true  ; "selection_exceeds_rect")]
-    #[test_case(doc(0, 0), doc(2, 8), 0, 2, 0, 9, false ; "end_col_one_short")]
-    #[test_case(doc(0, 1), doc(2, 9), 0, 2, 0, 9, false ; "start_col_one_past")]
-    #[test_case(doc(1, 0), doc(2, 9), 0, 2, 0, 9, false ; "start_row_one_past")]
-    #[test_case(doc(0, 0), doc(1, 9), 0, 2, 0, 9, false ; "end_row_one_short")]
-    #[test_case(doc(5, 3), doc(5, 3), 5, 5, 3, 3, true  ; "single_cell")]
-    fn range_covers_cases(
-        sel_start: DocPos,
-        sel_end: DocPos,
-        rt: u32,
-        rb: u32,
-        rl: u16,
-        rr: u16,
-        expected: bool,
-    ) {
-        assert_eq!(range_covers(sel_start, sel_end, rt, rb, rl, rr), expected);
+    #[test_case(ss(0, 0, 2, 9), Rect::new(0, 0, 10, 3), true  ; "exact_match")]
+    #[test_case(ss(0, 0, 5, 9), Rect::new(0, 1, 10, 3), true  ; "selection_exceeds_rect")]
+    #[test_case(ss(0, 0, 2, 8), Rect::new(0, 0, 10, 3), false ; "end_col_one_short")]
+    #[test_case(ss(0, 1, 2, 9), Rect::new(0, 0, 10, 3), false ; "start_col_one_past")]
+    #[test_case(ss(1, 0, 2, 9), Rect::new(0, 0, 10, 3), false ; "start_row_one_past")]
+    #[test_case(ss(0, 0, 1, 9), Rect::new(0, 0, 10, 3), false ; "end_row_one_short")]
+    #[test_case(ss(5, 3, 5, 3), Rect::new(3, 5,  1, 1), true  ; "single_cell")]
+    #[test_case(ss(0, 0, 2, 9), Rect::new(0, 0,  0, 3), false ; "zero_width")]
+    #[test_case(ss(0, 0, 2, 9), Rect::new(0, 0, 10, 0), false ; "zero_height")]
+    fn covers_rect_cases(sel: ScreenSelection, area: Rect, expected: bool) {
+        assert_eq!(sel.covers_rect(area), expected);
     }
 
     #[test]
@@ -1023,23 +985,6 @@ mod tests {
         };
         let text = extract_selected_text(&buf, &ss(0, 0, 1, 19), &[region]);
         assert_eq!(text, "long_variable_name_here");
-    }
-
-    #[test]
-    fn selection_start_col_clamped() {
-        let area = Rect::new(10, 5, 40, 20);
-        let right = Selection::start(8, 200, area, SelectionZone::Messages, 0);
-        assert_eq!(right.normalized().0.col, 49, "clamped to area right edge");
-        let left = Selection::start(8, 0, area, SelectionZone::Messages, 0);
-        assert_eq!(left.normalized().0.col, 10, "clamped to area left edge");
-    }
-
-    #[test]
-    fn covers_rect_empty_area() {
-        let sel = ss(0, 0, 10, 10);
-        assert!(!sel.covers_rect(Rect::new(0, 0, 0, 5)));
-        assert!(!sel.covers_rect(Rect::new(0, 0, 5, 0)));
-        assert!(!sel.covers_rect(Rect::ZERO));
     }
 
     #[test]
@@ -1140,22 +1085,6 @@ mod tests {
         assert_eq!(wrap_extract(input, width), expected);
     }
 
-    fn cwt(input: &str, width: u16) -> Vec<bool> {
-        compute_wrap_types(&Line::from(input), width)
-    }
-
-    #[test_case("abcdef",        5, &[false]              ; "char_overflow")]
-    #[test_case("ab cd",         3, &[true]               ; "word_boundary")]
-    #[test_case("ab   cd",       4, &[true]               ; "multiple_consecutive_spaces")]
-    #[test_case("abcdefghij",    3, &[false, false, false] ; "long_word_multiple_wraps")]
-    #[test_case("hi worldaaaaaa",5, &[true, false, false]  ; "mixed_word_then_char")]
-    #[test_case("ab\tcd",        3, &[true]               ; "tab_as_breakpoint")]
-    #[test_case("漢字漢字",       3, &[false, false, false] ; "cjk_double_width_char_wrap")]
-    #[test_case("漢 字字",        3, &[true, false]          ; "cjk_with_space_word_wrap")]
-    fn cwt_cases(input: &str, width: u16, expected: &[bool]) {
-        assert_eq!(cwt(input, width), expected);
-    }
-
     #[test]
     fn from_lines_no_wrap_marks_each_line_as_start() {
         let lines = vec![Line::from("abc"), Line::from("def"), Line::from("ghi")];
@@ -1177,17 +1106,24 @@ mod tests {
         assert!(lb.needs_space(1), "word-boundary continuation needs space");
     }
 
-    #[test]
-    fn from_lines_code_wrap_continuation_skipped() {
-        let wrap_line = Line::from(vec![ratatui::text::Span::raw(CODE_BAR_WRAP)]);
-        let lines = vec![Line::from("first"), wrap_line, Line::from("second")];
-        let lb = LineBreaks::from_lines(&lines, 80);
-        assert!(lb.is_line_start(0));
-        assert!(
-            !lb.is_line_start(1),
-            "code wrap continuation is not a line start"
-        );
-        assert!(lb.is_line_start(2));
+    /// A code block wrapped for a wider terminal leaves continuation rows
+    /// behind. They belong to the line above, so they start no line of their
+    /// own, but they still have to be walked at their real height: assume one
+    /// row each and every later start bit slides off its row, which splices
+    /// newlines into the middle of copied prose.
+    #[test_case("" => vec![0, 2] ; "continuation_fits_one_row")]
+    #[test_case("abcdefghij" => vec![0, 3] ; "continuation_wraps_again")]
+    fn from_lines_skips_every_row_a_code_continuation_takes(tail: &str) -> Vec<u16> {
+        const WIDTH: u16 = 6;
+        let lines = vec![
+            Line::from("first"),
+            Line::from(vec![Span::raw(CODE_BAR_WRAP), Span::raw(tail)]),
+            Line::from("second"),
+        ];
+        let lb = LineBreaks::from_lines(&lines, WIDTH);
+        (0..wrap::total_rows(&lines, WIDTH))
+            .filter(|&row| lb.is_line_start(row))
+            .collect()
     }
 
     #[test]
@@ -1213,6 +1149,8 @@ mod tests {
 
     #[test_case(Rect::new(0, 0, 0, 5), Rect::new(0, 0, 1, 5), ss(0, 0, 4, 0), 0, 5 ; "zero_width")]
     #[test_case(Rect::new(0, 0, 10, 0), Rect::new(0, 0, 10, 1), ss(0, 0, 0, 9), 0, 1 ; "zero_height")]
+    #[test_case(Rect::new(0, 0, 40, 5), Rect::new(0, 0, 8, 5), ss(0, 20, 4, 30), 0, 5 ; "area_wider_than_buffer")]
+    #[test_case(Rect::new(0, 0, 40, 9), Rect::new(0, 0, 8, 2), ss(0, 39, 8, 39), 0, 9 ; "area_taller_than_buffer")]
     fn append_rows_degenerate_area_no_panic(
         area: Rect,
         buf_area: Rect,
@@ -1222,20 +1160,16 @@ mod tests {
     ) {
         let buf = Buffer::empty(buf_area);
         let mut out = String::new();
-        append_rows(&buf, area, &sel, from, to, &mut out, &LineBreaks::EveryRow);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn cwt_multi_span_line() {
-        use ratatui::text::Span;
-        let line = Line::from(vec![Span::raw("hello "), Span::raw("world")]);
-        let wraps = compute_wrap_types(&line, 6);
-        assert_eq!(
-            wraps,
-            vec![true],
-            "word wrap should work across span boundaries"
+        append_rows(
+            &buf,
+            area,
+            &sel,
+            from..to,
+            &mut out,
+            &LineBreaks::EveryRow,
+            &mut RowCarry::default(),
         );
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1258,7 +1192,6 @@ mod tests {
         assert!(!lb.is_line_start(5));
         assert!(lb.needs_space(5));
     }
-
     #[test]
     fn wrap_extract_two_lines_first_wraps_second_doesnt() {
         use ratatui::widgets::{Paragraph, Widget, Wrap};
@@ -1295,10 +1228,10 @@ mod tests {
             &buf,
             area,
             &ss(0, 1, 0, 3),
-            0,
-            1,
+            0..1,
             &mut out,
             &LineBreaks::EveryRow,
+            &mut RowCarry::default(),
         );
         assert_eq!(out, "好");
     }

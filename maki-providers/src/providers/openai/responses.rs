@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
@@ -7,15 +9,20 @@ use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::providers::ResolvedAuth;
+use crate::model::Model;
+use crate::providers::openai_compat::tool_parameters;
+use crate::providers::{ResolvedAuth, sse_error_status};
+use crate::types::EffortDialect;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
+    ThinkingConfig, TokenUsage, dialect,
 };
 
 const RESPONSES_PATH: &str = "/responses";
+const FAILED_RESPONSE_STATUS: u16 = 500;
 
 pub(crate) fn build_body(
-    model: &crate::model::Model,
+    model: &Model,
     messages: &[Message],
     system: &str,
     tools: &Value,
@@ -34,6 +41,21 @@ pub(crate) fn build_body(
         body["tools"] = wire_tools;
     }
     body
+}
+
+pub(crate) fn apply_responses_reasoning(
+    body: &mut Value,
+    thinking: ThinkingConfig,
+    model: &Model,
+    dialect: &EffortDialect,
+) {
+    if let Some(effort) = thinking.effort_str(dialect, model) {
+        let mut reasoning = json!({ "effort": effort });
+        if effort != dialect::OFF {
+            reasoning["summary"] = json!("auto");
+        }
+        body["reasoning"] = reasoning;
+    }
 }
 
 pub(crate) fn convert_input(messages: &[Message]) -> Value {
@@ -131,12 +153,41 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
                     "type": "function",
                     "name": t.get("name")?,
                     "description": t.get("description")?,
-                    "parameters": t.get("input_schema")?,
+                    "parameters": tool_parameters(t),
                     "strict": false,
                 }))
             })
             .collect(),
     )
+}
+
+static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
+    SUMMARY_REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn summary_rejected(base: &str) -> bool {
+    init_summary_rejected().lock().unwrap().contains(base)
+}
+
+fn reject_summary(base: &str) {
+    init_summary_rejected()
+        .lock()
+        .unwrap()
+        .insert(base.to_owned());
+}
+
+fn has_summary(body: &Value) -> bool {
+    body.get("reasoning")
+        .and_then(|reasoning| reasoning.get("summary"))
+        .is_some()
+}
+
+fn strip_summary(body: &mut Value) {
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.remove("summary");
+    }
 }
 
 pub(crate) async fn do_stream(
@@ -150,6 +201,31 @@ pub(crate) async fn do_stream(
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
     })?;
+    let mut body = Cow::Borrowed(body);
+    if summary_rejected(base) && has_summary(&body) {
+        strip_summary(body.to_mut());
+    }
+    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    match result {
+        Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
+            reject_summary(base);
+            strip_summary(body.to_mut());
+            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_responses(
+    client: &HttpClient,
+    model: &crate::model::Model,
+    body: &Value,
+    event_tx: &Sender<ProviderEvent>,
+    auth: &ResolvedAuth,
+    base: &str,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
     let request = auth
@@ -229,10 +305,7 @@ pub(crate) async fn parse_sse(
                 .as_str()
                 .unwrap_or("unknown error")
                 .to_string();
-            return Err(AgentError::Api {
-                status: 500,
-                message,
-            });
+            return Err(AgentError::api(500, message));
         }
 
         let parsed_event = if current_event.is_empty() {
@@ -464,19 +537,16 @@ pub(crate) async fn parse_sse(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let resp = &parsed["response"];
-                let error = &resp["error"];
+                let error = &parsed["response"]["error"];
                 let message = error["message"]
                     .as_str()
                     .unwrap_or("response generation failed")
                     .to_string();
-                let code = error["code"].as_str().unwrap_or("server_error");
-                let status = match code {
-                    "rate_limit_exceeded" => 429,
-                    "server_error" => 500,
-                    _ => 500,
-                };
-                return Err(AgentError::Api { status, message });
+                let status = error["code"]
+                    .as_str()
+                    .and_then(sse_error_status)
+                    .unwrap_or(FAILED_RESPONSE_STATUS);
+                return Err(AgentError::api(status, message));
             }
 
             _ => {}
@@ -534,6 +604,7 @@ fn parse_usage(u: &Value) -> TokenUsage {
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
+        cost: None,
     }
 }
 
@@ -542,8 +613,47 @@ mod tests {
     use super::*;
     use futures_lite::io::Cursor;
     use serde_json::json;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
+    const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
+    const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+
+    #[test]
+    fn strip_summary_keeps_effort() {
+        let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        assert!(has_summary(&body));
+        strip_summary(&mut body);
+        assert!(!has_summary(&body));
+        assert_eq!(body, json!({"reasoning": {"effort": "high"}}));
+    }
+
+    #[test]
+    fn summary_memo_records_rejection_once() {
+        let base = "https://summary-memo.test/v1";
+        assert!(!summary_rejected(base));
+        reject_summary(base);
+        assert!(summary_rejected(base));
+    }
+
+    #[test]
+    fn convert_tools_defaults_missing_parameters() {
+        let tools = json!([{ "name": TOOL_NAME, "description": TOOL_DESCRIPTION }]);
+        let converted = convert_tools(&tools);
+        assert_eq!(
+            converted[0]["name"],
+            json!(TOOL_NAME),
+            "{TOOL_MUST_SURVIVE}"
+        );
+        assert_eq!(
+            converted[0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
@@ -629,41 +739,43 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
         })
     }
 
-    #[test]
-    fn parse_sse_error_event() {
+    // Codex hides an overload in `code` on an otherwise healthy 200 stream, so these tags are what
+    // decide between backing off and giving up: https://github.com/tontinton/maki/issues/777
+    #[test_case("service_unavailable_error", "server_is_overloaded", OVERLOAD_MESSAGE, 529, true ; "codex_overload")]
+    #[test_case("overloaded_error", "", OVERLOAD_MESSAGE, 529, true                              ; "overload_without_code")]
+    #[test_case("invalid_request_error", "invalid_value", BAD_REQUEST_MESSAGE, 400, false        ; "bad_request")]
+    fn parse_sse_error_event(
+        error_type: &str,
+        code: &str,
+        message: &str,
+        status: u16,
+        retryable: bool,
+    ) {
         smol::block_on(async {
-            let sse = "\
-event: error\n\
-data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n\
-\n";
+            let data = json!({
+                "type": "error",
+                "error": { "type": error_type, "code": code, "message": message },
+            });
 
-            let (err, _) = run_sse(sse).await;
-            match err.unwrap_err() {
-                AgentError::Api { status, message } => {
-                    assert_eq!(status, 529);
-                    assert_eq!(message, "Server overloaded");
-                }
-                other => panic!("expected Api error, got: {other:?}"),
-            }
+            let (result, _) = run_sse(&format!("event: error\ndata: {data}\n\n")).await;
+            let err = result.unwrap_err();
+            assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+            assert_eq!(err.is_retryable(), retryable);
         })
     }
 
-    #[test]
-    fn parse_sse_response_failed() {
+    #[test_case("rate_limit_exceeded", RATE_LIMIT_MESSAGE, 429 ; "rate_limit")]
+    #[test_case("server_is_overloaded", OVERLOAD_MESSAGE, 529  ; "overload")]
+    fn parse_sse_response_failed(code: &str, message: &str, status: u16) {
         smol::block_on(async {
-            let sse = "\
-event: response.failed\n\
-data: {\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit hit\"}}}\n\
-\n";
+            let data = json!({
+                "response": { "error": { "code": code, "message": message } },
+            });
 
-            let (err, _) = run_sse(sse).await;
-            match err.unwrap_err() {
-                AgentError::Api { status, message } => {
-                    assert_eq!(status, 429);
-                    assert_eq!(message, "Rate limit hit");
-                }
-                other => panic!("expected Api error, got: {other:?}"),
-            }
+            let (result, _) = run_sse(&format!("event: response.failed\ndata: {data}\n\n")).await;
+            let err = result.unwrap_err();
+            assert_eq!(err.to_string(), format!("API error ({status}): {message}"));
+            assert!(err.is_retryable());
         })
     }
 

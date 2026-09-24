@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -9,14 +9,16 @@ use ratatui::text::{Line, Span};
 use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::model_registry;
-use maki_providers::provider::ProviderKind;
+use maki_providers::spec::ProviderRegistry;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::repaint::{Cadence, Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
+const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
 
 fn footer_line() -> Line<'static> {
@@ -36,14 +38,13 @@ fn footer_line() -> Line<'static> {
 }
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
-    let digit = match (key.code, key.modifiers.contains(KeyModifiers::SHIFT)) {
-        // Kitty protocol: Shift+digit reported with base key + SHIFT modifier
-        (KeyCode::Char(c @ '1'..='4'), true) => c,
-        // Legacy terminals: Shift+digit reported as the resulting character
-        (KeyCode::Char('!' | '¡'), false) => '1', // US, ES
-        (KeyCode::Char('@' | '"' | '™'), false) => '2', // US, UK/DE
-        (KeyCode::Char('#' | '§' | '£'), false) => '3', // US, DE, UK
-        (KeyCode::Char('$' | '€' | '¤'), false) => '4', // US, EU, Nordic
+    // Shift+digit arrives as the character it types, with the SHIFT bit
+    // already folded into it by key normalization.
+    let digit = match key.code {
+        KeyCode::Char('!' | '¡') => '1',       // US, ES
+        KeyCode::Char('@' | '"' | '™') => '2', // US, UK/DE
+        KeyCode::Char('#' | '§' | '£') => '3', // US, DE, UK
+        KeyCode::Char('$' | '€' | '¤') => '4', // US, EU, Nordic
         _ => return None,
     };
     match digit {
@@ -70,6 +71,7 @@ struct ModelEntry {
     suffix: Option<String>,
     tier: String,
     override_tiers: Vec<ModelTier>,
+    free: bool,
 }
 
 impl PickerItem for ModelEntry {
@@ -97,10 +99,10 @@ impl PickerItem for ModelEntry {
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
     models: Arc<ArcSwapOption<Vec<String>>>,
+    available: Watch<Vec<String>>,
     recents: Vec<String>,
     current_spec: String,
-    last_spec_count: usize,
-    dirty: bool,
+    needs_rebuild: bool,
     /// User-moved entry to restore on refresh: `(was_recent, spec)`.
     anchor: Option<(bool, String)>,
 }
@@ -110,39 +112,42 @@ impl ModelPicker {
         Self {
             picker: ListPicker::new().with_footer_builder(footer_line),
             models,
+            available: Watch::default(),
             recents: Vec::new(),
             current_spec: String::new(),
-            last_spec_count: 0,
-            dirty: false,
+            needs_rebuild: false,
             anchor: None,
         }
     }
 
     pub fn set_recents(&mut self, recents: Vec<String>) {
         self.recents = recents;
-        self.dirty = true;
+        self.needs_rebuild = true;
     }
 
     pub fn open(&mut self, current_spec: &str) {
         self.current_spec = current_spec.to_owned();
         self.anchor = None;
-        self.dirty = false;
+        self.needs_rebuild = false;
+        let _ = self.available.poll(self.models.load_full());
         let entries = self.load_entries();
         self.picker.open(entries, TITLE);
         self.preselect_current_model();
     }
 
-    fn try_refresh(&mut self) {
+    /// Providers fetch their model lists in the background and drop them into
+    /// a shared slot, which wakes nothing. An open picker has to notice on its
+    /// own, so `App::tick` polls this instead of [`Self::view`] reading the
+    /// slot mid render.
+    pub fn refresh(&mut self) -> Dirty {
         if !self.picker.is_open() {
-            return;
+            return Dirty::NO;
         }
-        let guard = self.models.load();
-        let spec_count = guard.as_deref().map_or(0, Vec::len);
-        if spec_count == self.last_spec_count && !self.dirty {
-            return;
+        let arrived = self.available.poll(self.models.load_full());
+        if arrived == Dirty::NO && !self.needs_rebuild {
+            return Dirty::NO;
         }
-        drop(guard);
-        self.dirty = false;
+        self.needs_rebuild = false;
         let entries = self.load_entries();
         self.picker.replace_items(entries);
         if let Some((was_recent, spec)) = &self.anchor {
@@ -151,12 +156,11 @@ impl ModelPicker {
         } else {
             self.preselect_current_model();
         }
+        Dirty::YES
     }
 
-    fn load_entries(&mut self) -> Vec<ModelEntry> {
-        let guard = self.models.load();
-        let specs = guard.as_deref();
-        self.last_spec_count = specs.map_or(0, Vec::len);
+    fn load_entries(&self) -> Vec<ModelEntry> {
+        let specs = self.available.get();
         let mut entries = Vec::new();
         for spec in &self.recents {
             if let Some(mut e) = parse_model_entry(spec) {
@@ -171,6 +175,7 @@ impl ModelPicker {
         full.sort_by(|a, b| {
             a.provider_display
                 .cmp(&b.provider_display)
+                .then_with(|| b.free.cmp(&a.free))
                 .then_with(|| a.id.cmp(&b.id))
         });
         entries.extend(full);
@@ -229,7 +234,7 @@ impl ModelPicker {
             && let Some(entry) = self.picker.selected_item()
         {
             let spec = entry.spec.clone();
-            self.dirty = true;
+            self.needs_rebuild = true;
             if entry.override_tiers.contains(&tier) {
                 ModelPickerAction::UnassignTier(spec, tier)
             } else {
@@ -246,7 +251,6 @@ impl ModelPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        self.try_refresh();
         self.picker.view(frame, area)
     }
 }
@@ -259,24 +263,31 @@ impl Overlay for ModelPicker {
     fn close(&mut self) {
         self.close()
     }
+
+    fn cadence(&self) -> Cadence {
+        self.picker.cadence()
+    }
 }
 
 fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
-    let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
-        kind.display_name().to_string()
-    } else if let Some(name) = dynamic::display_name(provider_str) {
-        name.to_string()
-    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-        info.display_name.clone()
-    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
-        builtin.display_name.to_string()
-    } else {
-        let config = maki_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
-        maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
-    };
+    // `opencode-go` has a spec row but was never a `ProviderKind`, so the
+    // catalog named it and still should. That is what `is_native` filters for.
+    let provider_display =
+        if let Some(spec) = ProviderRegistry::get(provider_str).filter(|s| s.is_native()) {
+            spec.display_name.to_string()
+        } else if let Some(name) = dynamic::display_name(provider_str) {
+            name.to_string()
+        } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
+            info.display_name.clone()
+        } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
+            builtin.display_name.to_string()
+        } else {
+            let config = maki_config::providers::ProvidersConfig::load();
+            config.get(provider_str)?;
+            maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
+        };
 
     let override_tiers = model_registry::override_tiers(spec);
     let (tier, free) = match maki_providers::Model::from_spec(spec) {
@@ -292,10 +303,10 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
             .collect::<Vec<_>>()
             .join("/")
     };
-    let tier = if free {
-        format!("{FREE_PREFIX}{tier}")
-    } else {
-        tier
+    let tier = match (free, tier.is_empty()) {
+        (true, true) => FREE_LABEL.to_string(),
+        (true, false) => format!("{FREE_PREFIX}{tier}"),
+        (false, _) => tier,
     };
     let id = model_id.to_string();
     Some(ModelEntry {
@@ -305,6 +316,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         suffix: None,
         tier,
         override_tiers,
+        free,
     })
 }
 
@@ -313,8 +325,35 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent};
+    use maki_providers::ModelInfo;
+    use maki_providers::ModelPricing;
     use test_case::test_case;
+
+    const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
+    const SWAPPED_SPEC: &str = "zai/glm-5";
+
+    /// A provider that republishes the same number of specs has still changed
+    /// the list. Comparing lengths calls that no change, and the picker goes on
+    /// offering models that are gone.
+    #[test]
+    fn a_same_sized_model_list_owes_a_frame() {
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ])));
+        let mut p = ModelPicker::new(Arc::clone(&models));
+        p.open("");
+        assert_eq!(p.refresh(), Dirty::NO);
+
+        models.store(Some(Arc::new(vec![SWAPPED_SPEC.into()])));
+        assert_eq!(p.refresh(), Dirty::YES, "{SAME_SIZED_LIST}");
+        assert_eq!(
+            p.picker.selected_item().map(|e| e.spec.as_str()),
+            Some(SWAPPED_SPEC),
+            "{SAME_SIZED_LIST}"
+        );
+    }
 
     fn test_models() -> Arc<ArcSwapOption<Vec<String>>> {
         let models = Arc::new(ArcSwapOption::empty());
@@ -352,7 +391,7 @@ mod tests {
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
         ])));
-        p.try_refresh();
+        let _ = p.refresh();
 
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
@@ -396,8 +435,6 @@ mod tests {
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
     #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "legacy_dollar_compaction")]
     #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "legacy_euro_compaction")]
-    #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
-    #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -421,7 +458,7 @@ mod tests {
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
         ])));
-        p.try_refresh();
+        let _ = p.refresh();
 
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
@@ -498,7 +535,7 @@ mod tests {
         p.handle_key(key(KeyCode::Down));
         p.handle_key(key(KeyCode::Char('!')));
 
-        p.try_refresh();
+        let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
         assert_eq!(entry.spec, "zai/glm-5");
@@ -520,7 +557,7 @@ mod tests {
         p.open("anthropic/claude-sonnet-4-20250514");
 
         models.store(None);
-        p.try_refresh();
+        let _ = p.refresh();
         let entry = p.picker.selected_item().expect("selection during collapse");
         assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(entry.section(), Some("Recent"));
@@ -530,7 +567,7 @@ mod tests {
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
         ])));
-        p.try_refresh();
+        let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after arrival");
         assert_eq!(entry.spec, "anthropic/claude-sonnet-4-20250514");
@@ -551,7 +588,7 @@ mod tests {
         ]);
         p.open("anthropic/claude-sonnet-4-20250514");
         models.store(None);
-        p.try_refresh();
+        let _ = p.refresh();
         p.handle_key(key(KeyCode::Down));
 
         models.store(Some(Arc::new(vec![
@@ -559,7 +596,7 @@ mod tests {
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
         ])));
-        p.try_refresh();
+        let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after arrival");
         assert_eq!(entry.spec, "zai/glm-5");
@@ -584,16 +621,72 @@ mod tests {
         p.handle_key(key(KeyCode::Char('m')));
 
         models.store(None);
-        p.try_refresh();
+        let _ = p.refresh();
         models.store(Some(Arc::new(vec![
             "anthropic/claude-sonnet-4-20250514".into(),
             "anthropic/claude-opus-4-6-20260101".into(),
             "zai/glm-5".into(),
         ])));
-        p.try_refresh();
+        let _ = p.refresh();
 
         let entry = p.picker.selected_item().expect("selection after refresh");
         assert_eq!(entry.spec, "zai/glm-5");
         assert_eq!(entry.section(), Some("Z.AI"));
+    }
+
+    fn discovered(id: &str, pricing: ModelPricing) -> ModelInfo {
+        ModelInfo {
+            pricing: Some(pricing),
+            ..ModelInfo::id_only(id.into())
+        }
+    }
+
+    const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
+    const PAID_ID: &str = "vendor/paid-model";
+    const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
+
+    fn register_openrouter_models() {
+        model_registry::set_known_models(
+            "openrouter",
+            vec![
+                discovered("stealth/ox-alpha", ModelPricing::ZERO),
+                discovered(PAID_ID, PAID_PRICING),
+            ],
+        );
+    }
+
+    #[test]
+    fn zero_priced_discovery_marks_entry_free() {
+        register_openrouter_models();
+        let entry = parse_model_entry(OX_SPEC).unwrap();
+        assert!(
+            entry.tier.starts_with(FREE_PREFIX),
+            "zero-priced discovery must mark the entry free"
+        );
+    }
+
+    #[test]
+    fn paid_discovery_not_marked_free() {
+        register_openrouter_models();
+        let entry = parse_model_entry(&format!("openrouter/{PAID_ID}")).unwrap();
+        assert!(
+            !entry.tier.starts_with(FREE_PREFIX),
+            "paid discovery must not mark the entry free"
+        );
+    }
+
+    #[test]
+    fn free_models_sort_before_paid_within_a_provider() {
+        register_openrouter_models();
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(vec![
+            format!("openrouter/{PAID_ID}"),
+            OX_SPEC.into(),
+        ])));
+        let mut p = ModelPicker::new(models);
+        p.open("");
+        let entries = p.load_entries();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["stealth/ox-alpha", PAID_ID]);
     }
 }
