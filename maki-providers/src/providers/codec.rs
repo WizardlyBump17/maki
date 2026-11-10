@@ -1,0 +1,957 @@
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use flume::Sender;
+use reqwest::header::{
+    CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
+};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Map, Value, json};
+use tracing::warn;
+
+use maki_config::providers::{Protocol, ProvidersConfig, configured_base_url};
+use maki_storage::id::SessionRef;
+
+use super::custom::{self, THINKING_FIELD};
+use super::openai::responses;
+use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
+use super::{KeyRotation, ResolvedAuth, Timeouts};
+use crate::model::{Model, ModelInfo, ThinkingSupport};
+use crate::model_registry;
+use crate::provider::{BoxFuture, Provider};
+use crate::spec::ProviderSpec;
+use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
+use crate::{
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig,
+};
+
+/// Where effort goes when a declaration names a dialect and no field: the
+/// openai chat API's own spelling.
+const DEFAULT_EFFORT_FIELD: &str = "reasoning_effort";
+const EFFORT_PATH_SEPARATOR: char = '.';
+/// Framing the HTTP client owns. A declared one would contradict the request
+/// actually sent, or smuggle a second one into it.
+const TRANSPORT_HEADERS: [HeaderName; 4] = [HOST, CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION];
+
+/// Gateways and models that refused the default `thinking` block. It lives in
+/// a static because providers get rebuilt, on a model switch for example, and
+/// each new one would pay for the refusal again. Nothing is saved to disk, so a
+/// gateway that learns the field gets it back after a restart.
+static THINKING_REJECTED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+/// Why a declaration's openai wire options did not parse. Raised while the
+/// declaration decodes, so a bad one fails the plugin that wrote it rather
+/// than a request.
+#[derive(Debug, thiserror::Error)]
+pub enum WireError {
+    #[error("'{0}' is not a valid header name")]
+    HeaderName(String),
+    #[error("header '{0}' is framing the HTTP client sets, and cannot be declared")]
+    TransportHeader(String),
+    #[error("header '{0}' must have a value of visible ASCII")]
+    HeaderValue(String),
+    #[error("header '{0}' is declared twice")]
+    DuplicateHeader(String),
+    #[error("effort field '{0}' must be a dotted path of non-empty keys, e.g. `reasoning.effort`")]
+    EffortField(String),
+    #[error("unknown thinking dialect '{name}' (expected one of {expected})")]
+    UnknownDialect { name: String, expected: String },
+}
+
+/// What the openai codec lets a declaration say about its wire, as one value
+/// that travels unchanged from the Lua table through the declaration and
+/// [`CodecOptions`] to [`CompatProvider`]. Nothing copies it field by field,
+/// so an option cannot exist in one of those layers and be missing in the
+/// next. [`Self::apply_body`] and [`Self::request_headers`] take it apart
+/// without `..`, so a field added here fails to compile until it is applied.
+#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenAiWire {
+    /// `None` is [`DEFAULT_MAX_TOKENS_FIELD`].
+    pub max_tokens_field: Option<String>,
+    /// `None` asks for `stream_options.include_usage`, which every openai
+    /// endpoint worth billing for supports.
+    pub include_stream_usage: Option<bool>,
+    /// Read `usage.cost` from the stream as the turn's USD bill.
+    pub usage_cost: bool,
+    /// How this provider's API spells reasoning effort. Stating it replaces
+    /// the generic thinking pass, see [`Self::apply_body`].
+    pub thinking: Option<ThinkingWire>,
+    /// Sent with every request, below anything the auth layer set (see
+    /// [`OpenAiCompatProvider::do_stream`]).
+    #[serde(
+        serialize_with = "serialize_headers",
+        deserialize_with = "deserialize_headers"
+    )]
+    pub headers: HeaderMap,
+    /// Merged into every request body before the thinking pass.
+    pub extra_body: Option<Map<String, Value>>,
+    /// Model id prefix to what the model can do about thinking, for a
+    /// provider whose API knows better than the model table.
+    pub thinking_overrides: BTreeMap<String, ThinkingSupport>,
+}
+
+/// The effort half of [`OpenAiWire`]. Its own table, because `field` and
+/// `requires_support` mean nothing without a dialect to render.
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThinkingWire {
+    #[serde(
+        serialize_with = "serialize_dialect",
+        deserialize_with = "deserialize_dialect"
+    )]
+    pub dialect: &'static EffortDialect<'static>,
+    #[serde(default)]
+    pub field: EffortField,
+    /// Send effort only to a model that supports thinking, for an API that
+    /// rejects the field on any other.
+    #[serde(default)]
+    pub requires_support: bool,
+}
+
+/// Where the rendered effort lands in the body, as the dotted path a
+/// declaration writes: `reasoning.effort` nests, `reasoning_effort` does not.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffortField(Box<[String]>);
+
+/// Where the session id rides, for a provider that routes a session to the
+/// same backend or keys its cache by it: headers, a body field, or both.
+/// Shared by declarations and native providers, so every provider stamps the
+/// id the same way. `Cow` so a native one is a `const`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionCarrier {
+    #[serde(
+        skip_serializing_if = "<[_]>::is_empty",
+        deserialize_with = "deserialize_session_headers"
+    )]
+    pub headers: Cow<'static, [Cow<'static, str>]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_field: Option<Cow<'static, str>>,
+}
+
+impl SessionCarrier {
+    /// Body last of the provider's own passes, so a thinking pass or an
+    /// extra body naming the same key loses to the session.
+    pub(crate) fn apply(&self, session: &SessionRef, body: &mut Value, auth: &mut ResolvedAuth) {
+        if let (Some(field), Some(object)) = (&self.body_field, body.as_object_mut()) {
+            object.insert(field.to_string(), json!(session.as_str()));
+        }
+        self.apply_headers(session, auth);
+    }
+
+    /// Set rather than appended, so a request carries each header once even
+    /// when the auth layer already named it.
+    pub(crate) fn apply_headers(&self, session: &SessionRef, auth: &mut ResolvedAuth) {
+        for name in self.headers.iter() {
+            auth.set_header(name, session.as_str().to_owned());
+        }
+    }
+}
+
+/// One request, as every pass after the codec's own body sees it. Built once
+/// per request, so the thinking pass and the body hook cannot disagree about
+/// the model they are looking at.
+pub struct RequestCtx<'a> {
+    pub model: &'a Model,
+    pub opts: RequestOptions,
+    /// What discovery reported for this model under this slug, looked up once
+    /// here rather than by each pass that needs it.
+    pub discovered: Option<ModelInfo>,
+}
+
+impl OpenAiWire {
+    /// Everything this declaration adds to a body the codec built. The static
+    /// fragment goes in first, so a thinking pass that writes the same key
+    /// has the last word.
+    pub(crate) fn apply_body(&self, body: &mut Value, ctx: &RequestCtx) {
+        let Self {
+            max_tokens_field: _,
+            include_stream_usage: _,
+            usage_cost: _,
+            thinking,
+            headers: _,
+            extra_body,
+            thinking_overrides: _,
+        } = self;
+        if let (Some(extra), Some(object)) = (extra_body, body.as_object_mut()) {
+            merge_body(object, extra);
+        }
+        // One or the other, never both: a declared dialect is the provider
+        // saying how its own API spells effort, a different question from what
+        // the model said about itself, so it skips the `thinking_fields` merge.
+        match thinking {
+            Some(thinking) => thinking.apply(body, ctx),
+            None => ctx
+                .opts
+                .thinking
+                .apply_thinking(body, ctx.model, ThinkingFallback::None),
+        }
+    }
+
+    /// The static headers this declaration sends, under their canonical names.
+    pub(crate) fn request_headers(&self) -> Vec<(&str, &str)> {
+        let Self {
+            max_tokens_field: _,
+            include_stream_usage: _,
+            usage_cost: _,
+            thinking: _,
+            headers,
+            extra_body: _,
+            thinking_overrides: _,
+        } = self;
+        headers
+            .iter()
+            .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)))
+            .collect()
+    }
+
+    /// Applied after everything else that shapes the model, so the provider's
+    /// word on thinking is the one that stands.
+    pub(crate) fn adjust_model(&self, model: &mut Model) {
+        if let Some(support) = self.thinking_override(&model.id) {
+            model.thinking_override = Some(support);
+        }
+    }
+
+    /// The longest matching prefix wins, as it does for a model table row
+    /// (see [`crate::model::lookup_entry`]).
+    fn thinking_override(&self, model_id: &str) -> Option<ThinkingSupport> {
+        self.thinking_overrides
+            .iter()
+            .filter(|(prefix, _)| model_id.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, support)| *support)
+    }
+}
+
+impl ThinkingWire {
+    fn dialect_for<'a>(&'a self, discovered: Option<&'a ModelInfo>) -> EffortDialect<'a> {
+        match discovered.and_then(|row| row.effort.as_ref()) {
+            Some(effort) => effort.refine(self.dialect),
+            None => self.dialect.clone(),
+        }
+    }
+
+    pub(crate) fn sends(
+        &self,
+        discovered: Option<&ModelInfo>,
+        choice: ThinkingConfig,
+    ) -> ThinkingConfig {
+        self.dialect_for(discovered).sends(choice)
+    }
+
+    /// The declared dialect, narrowed by what discovery listed for the model,
+    /// renders the effort: one snap, against the levels the model accepts.
+    fn apply(&self, body: &mut Value, ctx: &RequestCtx) {
+        if self.requires_support && !ctx.model.supports_thinking() {
+            return;
+        }
+        let dialect = self.dialect_for(ctx.discovered.as_ref());
+        if let Some(effort) = ctx.opts.thinking.effort_str(&dialect, ctx.model)
+            && let Some(object) = body.as_object_mut()
+        {
+            self.field.write(object, effort);
+        }
+    }
+}
+
+impl EffortField {
+    pub(crate) fn parse(path: &str) -> Result<Self, WireError> {
+        let keys: Box<[String]> = path
+            .split(EFFORT_PATH_SEPARATOR)
+            .map(str::to_owned)
+            .collect();
+        if keys.iter().any(String::is_empty) {
+            return Err(WireError::EffortField(path.to_owned()));
+        }
+        Ok(Self(keys))
+    }
+
+    /// Merged rather than assigned, so a sibling the body already holds under
+    /// the same parent survives.
+    fn write(&self, body: &mut Map<String, Value>, effort: &str) {
+        let Some((outermost, nested)) = self.0.split_first() else {
+            return;
+        };
+        let value = nested.iter().rev().fold(Value::from(effort), |value, key| {
+            Value::Object(Map::from_iter([(key.clone(), value)]))
+        });
+        merge_body(body, &Map::from_iter([(outermost.clone(), value)]));
+    }
+}
+
+impl Default for EffortField {
+    fn default() -> Self {
+        Self(Box::new([DEFAULT_EFFORT_FIELD.to_owned()]))
+    }
+}
+
+impl Serialize for EffortField {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.join(&EFFORT_PATH_SEPARATOR.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for EffortField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::parse(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// Dumped as the dialect's name, so the table stays the one source of truth
+/// for what a dialect is and a declaration never carries the name twice.
+fn serialize_dialect<S: Serializer>(
+    dialect: &&'static EffortDialect<'static>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    dialect::name_of(dialect).serialize(serializer)
+}
+
+fn deserialize_dialect<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<&'static EffortDialect<'static>, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    dialect::by_name(&name).ok_or_else(|| {
+        D::Error::custom(WireError::UnknownDialect {
+            expected: dialect::NAMES.join(", "),
+            name,
+        })
+    })
+}
+
+fn declared_header_name(name: &str) -> Result<HeaderName, WireError> {
+    let parsed = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| WireError::HeaderName(name.to_owned()))?;
+    if TRANSPORT_HEADERS.contains(&parsed) {
+        return Err(WireError::TransportHeader(name.to_owned()));
+    }
+    Ok(parsed)
+}
+
+/// Visible ASCII only, so every value [`OpenAiWire::request_headers`] hands on
+/// renders as text.
+fn declared_headers(declared: BTreeMap<String, String>) -> Result<HeaderMap, WireError> {
+    let mut headers = HeaderMap::with_capacity(declared.len());
+    for (name, value) in declared {
+        let parsed = declared_header_name(&name)?;
+        let value = HeaderValue::from_str(&value)
+            .ok()
+            .filter(|value| value.to_str().is_ok())
+            .ok_or_else(|| WireError::HeaderValue(name.clone()))?;
+        if headers.insert(parsed, value).is_some() {
+            return Err(WireError::DuplicateHeader(name));
+        }
+    }
+    Ok(headers)
+}
+
+fn serialize_headers<S: Serializer>(headers: &HeaderMap, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), String::from_utf8_lossy(value.as_bytes()))),
+    )
+}
+
+fn deserialize_headers<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HeaderMap, D::Error> {
+    declared_headers(BTreeMap::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+/// Validated like a declared header and kept in canonical lowercase, so
+/// [`SessionCarrier::apply_headers`] matches the auth layer's own names.
+fn deserialize_session_headers<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Cow<'static, [Cow<'static, str>]>, D::Error> {
+    Vec::<String>::deserialize(deserializer)?
+        .iter()
+        .map(|name| {
+            declared_header_name(name)
+                .map(|parsed| Cow::Owned(parsed.as_str().to_owned()))
+                .map_err(D::Error::custom)
+        })
+        .collect()
+}
+
+/// Everything a provider declaration tells the codec about its wire: what an
+/// [`OpenAiCompatConfig`] is made of, plus what a declaration adds on top of
+/// the protocol. Passed whole so a new option is one more field here rather
+/// than one more argument at every call site.
+///
+/// `Cow` throughout because the fields land in an [`OpenAiCompatConfig`],
+/// which the native providers fill with `&'static str`.
+pub struct CodecOptions {
+    pub protocol: Protocol,
+    /// Never empty: it is the key
+    /// [`maki_config::providers::configured_base_url`] looks the user's
+    /// `<SLUG>_BASE_URL` and `providers.toml` origin up under.
+    pub slug: Cow<'static, str>,
+    pub api_key_env: Cow<'static, str>,
+    /// The origin the declaration itself names, and the weakest of the three
+    /// (see [`OpenAiCompatProvider::base_url`]): the user's env var and
+    /// `providers.toml` beat it, and an origin a hook resolved beats those.
+    pub base_url: Cow<'static, str>,
+    /// A log label, the slug by default.
+    pub provider_name: Cow<'static, str>,
+    pub system_prefix: Option<String>,
+    /// Only the `openai` codec reads it, and registration refuses one stated
+    /// for any other.
+    pub openai: OpenAiWire,
+    /// Read by every codec but google, which registration refuses it for.
+    pub session_id: SessionCarrier,
+    pub build_body: Option<Arc<dyn BodyHook>>,
+}
+
+impl CodecOptions {
+    /// Everything but the protocol and the slug behaves as a plain openai
+    /// endpoint, so a caller states only what it differs on.
+    pub fn new(protocol: Protocol, slug: impl Into<Cow<'static, str>>) -> Self {
+        let slug = slug.into();
+        Self {
+            protocol,
+            api_key_env: Cow::Borrowed(""),
+            base_url: Cow::Borrowed(""),
+            provider_name: slug.clone(),
+            slug,
+            system_prefix: None,
+            openai: OpenAiWire::default(),
+            session_id: SessionCarrier::default(),
+            build_body: None,
+        }
+    }
+}
+
+/// The native provider a custom or plugin slug borrows its codec and fallbacks
+/// from. It points straight at the row, so it can never come back empty.
+pub(crate) fn protocol_spec(protocol: Protocol) -> &'static ProviderSpec {
+    match protocol {
+        Protocol::Openai | Protocol::OpenaiResponses => &super::openai::SPEC,
+        Protocol::Anthropic => &super::anthropic::SPEC,
+        Protocol::Google => &super::google::SPEC,
+    }
+}
+
+/// Applied to the final request body, after the codec built it and after the
+/// thinking pass, so a hook sees exactly what goes on the wire.
+pub trait BodyHook: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        body: Value,
+        ctx: &RequestCtx<'_>,
+    ) -> BoxFuture<'a, Result<Value, AgentError>>;
+}
+
+/// Where a declaration's wire options become the compat layer's, so
+/// `max_tokens_field` and `include_stream_usage` pick up their defaults in one
+/// place.
+fn compat_config(options: &CodecOptions) -> OpenAiCompatConfig {
+    OpenAiCompatConfig {
+        slug: options.slug.clone(),
+        api_key_env: options.api_key_env.clone(),
+        base_url: options.base_url.clone(),
+        max_tokens_field: options
+            .openai
+            .max_tokens_field
+            .clone()
+            .map_or(Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD), Cow::Owned),
+        include_stream_usage: options.openai.include_stream_usage.unwrap_or(true),
+        usage_cost: options.openai.usage_cost,
+        provider_name: options.provider_name.clone(),
+    }
+}
+
+/// The one place a protocol picks its codec. Every codec here honours
+/// `system_prefix` except google, which drops it (see [`super::google`]) and
+/// refuses one at registration instead.
+pub fn build(
+    options: CodecOptions,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+) -> Box<dyn Provider> {
+    match options.protocol {
+        Protocol::Anthropic => Box::new(
+            super::anthropic::Anthropic::with_auth(auth, timeouts)
+                .with_fallback_base_url(fallback_base_url(&options))
+                .with_system_prefix(options.system_prefix)
+                .with_session_id(options.session_id),
+        ),
+        Protocol::Openai | Protocol::OpenaiResponses => Box::new(CompatProvider {
+            compat: OpenAiCompatProvider::new(compat_config(&options), timeouts),
+            auth,
+            protocol: options.protocol,
+            system_prefix: options.system_prefix,
+            openai: options.openai,
+            session_id: options.session_id,
+            build_body: options.build_body,
+        }),
+        Protocol::Google => Box::new(
+            super::google::Google::with_auth(auth, timeouts)
+                .with_fallback_base_url(fallback_base_url(&options)),
+        ),
+    }
+}
+
+/// The same order [`OpenAiCompatProvider::base_url`] keeps under a hook's
+/// origin, for the codecs that otherwise only know their vendor's host.
+fn fallback_base_url(options: &CodecOptions) -> Option<String> {
+    let config = ProvidersConfig::load();
+    configured_base_url(&options.slug, config.get(&options.slug))
+        .or_else(|| (!options.base_url.is_empty()).then(|| options.base_url.to_string()))
+}
+
+pub(crate) struct CompatProvider {
+    compat: OpenAiCompatProvider,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    protocol: Protocol,
+    system_prefix: Option<String>,
+    openai: OpenAiWire,
+    session_id: SessionCarrier,
+    build_body: Option<Arc<dyn BodyHook>>,
+}
+
+impl CompatProvider {
+    /// GLM and Kimi keep reasoning unless they get the default `thinking`
+    /// block, but LiteLLM in front of Azure answers any field it does not know
+    /// with a 400. There is no way to tell them apart up front, so the block
+    /// goes out and a refusal costs one replay without it.
+    ///
+    /// We only remember the refusal once the replay works. If it fails too,
+    /// with a 503 or with a 400 that just happened to say "thinking", the
+    /// block was not the problem and the next request offers it again.
+    async fn stream_chat(
+        &self,
+        model: &Model,
+        headers: &[(&str, &str)],
+        mut body: Value,
+        event_tx: &Sender<ProviderEvent>,
+        auth: &ResolvedAuth,
+    ) -> Result<StreamResponse, AgentError> {
+        if !custom::carries_undeclared_thinking(model, &body) {
+            return self
+                .compat
+                .do_stream(model, headers, &body, event_tx, auth)
+                .await;
+        }
+        let gateway = (self.compat.base_url(auth), model.id.clone());
+        let refused_before = THINKING_REJECTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&gateway);
+        if !refused_before {
+            match self
+                .compat
+                .do_stream(model, headers, &body, event_tx, auth)
+                .await
+            {
+                Err(error) if error.rejects_param(THINKING_FIELD) => warn!(
+                    base_url = %gateway.0,
+                    model = %model.id,
+                    %error,
+                    "gateway refused the thinking block, retrying without it. \
+                     Declare thinking_fields for this model to choose what is sent"
+                ),
+                result => return result,
+            }
+        }
+        if let Some(object) = body.as_object_mut() {
+            object.remove(THINKING_FIELD);
+        }
+        let result = self
+            .compat
+            .do_stream(model, headers, &body, event_tx, auth)
+            .await;
+        if result.is_ok() {
+            THINKING_REJECTED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(gateway);
+        }
+        result
+    }
+}
+
+#[warn(clippy::missing_trait_methods)]
+impl Provider for CompatProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a Sender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let mut auth = self.auth.lock().unwrap().clone();
+            let mut buf = String::new();
+            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+            let ctx = RequestCtx {
+                model,
+                opts,
+                discovered: model_registry::discovered(&self.compat.config().slug, &model.id),
+            };
+
+            if self.protocol == Protocol::OpenaiResponses {
+                // `responses::do_stream` reads the origin off the auth alone,
+                // so the three-way precedence has to be settled here. Nothing
+                // resolved means nothing written, so a declaration with no
+                // origin anywhere still fails there rather than posting to "".
+                let resolved = self.compat.base_url(&auth);
+                if !resolved.is_empty() {
+                    auth.base_url = Some(resolved);
+                }
+                let mut body = responses::build_body(model, messages, system, tools);
+                // TODO: wire thinking budget into responses API when llama.cpp supports it
+                if let Some(session) = session_id {
+                    self.session_id.apply(session, &mut body, &mut auth);
+                }
+                if let Some(hook) = &self.build_body {
+                    body = hook.call(body, &ctx).await?;
+                }
+                return responses::do_stream(
+                    self.compat.client(),
+                    model,
+                    &body,
+                    event_tx,
+                    &auth,
+                    self.compat.stream_timeout(),
+                )
+                .await;
+            }
+
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            self.openai.apply_body(&mut body, &ctx);
+            if let Some(session) = session_id {
+                self.session_id.apply(session, &mut body, &mut auth);
+            }
+            if let Some(hook) = &self.build_body {
+                body = hook.call(body, &ctx).await?;
+            }
+            let headers = self.openai.request_headers();
+            self.stream_chat(model, &headers, body, event_tx, &auth)
+                .await
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        let auth = self.auth.lock().unwrap().clone();
+        Box::pin(async move { self.compat.do_list_models(&auth).await })
+    }
+
+    /// The protocol has no usage endpoint. A declaration whose provider has
+    /// one answers through its `fetch_usage` hook, a layer above this.
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Credentials are minted above the codec, which only reads the shared
+    /// cell per request, so there is nothing here to refresh.
+    fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// The key pool belongs to whoever resolved the credentials, which wraps
+    /// this provider and answers for it.
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        None
+    }
+
+    fn adjust_model(&self, model: &mut Model) {
+        self.openai.adjust_model(model);
+    }
+
+    fn served_context_window<'a>(&'a self, _model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async { None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use test_case::test_case;
+
+    use super::super::plugin::PluginAuth;
+    use super::*;
+    use crate::model::ModelEffort;
+    use crate::{Effort, ThinkingConfig};
+
+    const TITLE_HEADER: &str = "X-Title";
+    const AFFINITY_HEADER: &str = "x-affinity";
+    const SAFE_VALUE: &str = "maki";
+    const MODEL_SPEC: &str = "xai/grok-4.6";
+
+    /// One slug per case: `<SLUG>_BASE_URL` is process-wide, and these run in
+    /// one process under `cargo test`.
+    const DECLARED_SLUG: &str = "codec-declared-origin";
+    const OVERRIDDEN_SLUG: &str = "codec-overridden-origin";
+    const OVERRIDDEN_ENV: &str = "CODEC_OVERRIDDEN_ORIGIN_BASE_URL";
+    const HOOKED_SLUG: &str = "codec-hooked-origin";
+    const HOOKED_ENV: &str = "CODEC_HOOKED_ORIGIN_BASE_URL";
+    const DECLARED_URL: &str = "https://declared.example/v1";
+    const USER_URL: &str = "https://user.example/v1";
+    const HOOK_URL: &str = "https://hooked.example/v1";
+    const HOOK_HOST: &str = "hooked.example";
+
+    /// A declaration that states an origin and nothing else.
+    fn compat(slug: &'static str) -> OpenAiCompatProvider {
+        let options = CodecOptions {
+            base_url: Cow::Borrowed(DECLARED_URL),
+            ..CodecOptions::new(Protocol::Openai, slug)
+        };
+        OpenAiCompatProvider::new(compat_config(&options), Timeouts::default())
+    }
+
+    fn no_credentials(slug: &str) -> ResolvedAuth {
+        ResolvedAuth::new(slug, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn a_declared_origin_is_the_last_resort() {
+        let compat = compat(DECLARED_SLUG);
+        assert_eq!(
+            compat.base_url(&no_credentials(DECLARED_SLUG)),
+            DECLARED_URL
+        );
+    }
+
+    /// The bug the empty `slug` on the old shared config hid: a plugin or
+    /// `providers.toml` provider never looked at `<SLUG>_BASE_URL` at all, so
+    /// a declaration outranked the user.
+    #[test]
+    fn a_user_origin_beats_a_declared_one() {
+        unsafe { std::env::set_var(OVERRIDDEN_ENV, USER_URL) };
+        let compat = compat(OVERRIDDEN_SLUG);
+        assert_eq!(compat.base_url(&no_credentials(OVERRIDDEN_SLUG)), USER_URL);
+    }
+
+    /// The two origins live in different fields, so one cannot overwrite the
+    /// other: a hook's lands in the auth cell through
+    /// [`PluginAuth::into_resolved`], the one door that vets it against the
+    /// declared hosts, while the user's sits in `resolved_base_url` where no
+    /// hook can reach it.
+    #[test]
+    fn a_hook_origin_wins_only_for_the_request_it_answered() {
+        unsafe { std::env::set_var(HOOKED_ENV, USER_URL) };
+        let compat = compat(HOOKED_SLUG);
+        let hooked = PluginAuth {
+            base_url: Some(HOOK_URL.to_string()),
+            headers: HashMap::new(),
+        }
+        .into_resolved(HOOKED_SLUG, &[HOOK_HOST.to_string()])
+        .unwrap();
+
+        assert_eq!(compat.base_url(&hooked), HOOK_URL);
+        assert_eq!(compat.base_url(&no_credentials(HOOKED_SLUG)), USER_URL);
+    }
+
+    fn wire(authored: Value) -> Result<OpenAiWire, String> {
+        serde_json::from_value(authored).map_err(|e| e.to_string())
+    }
+
+    fn curated_model() -> Model {
+        Model::from_spec(MODEL_SPEC).unwrap()
+    }
+
+    fn ctx(model: &Model, thinking: ThinkingConfig) -> RequestCtx<'_> {
+        RequestCtx {
+            model,
+            opts: RequestOptions {
+                thinking,
+                ..RequestOptions::default()
+            },
+            discovered: None,
+        }
+    }
+
+    /// Header names and values are parsed when the declaration decodes, so a
+    /// header that could not go on the wire, or that would contradict the
+    /// framing the client writes, fails the plugin and never a request.
+    #[test_case("Host", SAFE_VALUE, WireError::TransportHeader("Host".into()) ; "host")]
+    #[test_case("content-length", SAFE_VALUE, WireError::TransportHeader("content-length".into()) ; "content_length")]
+    #[test_case("Transfer-Encoding", SAFE_VALUE, WireError::TransportHeader("Transfer-Encoding".into()) ; "transfer_encoding")]
+    #[test_case("connection", SAFE_VALUE, WireError::TransportHeader("connection".into()) ; "connection")]
+    #[test_case("bad header", SAFE_VALUE, WireError::HeaderName("bad header".into()) ; "space_in_the_name")]
+    #[test_case(TITLE_HEADER, "caf\u{e9}", WireError::HeaderValue(TITLE_HEADER.into()) ; "non_ascii_value")]
+    fn a_header_the_wire_cannot_carry_is_refused(name: &str, value: &str, expected: WireError) {
+        let error = wire(json!({ "headers": { name: value } }))
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains(&expected.to_string()), "{error}");
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("reasoning..effort" ; "empty_middle_key")]
+    #[test_case(".effort" ; "leading_separator")]
+    fn an_effort_path_with_an_empty_key_is_refused(field: &str) {
+        let authored = json!({ "thinking": { "dialect": "standard", "field": field } });
+        let error = wire(authored).err().unwrap_or_default();
+        assert!(
+            error.contains(&WireError::EffortField(field.into()).to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn declared_headers_are_sent_under_canonical_names() {
+        let wire = wire(json!({ "headers": { TITLE_HEADER: SAFE_VALUE } })).unwrap();
+
+        assert_eq!(
+            wire.request_headers(),
+            [(TITLE_HEADER.to_ascii_lowercase().as_str(), SAFE_VALUE)]
+        );
+    }
+
+    /// The static fragment, and the effort under a nested path that keeps its
+    /// siblings.
+    #[test]
+    fn the_declared_body_options_reach_the_body() {
+        let wire = wire(json!({
+            "thinking": { "dialect": "standard", "field": "reasoning.effort" },
+            "extra_body": { "reasoning": { "exclude": true }, "cache_control": { "type": "ephemeral" } },
+        }))
+        .unwrap();
+        let model = curated_model();
+        let mut body = json!({ "model": model.id });
+
+        wire.apply_body(
+            &mut body,
+            &ctx(&model, ThinkingConfig::Effort(Effort::High)),
+        );
+
+        assert_eq!(
+            body,
+            json!({
+                "model": model.id,
+                "reasoning": { "exclude": true, "effort": "high" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        );
+    }
+
+    fn carrier(authored: Value) -> Result<SessionCarrier, String> {
+        serde_json::from_value(authored).map_err(|e| e.to_string())
+    }
+
+    /// A provider whose cache keys off a body field while it routes by
+    /// headers declares them together. Each header is set once, over one
+    /// the auth layer already named.
+    #[test]
+    fn the_session_id_rides_every_header_and_the_body_field() {
+        const CACHE_KEY_FIELD: &str = "prompt_cache_key";
+        const SECOND_HEADER: &str = "X-Request-Group";
+        const STALE_VALUE: &str = "stale";
+        let carrier = carrier(json!({
+            "headers": [AFFINITY_HEADER, SECOND_HEADER],
+            "body_field": CACHE_KEY_FIELD,
+        }))
+        .unwrap();
+        let session = SessionRef::generate();
+        let mut auth = ResolvedAuth::new(
+            DECLARED_SLUG,
+            vec![(AFFINITY_HEADER.to_owned(), STALE_VALUE.to_owned())],
+        )
+        .unwrap();
+        let mut body = json!({});
+
+        carrier.apply(&session, &mut body, &mut auth);
+
+        assert_eq!(body, json!({ CACHE_KEY_FIELD: session.as_str() }));
+        assert_eq!(
+            auth.headers,
+            [
+                (AFFINITY_HEADER.to_owned(), session.to_string()),
+                (SECOND_HEADER.to_ascii_lowercase(), session.to_string()),
+            ]
+        );
+    }
+
+    #[test_case("Host", WireError::TransportHeader("Host".into()) ; "transport_header")]
+    #[test_case("bad header", WireError::HeaderName("bad header".into()) ; "invalid_name")]
+    fn a_session_header_the_wire_cannot_carry_is_refused(name: &str, expected: WireError) {
+        let error = carrier(json!({ "headers": [name] }))
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains(&expected.to_string()), "{error}");
+    }
+
+    #[test_case(false, true ; "sent_to_any_model_by_default")]
+    #[test_case(true, false ; "withheld_from_a_model_without_thinking")]
+    fn requires_support_gates_the_effort(requires_support: bool, sent: bool) {
+        let wire = wire(json!({
+            "thinking": { "dialect": "standard", "requires_support": requires_support },
+        }))
+        .unwrap();
+        let mut model = curated_model();
+        model.thinking_override = Some(ThinkingSupport::No);
+        let mut body = json!({});
+
+        wire.apply_body(
+            &mut body,
+            &ctx(&model, ThinkingConfig::Effort(Effort::High)),
+        );
+
+        assert_eq!(body.get(DEFAULT_EFFORT_FIELD).is_some(), sent, "{body}");
+    }
+
+    /// A listed model's levels replace the declared ones before the one snap,
+    /// so a level past the declared ceiling still goes out.
+    #[test_case(Some(vec![Effort::High, Effort::XHigh]), "xhigh" ; "listed_levels_refine_the_dialect")]
+    #[test_case(None, "high" ; "unlisted_model_keeps_the_declared_dialect")]
+    fn a_discovered_effort_refines_the_declared_dialect(
+        listed: Option<Vec<Effort>>,
+        expected: &str,
+    ) {
+        let wire = wire(json!({ "thinking": { "dialect": "prefer-high" } })).unwrap();
+        let model = curated_model();
+        let ctx = RequestCtx {
+            discovered: Some(ModelInfo {
+                effort: listed.map(|supported| ModelEffort {
+                    supported,
+                    send_off: None,
+                }),
+                ..ModelInfo::id_only(model.id.clone())
+            }),
+            ..ctx(&model, ThinkingConfig::Effort(Effort::Max))
+        };
+        let mut body = json!({});
+
+        wire.apply_body(&mut body, &ctx);
+
+        assert_eq!(body[DEFAULT_EFFORT_FIELD], expected);
+    }
+
+    #[test_case("ministral-8b-latest", Some(ThinkingSupport::No) ; "shorter_prefix")]
+    #[test_case("ministral-large-2", Some(ThinkingSupport::Yes) ; "longest_prefix_wins")]
+    #[test_case("mistral-medium-latest", None ; "no_prefix_leaves_the_model_alone")]
+    fn thinking_overrides_take_the_longest_prefix(
+        model_id: &str,
+        expected: Option<ThinkingSupport>,
+    ) {
+        let wire = wire(json!({
+            "thinking_overrides": { "ministral-": "no", "ministral-large": "yes" },
+        }))
+        .unwrap();
+        assert_eq!(wire.thinking_override(model_id), expected);
+    }
+
+    #[test_case(json!({}), false ; "off_by_default")]
+    #[test_case(json!({ "usage_cost": true }), true ; "enabled_when_declared")]
+    fn compat_config_forwards_usage_cost(authored: Value, expected: bool) {
+        let options = CodecOptions {
+            openai: wire(authored).unwrap(),
+            ..CodecOptions::new(Protocol::Openai, DECLARED_SLUG)
+        };
+        assert_eq!(compat_config(&options).usage_cost, expected);
+    }
+}

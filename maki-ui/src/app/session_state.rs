@@ -33,6 +33,7 @@ pub(crate) struct SessionState {
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
+    pub pending_thinking: Option<ThinkingConfig>,
     /// What we actually bill and send.
     pub fast: bool,
     /// A wish parked until discovery answers, so a `/fast` typed while the
@@ -47,9 +48,18 @@ const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started 
 /// them can advertise a mode this model lacks, or miss one it demands. Fast
 /// comes back split into "on now" and "still waiting", which is the only place
 /// those two bits are derived.
-fn clamp(thinking: ThinkingConfig, fast: bool, model: &Model) -> (ThinkingConfig, bool, bool) {
+fn clamp(
+    thinking: ThinkingConfig,
+    fast: bool,
+    model: &Model,
+) -> (ThinkingConfig, Option<ThinkingConfig>, bool, bool) {
     let opts = RequestOptions { thinking, fast }.clamped(model);
-    (opts.thinking, opts.fast, fast && model.fast_pending())
+    (
+        opts.thinking,
+        (thinking.is_enabled() && !model.supports_thinking()).then_some(thinking),
+        opts.fast,
+        fast && model.fast_pending(),
+    )
 }
 
 impl SessionState {
@@ -90,7 +100,7 @@ impl SessionState {
 
         // Saved model may differ from the live one (updated, removed, etc), so
         // reconcile before anyone reads the toggles or prices history with them.
-        let (thinking, fast, pending_fast) =
+        let (thinking, pending_thinking, fast, pending_fast) =
             clamp(session.meta.thinking.into(), session.meta.fast, &model);
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
@@ -107,6 +117,7 @@ impl SessionState {
 
         Self {
             thinking,
+            pending_thinking,
             fast,
             pending_fast,
             workflow: session.meta.workflow,
@@ -133,13 +144,26 @@ impl SessionState {
         self.fast || self.pending_fast
     }
 
+    pub fn thinking_intent(&self) -> ThinkingConfig {
+        self.pending_thinking.unwrap_or(self.thinking)
+    }
+
     pub fn set_fast(&mut self, fast: bool) {
-        (self.thinking, self.fast, self.pending_fast) = clamp(self.thinking, fast, &self.model);
+        (
+            self.thinking,
+            self.pending_thinking,
+            self.fast,
+            self.pending_fast,
+        ) = clamp(self.thinking_intent(), fast, &self.model);
     }
 
     pub fn update_model(&mut self, model: &Model) {
-        (self.thinking, self.fast, self.pending_fast) =
-            clamp(self.thinking, self.fast_intent(), model);
+        (
+            self.thinking,
+            self.pending_thinking,
+            self.fast,
+            self.pending_fast,
+        ) = clamp(self.thinking_intent(), self.fast_intent(), model);
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
@@ -181,15 +205,13 @@ fn migrate_stored_tool_key(s: &str) -> Option<maki_config::ToolKey> {
     {
         let new_form = format!("{server}.{tool}");
         return maki_config::ToolKey::parse(&new_form)
-            .map_err(
-                |e| tracing::warn!(key = s, error = %e, "malformed stored tool key — skipping"),
-            )
+            .map_err(|e| tracing::warn!(key = s, error = %e, "malformed stored tool key: skipping"))
             .ok();
     }
     match maki_config::ToolKey::parse(s) {
         Ok(key) => Some(key),
         Err(e) => {
-            tracing::error!(key = s, error = %e, "malformed stored tool key — rule DROPPED; a deny rule may have been lost");
+            tracing::error!(key = s, error = %e, "malformed stored tool key: rule DROPPED; a deny rule may have been lost");
             None
         }
     }
@@ -205,7 +227,7 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
                     if matches!(r.effect, StoredEffect::Deny) {
                         tracing::error!(
                             key = %r.tool,
-                            "SECURITY: stored DENY rule dropped — tool may now be accessible. \
+                            "SECURITY: stored DENY rule dropped: tool may now be accessible. \
                              Re-add this rule manually in permissions.toml"
                         );
                     }
@@ -504,6 +526,25 @@ mod tests {
         };
 
         resumed(session, &model).thinking
+    }
+
+    #[test_case(StoredThinking::Off)]
+    #[test_case(StoredThinking::Adaptive)]
+    #[test_case(StoredThinking::Effort { level: Effort::High })]
+    #[test_case(StoredThinking::Budget { tokens: 8192 })]
+    fn discovery_restores_thinking_after_startup_clamps_it(stored: StoredThinking) {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.thinking = Some(stored);
+        let mut model = test_model();
+        model.thinking_override = Some(ThinkingSupport::No);
+        let mut state = resumed(session, &model);
+        assert_eq!(state.thinking, ThinkingConfig::Off);
+
+        state.set_fast(false);
+        model.thinking_override = Some(ThinkingSupport::Yes);
+        state.update_model(&model);
+
+        assert_eq!(state.thinking, ThinkingConfig::from(stored));
     }
 
     /// Adoption overwrites `session.model`, so the per-model breakdown is the

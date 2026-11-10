@@ -4,19 +4,28 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
+use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
+use crate::components::input::Draft;
+use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, NoticeDetail, ToolRole,
+    ToolStatus,
+};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
-use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_lua::WinView;
-use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+use maki_agent::types::ALLOWED_BY;
+use maki_agent::{
+    AgentEvent, BufferSnapshot, DisplayItem, SessionControl, SharedBuf, SteerKind, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, display_order, observation_detail,
+};
+use maki_config::{ToolOutputLines, UiConfig};
+use maki_lua::{LuaCommandInfo, WinView};
+use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role, format_tokens};
 use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -27,28 +36,47 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+const COMPACTING_TEXT: &str = "Compacting...";
+pub(crate) const LOST_TEXT: &str = "Lost";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
+const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
+const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
+const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
+pub(crate) const INBOX_DROPPED_SUFFIX: &str =
+    " queued message(s) dropped: the subagent finished first";
 
 pub enum ChatEventResult {
     Continue,
     Done,
-    QueueItemConsumed {
-        text: String,
-        images: Vec<ImageSource>,
-    },
     Error(String),
-    PermissionRequest {
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-    },
-    AuthRequired,
+}
+
+/// A call this chat's agent started that has not reported done.
+pub(crate) struct RunningCall {
+    pub(crate) id: String,
+    pub(crate) tool: Arc<str>,
 }
 
 pub struct Chat {
     pub name: String,
+    /// The plugin that opened this task with `maki.agent.session`. A tool task
+    /// has none: it lives for one turn of the main chat and is swept with it,
+    /// while a plugin task answers only to its plugin and to Esc in its tab.
+    pub(crate) plugin: Option<Arc<str>>,
+    /// A plugin task between runs: its run ended, its session did not. Kept
+    /// by [`Self::track_run`] from the runs' own events.
+    pub(crate) idle: bool,
+    /// Its run waits on expired credentials for the user's Enter. Any later
+    /// event of the run, or the chat's end, lifts it, so it never goes stale.
+    pub(crate) auth_parked: bool,
+    /// Shows a call moved off its turn. The call is out until its final
+    /// result, whatever its runs do in between, so it never reads idle.
+    pub(crate) backs_moved_call: bool,
+    /// The moved call `/tasks` lists this task under.
+    pub(crate) parent: Option<TaskParent>,
+    pub(crate) clock: Option<TaskClock>,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -58,11 +86,24 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
+    /// A running subagent's control, whose inbox takes messages typed in its
+    /// chat. Taken when the chat finishes, since nothing would drain it after
+    /// that.
+    pub(crate) control: Option<Arc<SessionControl>>,
+    /// Where a subagent's permission answers go. It lives until the chat
+    /// finishes, not the turn, so a subagent moved off its turn can still be
+    /// answered.
+    pub(crate) answer_tx: Option<flume::Sender<String>>,
+    /// Parked while another chat is in front, see `App::set_active_chat`.
+    pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
+    /// Candidates only: a row can stop running without a `ToolDone` (a cancel,
+    /// a retry), so [`Self::running_calls`] checks each against its row.
+    running_calls: Vec<RunningCall>,
 }
 
 impl Chat {
@@ -80,14 +121,24 @@ impl Chat {
         messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
+            plugin: None,
+            idle: false,
+            auth_parked: false,
+            backs_moved_call: false,
+            parent: None,
+            clock: None,
             cost: None,
             list_cost: None,
             context_size: 0,
             model_id: None,
             opts: None,
+            control: None,
+            answer_tx: None,
+            draft: Draft::default(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,
+            running_calls: Vec::new(),
         }
     }
 
@@ -106,7 +157,40 @@ impl Chat {
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
-        self.finish.map(|(outcome, _)| outcome).into()
+        match self.finish {
+            Some((outcome, _)) => outcome.into(),
+            None if self.idle && !self.backs_moved_call => TaskStatus::Idle,
+            None => TaskStatus::Working,
+        }
+    }
+
+    /// A plugin task that still answers to its plugin. Its session lives in
+    /// the Lua host, so neither a rewind nor a reload of the chrome ends it.
+    pub(crate) fn is_live_plugin_task_of(&self, session: MakiId) -> bool {
+        self.plugin.is_some()
+            && !self.is_finished()
+            && self.messages_panel.session_id() == Some(session)
+    }
+
+    /// A run is working from any event of its own to its `Done` or `Error`.
+    /// A run woken by a moved call's result opens without a prompt, so no
+    /// single event marks the start. What trails a run, its transcript, its
+    /// close and frozen renders, says nothing either way. Only a plugin task
+    /// goes idle, but any run's own event means it no longer waits on auth.
+    pub(crate) fn track_run(&mut self, event: &AgentEvent) {
+        let idle = match event {
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } => true,
+            AgentEvent::SubagentHistory { .. }
+            | AgentEvent::StreamClosed
+            | AgentEvent::ToolSnapshot { .. }
+            | AgentEvent::ToolHeaderSnapshot { .. }
+            | AgentEvent::LiveToolBuf { .. } => return,
+            _ => false,
+        };
+        self.auth_parked = false;
+        if self.plugin.is_some() {
+            self.idle = idle;
+        }
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -128,13 +212,22 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
-            AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
+            AgentEvent::ToolStart(e) => {
+                if !self.running_calls.iter().any(|call| call.id == e.id) {
+                    self.running_calls.push(RunningCall {
+                        id: e.id.clone(),
+                        tool: Arc::clone(&e.tool),
+                    });
+                }
+                self.messages_panel.tool_start(*e);
+            }
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == WRITE_TOOL_NAME;
+                self.running_calls.retain(|call| call.id != e.id);
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -163,35 +256,65 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting { .. } => {
+            AgentEvent::AutoCompacting { .. } => {}
+            AgentEvent::CompactionStarted => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
-                    "Auto-compacting conversation...".into(),
+                    COMPACTING_TEXT.into(),
                 ));
             }
-            AgentEvent::CompactionDone { .. } => {
+            AgentEvent::CompactionDone {
+                context_size_before,
+                context_size_after,
+                duration_ms,
+                ..
+            } => {
                 self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Notice,
+                    format!(
+                        "Compacted in {:.1}s · context {} → {} tokens",
+                        Duration::from_millis(duration_ms).as_secs_f64(),
+                        format_tokens(context_size_before),
+                        format_tokens(context_size_after),
+                    ),
+                ));
             }
-            AgentEvent::QueueItemConsumed { text, images } => {
-                return ChatEventResult::QueueItemConsumed { text, images };
-            }
+            // The App takes these before they reach a chat.
+            AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::AuthRequired
+            | AgentEvent::Retry { .. } => {}
             AgentEvent::QueueDrained => {}
-            AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
+            AgentEvent::ToolMovable { id, movable } => {
+                self.messages_panel.set_tool_movable(&id, movable);
+            }
+            // Parts belong to `/tasks`, which the App keeps, never to a transcript.
+            AgentEvent::ToolParts { .. } => {}
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::Steered { kind, text } => {
+                let prefix = match kind {
+                    SteerKind::MessageRewritten => REWRITTEN_PREFIX,
+                    SteerKind::MessageDropped => DROPPED_PREFIX,
+                    SteerKind::Continued => CONTINUED_PREFIX,
+                };
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    format!("{prefix}\n\n{text}"),
+                ));
             }
-            AgentEvent::AuthRequired => {
-                return ChatEventResult::AuthRequired;
-            }
+            AgentEvent::AllowedByPlugin { id, plugin } => self
+                .messages_panel
+                .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
             AgentEvent::ToolSnapshot {
                 id,
                 snapshot,
@@ -215,6 +338,24 @@ impl Chat {
                         NUDGE_TEXT.into(),
                     ));
                 }
+            }
+            AgentEvent::Notice { text } => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .push(DisplayMessage::new(DisplayRole::Notice, text));
+            }
+            AgentEvent::ObservationLine {
+                text,
+                detail,
+                markdown,
+                end,
+            } => {
+                self.messages_panel.flush();
+                self.messages_panel.push(task_notice(
+                    text,
+                    detail.map(|text| NoticeDetail { text, markdown }),
+                    end.map(BackgroundOutcome::from),
+                ));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -298,9 +439,10 @@ impl Chat {
         area: Rect,
         has_selection: bool,
         images_visible: bool,
+        lua_commands: &[LuaCommandInfo],
     ) {
         self.messages_panel
-            .view(frame, area, has_selection, images_visible);
+            .view(frame, area, has_selection, images_visible, lua_commands);
     }
 
     pub fn scroll_pos(&self) -> ScrollPos {
@@ -323,8 +465,16 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) {
-        self.messages_panel.handle_click(row, area);
+    pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.handle_click(row, col, area)
+    }
+
+    pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.toggle_click(row, area)
+    }
+
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_tool(tool_id)
     }
 
     pub fn tool_snapshot(
@@ -372,6 +522,50 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    /// Ends the task before its work says so, after a stop or a loss. Rows
+    /// still in progress would never hear back, so they are cancelled here.
+    pub(crate) fn end_early(&mut self, outcome: TaskOutcome, text: &str) {
+        self.flush();
+        self.cancel_in_progress();
+        self.mark_finished(outcome, text);
+    }
+
+    /// Like [`Self::mark_finished`], but the latest word wins. A part's tab
+    /// only mirrors reports, and a report that lands after its call ended
+    /// knows better than the call did.
+    pub(crate) fn end_as(&mut self, outcome: TaskOutcome, text: &str) {
+        match self.finish {
+            Some((previous, _)) if previous == outcome => {}
+            Some((_, bubble)) => {
+                self.finish = Some((outcome, bubble));
+                self.messages_panel
+                    .replace(bubble, DisplayMessage::new(outcome.role(), text.into()));
+            }
+            None => self.mark_finished(outcome, text),
+        }
+    }
+
+    pub(crate) fn finish_outcome(&self) -> Option<TaskOutcome> {
+        self.finish.map(|(outcome, _)| outcome)
+    }
+
+    /// The call this tab is a part of, see [`TaskParent::Part`].
+    pub(crate) fn part_of(&self) -> Option<&Arc<str>> {
+        match &self.parent {
+            Some(TaskParent::Part(call)) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// The call whose receipt the model holds for this task. A batch child
+    /// goes by its batch, since only the batch has a receipt.
+    pub(crate) fn receipt(&self) -> Option<&Arc<str>> {
+        self.parent
+            .as_ref()
+            .map(TaskParent::call)
+            .or(self.task_id())
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
@@ -385,14 +579,41 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
+        self.answer_tx = None;
+        self.auth_parked = false;
+        if let Some(clock) = &mut self.clock {
+            clock.stop();
+        }
+        let undelivered = self.control.take().map_or(0, |control| control.len());
+        if undelivered > 0 {
+            self.messages_panel.push(DisplayMessage::new(
+                DisplayRole::Error,
+                format!("{undelivered}{INBOX_DROPPED_SUFFIX}"),
+            ));
+        }
         let bubble = self
             .messages_panel
             .push(DisplayMessage::new(outcome.role(), text.into()));
         self.finish = Some((outcome, bubble));
     }
 
+    /// Takes back an ending the turn wrote for a task that outlived it. Its
+    /// bubble stays as the record of that Esc. The next event naming the task
+    /// brings back the senders the ending dropped.
+    pub(crate) fn reopen(&mut self) {
+        self.finish = None;
+        if let Some(clock) = &mut self.clock {
+            clock.resume();
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finish.is_some()
+    }
+
+    /// A moved call's task has no inbox, a finished one nothing to read it.
+    pub(crate) fn takes_messages(&self) -> bool {
+        self.control.is_some() && !self.is_finished()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -400,15 +621,68 @@ impl Chat {
     }
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.update_tool_model(tool_id, model);
+        self.messages_panel.annotate_tool(tool_id, model);
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
+    /// The calls still running now, oldest first.
+    pub(crate) fn running_calls(&mut self) -> &[RunningCall] {
+        let panel = &self.messages_panel;
+        self.running_calls.retain(|call| {
+            panel.tool_message(&call.id).is_some_and(|msg| {
+                matches!(&msg.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress)
+            })
+        });
+        &self.running_calls
+    }
+
+    pub(crate) fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.messages_panel.tool_message(tool_id)
+    }
+
+    pub(crate) fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
+        self.messages_panel.live_buf(tool_id)
+    }
+
+    pub(crate) fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        self.messages_panel.tool_name(tool_id)
+    }
+
+    pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
+        self.messages_panel.register_live_buf(tool_id, buf);
+    }
+
+    pub(crate) fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.messages_panel.settle_tool(tool_id, status);
+    }
+
+    pub(crate) fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
+        self.messages_panel.set_tool_background(tool_id, badge);
+    }
+
+    pub(crate) fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
+        self.messages_panel.set_background_outcome(tool_id, outcome);
+    }
+
+    pub(crate) fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_background_badge(tool_id)
+    }
+
+    pub(crate) fn background_badges(&self) -> Vec<BackgroundBadge> {
+        self.messages_panel.background_badges()
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
+    }
+
+    /// Whether the transcript already shows what the subagent was asked.
+    pub(crate) fn has_user_message(&self) -> bool {
+        self.messages_panel.has_user_message()
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
@@ -494,8 +768,23 @@ pub fn history_to_display(
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
-        if msg.is_observation() {
+    for item in display_order(messages) {
+        let msg = match item {
+            DisplayItem::Message(msg) => msg,
+            DisplayItem::ObservationLine { index, text } => {
+                let message = &messages[index];
+                display.push(task_notice(
+                    text.to_owned(),
+                    observation_detail(message).map(|text| NoticeDetail {
+                        text: text.to_owned(),
+                        markdown: message.markdown,
+                    }),
+                    message.answered().map(|settled| settled.end.into()),
+                ));
+                continue;
+            }
+        };
+        if msg.is_context_update() || msg.is_observation() {
             continue;
         }
         match msg.role {
@@ -612,7 +901,12 @@ pub fn history_to_display(
                                 render_snapshot: None,
                                 render_header: None,
                                 snapshot_theme_gen: 0,
-                                thinking_collapsed: false,
+                                thinking_expanded: false,
+                                movable: false,
+                                background: None,
+                                detail: None,
+                                detail_expanded: false,
+                                task_end: None,
                             });
                         }
                         _ => {}
@@ -622,6 +916,18 @@ pub fn history_to_display(
         }
     }
     (display, restore_items)
+}
+
+fn task_notice(
+    text: String,
+    detail: Option<NoticeDetail>,
+    task_end: Option<BackgroundOutcome>,
+) -> DisplayMessage {
+    DisplayMessage {
+        detail,
+        task_end,
+        ..DisplayMessage::new(DisplayRole::Notice, text)
+    }
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
@@ -716,7 +1022,7 @@ fn user_images(msg: &Message) -> Vec<ImageSource> {
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
-        if !matches!(msg.role, Role::User) || msg.is_observation() {
+        if !matches!(msg.role, Role::User) || msg.is_from_host() {
             continue;
         }
         for block in &msg.content {
@@ -724,6 +1030,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } = block
             {
                 map.insert(tool_use_id.as_str(), (*is_error, content.as_str()));
@@ -737,13 +1044,20 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{
+        AgentEvent, DoneReason, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent,
+        TurnCompleteEvent,
+    };
     use maki_config::UiConfig;
-    use maki_providers::ImageMediaType;
+    use maki_providers::{ImageMediaType, TaskAnswer, TaskEnd, TaskSettled};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
-    const EXPECTED_QUEUE_DELIVERY: &str = "a consumed queue item must carry its images";
+    const COMPACTION_SUMMARY: &str = "summary";
+    const COMPACTION_THINKING: &str = "thinking";
+    const COMPACTION_ERROR: &str = "compaction failed";
+    const COMPACTED_ZERO: &str = "Compacted in 0.0s · context 0 → 0 tokens";
+    const COMPACTED_CONTEXT: &str = "Compacted in 12.4s · context 148.0k → 23.0k tokens";
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
@@ -761,11 +1075,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: TASK_ID.into(),
-                    content: USER_TEXT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result(TASK_ID, USER_TEXT, false),
                 ContentBlock::Image { source: image() },
             ],
             ..Default::default()
@@ -800,17 +1110,7 @@ mod tests {
     #[test]
     fn queued_user_images_reach_display() {
         let mut chat = chat();
-        let result = chat.handle_event(
-            AgentEvent::QueueItemConsumed {
-                text: String::new(),
-                images: vec![image()],
-            },
-            None,
-        );
-        let ChatEventResult::QueueItemConsumed { text, images } = result else {
-            panic!("{EXPECTED_QUEUE_DELIVERY}");
-        };
-        chat.show_user_message(text, images);
+        chat.show_user_message(String::new(), vec![image()]);
         let message = chat.message_at(0).unwrap();
         assert_eq!(message.role, DisplayRole::User);
         assert_eq!(message.text, IMAGE_PLACEHOLDER);
@@ -879,12 +1179,14 @@ mod tests {
         written_path: Option<String>,
     ) -> AgentEvent {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
             id: id.into(),
             tool: tool.into(),
             output: Arc::new(output),
             is_error: false,
             annotation: None,
             written_path,
+            backgrounded: false,
         }))
     }
 
@@ -913,6 +1215,9 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const TASK_PLUGIN: &str = "monitor";
 
     fn chat() -> Chat {
         Chat::new(
@@ -935,11 +1240,7 @@ mod tests {
     }
 
     fn end(chat: &mut Chat, outcome: TaskOutcome) {
-        let text = match outcome {
-            TaskOutcome::Error => ERROR_TEXT,
-            TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
-        };
-        chat.mark_finished(outcome, text);
+        chat.mark_finished(outcome, outcome.text());
     }
 
     fn text_delta(chat: &mut Chat, text: &str) {
@@ -957,6 +1258,30 @@ mod tests {
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
+    }
+
+    /// The call never opened a prompt, so the row is the only place the user
+    /// learns something let it through. A code_execution run marks its row
+    /// once per inner call, and the row needs to say it only once.
+    #[test]
+    fn a_call_a_plugin_allowed_is_marked_on_its_row_once() {
+        const PLUGIN: &str = "automode";
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "code_execution"), None);
+        for _ in 0..2 {
+            chat.handle_event(
+                AgentEvent::AllowedByPlugin {
+                    id: "t1".into(),
+                    plugin: PLUGIN.into(),
+                },
+                None,
+            );
+        }
+        let row = chat.message_at(0).expect("the tool row");
+        assert_eq!(
+            row.annotation.as_deref(),
+            Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
+        );
     }
 
     #[test]
@@ -1026,22 +1351,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn history_hides_observations_but_keeps_the_reply() {
-        let msgs = vec![
-            Message::observation("build failed".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "I will fix it".into(),
-                }],
-                ..Default::default()
-            },
-        ];
+    #[test_case(Message::observation("build failed".into()) ; "observation")]
+    #[test_case(Message::context_update("<context-update>Date is now tomorrow.</context-update>".into(), Default::default()) ; "context_update")]
+    fn history_hides_host_messages_but_keeps_the_prompt(host: Message) {
+        let msgs = vec![host, Message::user(USER_TEXT.into())];
         let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
-        assert_eq!(display.len(), 1);
-        assert_eq!(display[0].role, DisplayRole::Assistant);
-        assert_eq!(display[0].text, "I will fix it");
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, [(DisplayRole::User, USER_TEXT)]);
+    }
+
+    /// The line is saved with the observation, so a restored session shows
+    /// it as a notice row, and the body stays the model's alone. Where the
+    /// row goes is `display_order`'s call.
+    #[test_case(Some(NOTICE_LINE), &[(DisplayRole::User, USER_TEXT), (DisplayRole::Notice, NOTICE_LINE)] ; "labelled")]
+    #[test_case(None, &[(DisplayRole::User, USER_TEXT)] ; "unlabelled")]
+    fn a_restored_observation_shows_only_its_line(
+        line: Option<&str>,
+        expected: &[(DisplayRole, &str)],
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = line.map(str::to_owned);
+        let next = Message::user(USER_TEXT.into());
+        let saved = serde_json::to_string(&[observation, next]).unwrap();
+        let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
+
+        let display =
+            history_to_display(&restored, &empty_outputs(), &ToolOutputLines::default()).0;
+
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, expected);
+    }
+
+    const NOTICE_OUTPUT: &str = "ok";
+
+    /// The line already names the task, so a background result unfolds to
+    /// its output alone, and its dot says how the task ended.
+    #[test_case(Some(TaskEnd::Failed), NOTICE_OUTPUT, Some(BackgroundOutcome::Error) ; "a_result")]
+    #[test_case(None, NOTICE_BODY, None ; "a_plain_observation")]
+    fn a_restored_notice_unfolds_to_what_it_reports(
+        end: Option<TaskEnd>,
+        detail: &str,
+        task_end: Option<BackgroundOutcome>,
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = Some(NOTICE_LINE.into());
+        observation.answers = end.map(|end| {
+            TaskAnswer::Settles(TaskSettled {
+                task: TASK_ID.into(),
+                end,
+            })
+        });
+
+        let display = history_to_display(
+            &[observation],
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+        )
+        .0;
+
+        assert_eq!(
+            display[0]
+                .detail
+                .as_ref()
+                .map(|detail| detail.text.as_str()),
+            Some(detail)
+        );
+        assert_eq!(display[0].task_end, task_end);
     }
 
     fn tool_use_pair(
@@ -1058,11 +1439,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: result.into(),
-                    is_error,
-                }],
+                content: vec![ContentBlock::tool_result("t1", result, is_error)],
                 ..Default::default()
             },
         ]
@@ -1098,11 +1475,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "hi".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "hi", false)],
                 ..Default::default()
             },
             Message {
@@ -1310,28 +1683,64 @@ mod tests {
         assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
     }
 
-    #[test]
-    fn compaction_done_flushes_streaming_buffers() {
+    fn message_rows(chat: &Chat) -> Vec<(&DisplayRole, &str)> {
+        (0..chat.message_count())
+            .map(|index| {
+                let message = chat.message_at(index).unwrap();
+                (&message.role, message.text.as_str())
+            })
+            .collect()
+    }
+
+    #[test_case(false ; "manual")]
+    #[test_case(true ; "automatic")]
+    fn compaction_started_flushes_prior_stream_once(automatic: bool) {
         let mut chat = chat();
-
-        chat.handle_event(
-            AgentEvent::AutoCompacting {
-                context_size: 0,
-                context_window: 0,
-            },
-            None,
-        );
-        assert_eq!(chat.message_count(), 1);
-
-        chat.handle_event(
-            AgentEvent::TextDelta {
-                text: "summary".into(),
-            },
-            None,
-        );
+        text_delta(&mut chat, REPLY_TEXT);
         chat.handle_event(
             AgentEvent::ThinkingDelta {
-                text: "thinking".into(),
+                text: COMPACTION_THINKING.into(),
+            },
+            None,
+        );
+        if automatic {
+            chat.handle_event(
+                AgentEvent::AutoCompacting {
+                    context_size: 0,
+                    context_window: 0,
+                },
+                None,
+            );
+        }
+
+        chat.handle_event(AgentEvent::CompactionStarted, None);
+
+        assert!(chat.streaming_text_is_empty());
+        assert!(chat.streaming_thinking_is_empty());
+        assert_eq!(
+            message_rows(&chat),
+            [
+                (&DisplayRole::Thinking, COMPACTION_THINKING),
+                (&DisplayRole::Assistant, REPLY_TEXT),
+                (&DisplayRole::Assistant, COMPACTING_TEXT),
+            ]
+        );
+    }
+
+    #[test_case(0, 0, 0, COMPACTED_ZERO ; "zero")]
+    #[test_case(12_400, 148_000, 23_000, COMPACTED_CONTEXT ; "typical_context")]
+    fn compaction_done_flushes_streaming_buffers(
+        duration_ms: u64,
+        context_size_before: u32,
+        context_size_after: u32,
+        expected: &str,
+    ) {
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::CompactionStarted, None);
+        text_delta(&mut chat, COMPACTION_SUMMARY);
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: COMPACTION_THINKING.into(),
             },
             None,
         );
@@ -1340,20 +1749,50 @@ mod tests {
 
         chat.handle_event(
             AgentEvent::CompactionDone {
-                context_size_before: 0,
-                context_size_after: 0,
+                context_size_before,
+                context_size_after,
                 context_window: 0,
+                summary: COMPACTION_SUMMARY.into(),
+                duration_ms,
             },
             None,
         );
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
-        assert_eq!(chat.message_count(), 3);
+        assert_eq!(
+            message_rows(&chat),
+            [
+                (&DisplayRole::Assistant, COMPACTING_TEXT),
+                (&DisplayRole::Thinking, COMPACTION_THINKING),
+                (&DisplayRole::Assistant, COMPACTION_SUMMARY),
+                (&DisplayRole::Notice, expected),
+            ]
+        );
 
-        chat.handle_event(AgentEvent::TextDelta { text: "new".into() }, None);
+        text_delta(&mut chat, REPLY_TEXT);
         chat.flush();
-        assert_eq!(chat.message_count(), 4);
-        assert_eq!(chat.last_message_text(), "new");
+        assert_eq!(chat.message_count(), 5);
+        assert_eq!(chat.last_message_text(), REPLY_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    #[test_case(AgentEvent::Error { message: COMPACTION_ERROR.into(), auth: false, totals: RunTotals::default() } ; "error")]
+    #[test_case(AgentEvent::Done { usage: Default::default(), cost: None, list_cost: None, context_size: 0, context_window: 0, num_turns: 0, reason: DoneReason::Cancelled } ; "cancelled")]
+    fn interrupted_compaction_has_no_success_notice(ending: AgentEvent) {
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::CompactionStarted, None);
+        text_delta(&mut chat, COMPACTION_SUMMARY);
+
+        chat.handle_event(ending, None);
+
+        assert!(chat.streaming_text_is_empty());
+        assert_eq!(
+            message_rows(&chat),
+            [
+                (&DisplayRole::Assistant, COMPACTING_TEXT),
+                (&DisplayRole::Assistant, COMPACTION_SUMMARY),
+            ]
+        );
     }
 
     /// The transcript keeps growing after the ending, since the subagent chat
@@ -1471,5 +1910,49 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    /// Once its run ends, only another run brings a task back. A woken run
+    /// opens with no prompt, and what trails a run says nothing of the next.
+    #[test_case(AgentEvent::TextDelta { text: USER_TEXT.into() }, TaskStatus::Working ; "a_run_streams")]
+    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, markdown: false, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
+    #[test_case(AgentEvent::SubagentHistory { tool_use_id: TASK_ID.into(), messages: Vec::new() }, TaskStatus::Idle ; "transcript_trails_the_run")]
+    #[test_case(AgentEvent::StreamClosed, TaskStatus::Idle ; "close_trails_the_run")]
+    fn only_a_run_event_brings_an_idle_task_back(event: AgentEvent, status: TaskStatus) {
+        let mut sub = subagent_chat();
+        sub.plugin = Some(TASK_PLUGIN.into());
+        sub.track_run(&AgentEvent::Error {
+            message: ERROR_TEXT.into(),
+            auth: false,
+            totals: RunTotals::default(),
+        });
+        assert_eq!(sub.task_status(), TaskStatus::Idle);
+
+        sub.track_run(&event);
+
+        assert_eq!(sub.task_status(), status);
+    }
+
+    const STEER_TEXT: &str = "keep going";
+
+    #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
+    #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
+    #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
+    fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
+        let mut chat = chat();
+        chat.handle_event(
+            AgentEvent::Steered {
+                kind,
+                text: STEER_TEXT.into(),
+            },
+            None,
+        );
+        assert_eq!(chat.message_count(), 1);
+        let text = chat.last_message_text();
+        assert!(
+            text.starts_with(prefix) && text.ends_with(STEER_TEXT),
+            "{text}"
+        );
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
     }
 }

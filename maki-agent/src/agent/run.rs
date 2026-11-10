@@ -1,29 +1,42 @@
-use std::borrow::Cow;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use serde_json::Value;
-use tracing::{error, info, warn};
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StopReason, StreamResponse,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
+    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
 };
+use maki_storage::frame::{LiveFacts, PromptFacts};
 
-use super::compaction;
-use super::history::{History, sanitize_cancelled_history};
+use super::compaction::{self, CompactReason, CompactSteer, Compacted};
+use super::display_order::{observation_detail, observation_line};
+use super::frame::{
+    FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
+};
+use super::history::{Cutter, History, sanitize_cancelled_history};
+use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpSession;
+use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileAccess, LocalTools, RequestTools, ToolAudience, ToolContext};
+use crate::prompt::ResolvedPrompts;
+use crate::tools::hook::Verdict;
+use crate::tools::{
+    BackgroundFor, Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter,
+    ToolOutputMode, ToolRegistry,
+};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, RunLedger, SessionMailbox, TurnCompleteEvent,
+    ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
+    TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
@@ -38,24 +51,48 @@ const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty r
 const MAX_NUDGES: u32 = 20;
 /// Counted over non-padding messages.
 const RECENT_TOOL_WINDOW: usize = 5;
-/// Without this note a cancelled reply replays in history as a finished
-/// turn, and a model resuming its own cut-off text can wedge the session
-/// (seen with llama.cpp stuck on an unterminated tool call).
-const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
-const INTERRUPT_NOTE: &str =
+const USER_INTERRUPT_TAG: &str = "user-interrupt";
+const USER_INTERRUPT_NOTE: &str =
     "The user sent a new message while you were working. Address it and continue.";
+const PARENT_INTERRUPT_TAG: &str = "parent-interrupt";
+const PARENT_INTERRUPT_NOTE: &str = "Your parent agent or a plugin sent this while you were working, not the user. Address it and continue.";
+/// A layer that always answers "continue" would never let the run end, and
+/// the user would pay for every turn of it. So `agent.stop` gets this many in
+/// a row, and the count starts over whenever the user speaks.
+const MAX_STOP_CONTINUATIONS: u32 = 3;
+const FIELD_TEXT: &str = "text";
+const STOP_FINISHED: &str = "finished";
+const STOP_MAX_TOKENS: &str = "max_tokens";
+const EMPTIED_MESSAGE: &str = "A plugin emptied the message, so there was nothing to send.";
+const NO_FRAME: &str = "no prompt frame to send the request under";
+/// The reason the API gives when it drops the old model's thinking after a
+/// switch. That is expected and does not mean the prefix moved.
+const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
+const MAX_LOGGED_PATHS: usize = 5;
+const THINKING_DROPPED: &str =
+    "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
 
-pub fn resolve_compaction_model(
+fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
+    format!(
+        "The server runs {model} with a {served}-token context, below the {planned} tokens maki planned for. Compacting to fit from now on. Raise the server's context length for more room."
+    )
+}
+
+pub async fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
     model: &Model,
     timeouts: maki_providers::Timeouts,
     model_policy: &ModelPolicy,
 ) -> (Arc<dyn Provider>, Model) {
-    if let Some(spec) =
-        maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
-        && model_policy.allows(&spec)
-        && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model(&mut m, timeouts)
+    // When the tier names the session model, the session's own copy wins,
+    // since a rebuild would forget what it learned at runtime, like the
+    // context window the server really serves.
+    if let Some(spec) = model_registry::resolve_tier(Some(&*model.provider), ModelTier::Compaction)
+        && spec != model.spec()
+        && let Ok(mut m) = Model::from_spec_with_policy(&spec, model_policy).await
+        && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)
+            .await
+            .inspect_err(|err| warn!(provider = %m.provider, model = %m.id, error = %err, "compaction model unavailable, falling back to the session model"))
     {
         return (Arc::from(p), m);
     }
@@ -64,22 +101,11 @@ pub fn resolve_compaction_model(
 
 /// The model and provider a frontend is running. Shared, so a picker can swap
 /// it while a run is in flight: [`Agent`] re-reads it every turn.
+#[derive(Clone)]
 pub struct ModelSlot {
     pub model: Model,
     pub provider: Arc<dyn Provider>,
 }
-
-/// The system prompt and base tools for one model. Both come out of one
-/// builder, so a mid-run switch cannot refresh the prompt's model line without
-/// the tools' capability gates, or the other way round.
-pub struct RunContext {
-    pub system: String,
-    pub tools: RequestTools,
-}
-
-/// Renders a [`RunContext`]. The frontend owns it because only it knows how
-/// the prompt and the tool catalog are put together.
-pub type RunContextBuilder = Arc<dyn Fn(&Model, &AgentMode, bool) -> RunContext + Send + Sync>;
 
 enum TurnOutcome {
     Continue,
@@ -94,15 +120,19 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    /// The chat session a plugin runs this agent for in the background, `None`
+    /// for anything the user watches. Its file writes are denied while the
+    /// chat plans, see [`crate::AgentSeed::background_write_block`]. Subagents
+    /// inherit it, or a monitor could get around the block by starting one.
+    pub background_for: BackgroundFor,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
-    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub prompt_slots: Arc<ResolvedPrompts>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Subagents inherit this, so a turn's totals cover everything it spawned.
     pub ledger: Arc<RunLedger>,
-    pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
 }
@@ -113,9 +143,10 @@ pub struct AgentRunParams<'h> {
     /// transcript. A gauge rebuilt per run would forget every measurement the
     /// session made and fall back to the estimate.
     pub gauge: &'h mut ContextGauge,
-    pub system: String,
     pub event_tx: EventSender,
-    pub tools: RequestTools,
+    /// What the session would start with now. The history's frame is built
+    /// from it once, and later only compared against it.
+    pub context: RunContextBuilder,
 }
 
 pub struct Agent<'h> {
@@ -123,11 +154,15 @@ pub struct Agent<'h> {
     model: Arc<Model>,
     history: &'h mut History,
     gauge: &'h mut ContextGauge,
-    system: String,
     event_tx: EventSender,
-    tools: RequestTools,
+    context: RunContextBuilder,
+    /// What the last context built for this run states. Building one renders
+    /// the whole prompt and tools, so it happens at run start, after a
+    /// compaction and on a model switch, the only times these facts change
+    /// within a run, and not before every request.
+    prompt_facts: Option<PromptFacts>,
     mode: AgentMode,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     ledger: Arc<RunLedger>,
@@ -135,28 +170,35 @@ pub struct Agent<'h> {
     recent_calls: RecentCalls,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
+    instruction_files: Arc<Vec<String>>,
     rollback_len: usize,
     carry_from: usize,
     mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
+    reauth: bool,
     reauth_attempts: u32,
     overflow_recoveries: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    background_for: BackgroundFor,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_access: Arc<FileAccess>,
-    prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    prompt_slots: Arc<ResolvedPrompts>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
-    registry: Arc<crate::tools::ToolRegistry>,
+    registry: Arc<ToolRegistry>,
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
-    model_sync: Option<(Arc<ArcSwap<ModelSlot>>, RunContextBuilder)>,
+    model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
+    stop_continuations: u32,
+    /// The last tool round moved a call to the background. Its receipt tells
+    /// the model to end the turn, so an empty reply after it is no stall.
+    moved_last_round: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -170,9 +212,9 @@ impl<'h> Agent<'h> {
             timeouts: params.timeouts,
             history: run.history,
             gauge: run.gauge,
-            system: run.system,
             event_tx: run.event_tx,
-            tools: run.tools,
+            context: run.context,
+            prompt_facts: None,
             mode: AgentMode::default(),
             user_response_rx: None,
             interrupt_source: None,
@@ -182,36 +224,36 @@ impl<'h> Agent<'h> {
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
+            instruction_files: Arc::default(),
             rollback_len: 0,
             carry_from: 0,
             mcp: None,
+            reauth: false,
             reauth_attempts: 0,
             overflow_recoveries: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            background_for: params.background_for,
             task_id: params.task_id,
             mailbox: params.mailbox,
             file_access: params.file_access,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
-            registry: params.registry,
+            registry: Arc::clone(ToolRegistry::global_arc()),
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
             model_sync: None,
+            stop_continuations: 0,
+            moved_last_round: false,
         }
     }
 
-    /// Lets the run follow the frontend's model picker. Slot and builder come
-    /// as a pair so an adopted model always arrives with a matching prompt and
-    /// tools. Without them the run keeps the snapshot it started from.
-    pub fn with_model_sync(
-        mut self,
-        slot: Arc<ArcSwap<ModelSlot>>,
-        builder: RunContextBuilder,
-    ) -> Self {
-        self.model_sync = Some((slot, builder));
+    /// Lets the run follow the frontend's model picker. Without it the run
+    /// keeps the model it started with.
+    pub fn with_model_sync(mut self, slot: Arc<ArcSwap<ModelSlot>>) -> Self {
+        self.model_sync = Some(slot);
         self
     }
 
@@ -220,11 +262,16 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_user_response_rx(
-        mut self,
-        rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
-    ) -> Self {
+    pub fn with_user_response_rx(mut self, rx: Arc<Mutex<flume::Receiver<String>>>) -> Self {
         self.user_response_rx = Some(rx);
+        self
+    }
+
+    /// On an auth error, emits [`AgentEvent::AuthRequired`] and waits on the
+    /// user response channel for a re-login instead of failing the run. Only
+    /// a frontend that answers that event may set it, and subagents inherit it.
+    pub fn with_reauth(mut self, reauth: bool) -> Self {
+        self.reauth = reauth;
         self
     }
 
@@ -243,8 +290,13 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
+    pub fn with_loaded_instructions(
+        mut self,
+        loaded: LoadedInstructions,
+        files: Arc<Vec<String>>,
+    ) -> Self {
         self.loaded_instructions = loaded;
+        self.instruction_files = files;
         self
     }
 
@@ -256,21 +308,47 @@ impl<'h> Agent<'h> {
             mode,
             images,
             preamble,
+            earlier,
             thinking,
             fast,
             workflow,
             prompt: _,
+            source,
         } = input;
-        self.rollback_len = self.history.len();
-        self.carry_from = self.history.len();
-        self.push_input_context(preamble);
-        if !message.trim().is_empty() || !images.is_empty() {
-            self.history
-                .push(Message::user_with_images(message.clone(), images));
-        }
+        self.begin(RequestOptions { thinking, fast });
         self.mode = mode;
         self.workflow = workflow;
-        self.opts = RequestOptions { thinking, fast };
+        // Each message of a burst is judged on its own, and one kept message is
+        // enough for the run to go on.
+        let burst = earlier
+            .into_iter()
+            .map(|e| (e.message, e.images, e.preamble))
+            .chain([(message, images, preamble)]);
+        let mut prompt = None;
+        for (message, images, preamble) in burst {
+            let kept = match self
+                .filter_user_message(message, images.len(), source)
+                .await
+            {
+                Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
+                kept => kept?,
+            };
+            // A burst dropped whole or a run already cancelled sends nothing,
+            // so it must not rebuild the frame either. The next run sees the
+            // same change.
+            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
+                self.refresh_frame()?;
+            }
+            let kept = kept.map(|text| {
+                prompt = Some(text.clone());
+                Message::user_with_images(text, images)
+            });
+            self.land_input(preamble, kept, true)?;
+        }
+        let Some(message) = prompt else {
+            self.emit_done(DoneReason::Dropped)?;
+            return Ok(DoneReason::Dropped);
+        };
 
         info!(
             model = %self.model.id,
@@ -278,10 +356,7 @@ impl<'h> Agent<'h> {
             message_len = message.len(),
             "agent run started"
         );
-        // Subagents are prompted by the machine inside the parent's window;
-        // counting them would inflate prompts and busy time.
-        let top_level = self.audience.contains(ToolAudience::MAIN);
-        if top_level {
+        if self.top_level() {
             // Tabs and frontends share one process, so attribution follows
             // whichever session actually runs a turn, not whoever last
             // called `set_session_id`.
@@ -290,24 +365,87 @@ impl<'h> Agent<'h> {
             }
             maki_otel::emit::user_prompt(&message);
         }
+        self.drive().await
+    }
 
-        self.gauge.seed_if_empty(
-            self.history.as_slice(),
-            &self.system,
-            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
-        );
+    /// Goes on with the same history: lands {notices}, then whatever the
+    /// interrupt source holds, the way it lands between turns, so the model
+    /// reads it as an interrupt from whoever sent it. The history alone says
+    /// whether there is anything to answer. After a cut turn its marker is
+    /// enough, so a dropped message lets the cut work go on. After a finished
+    /// answer with nothing new it sends nothing and ends `Dropped`, since a
+    /// request must never end on the model's own reply.
+    pub async fn resume(
+        &mut self,
+        notices: Vec<Message>,
+        opts: RequestOptions,
+    ) -> Result<DoneReason, AgentError> {
+        self.begin(opts);
+        let landed = async {
+            self.land_input(notices, None, false)?;
+            self.handle_queued_command().await
+        }
+        .await;
+        if let Err(e) = landed {
+            return self.finish(Err(e));
+        }
+        if !self.awaits_reply() {
+            return self.finish(Ok(DoneReason::Dropped));
+        }
+        self.drive().await
+    }
+
+    fn awaits_reply(&self) -> bool {
+        self.history
+            .as_slice()
+            .last()
+            .is_some_and(|message| matches!(message.role, Role::User))
+    }
+
+    fn begin(&mut self, opts: RequestOptions) {
+        self.rollback_len = self.history.len();
+        self.carry_from = self.history.len();
+        self.stop_continuations = 0;
+        self.moved_last_round = false;
+        self.opts = opts;
+    }
+
+    async fn drive(&mut self) -> Result<DoneReason, AgentError> {
+        if let Some((system, tools)) = self.history.request_prefix() {
+            self.gauge
+                .seed_if_empty(self.history.as_slice(), system, tools);
+        }
 
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
         let busy_since = Instant::now();
         let result = self.run_loop().await;
-        if top_level {
+        if self.top_level() {
             maki_otel::emit::active_time(busy_since.elapsed());
         }
+        self.finish(result)
+    }
+
+    /// Subagents are prompted by the machine inside the parent's window, so
+    /// counting them would inflate prompts and busy time.
+    fn top_level(&self) -> bool {
+        self.audience.contains(ToolAudience::MAIN)
+    }
+
+    /// Only asked after the run's token fired. Before that nobody cut it.
+    fn cutter(&self) -> Cutter {
+        self.interrupt_source
+            .as_ref()
+            .map(|source| source.cut_by())
+            .unwrap_or_default()
+    }
+
+    fn finish(&mut self, result: Result<DoneReason, AgentError>) -> Result<DoneReason, AgentError> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
-                sanitize_cancelled_history(self.history, self.rollback_len);
+                let cutter = self.cutter();
+                sanitize_cancelled_history(self.history, self.rollback_len, cutter);
                 DoneReason::Cancelled
             }
             Err(e) => return Err(e),
@@ -317,15 +455,72 @@ impl<'h> Agent<'h> {
         Ok(reason)
     }
 
-    fn push_input_context(&mut self, preamble: Vec<Message>) {
+    /// The preamble lands even when the message was dropped. It holds what the
+    /// user already ran (a `!cmd` result), and that is not a layer's to judge.
+    /// The mailbox waits for a kept message. Draining it for a dropped one
+    /// would bury its notes in a run that ends right away, and eat the wake
+    /// they would have caused. A caller that draws the burst's prompts one by
+    /// one drains it only with the last, so a note's line comes after every
+    /// prompt it was saved ahead of. Whatever changed goes right before the
+    /// message, so the model reads the change first and a rewind takes both.
+    fn land_input(
+        &mut self,
+        preamble: Vec<Message>,
+        message: Option<Message>,
+        drain_mailbox: bool,
+    ) -> Result<(), AgentError> {
         for message in preamble {
+            self.land_observation(message)?;
+        }
+        let Some(message) = message else {
+            return Ok(());
+        };
+        if drain_mailbox {
+            self.land_mailbox()?;
+        }
+        self.tell_changes();
+        if !message.content.is_empty() {
             self.history.push(message);
         }
-        if let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                self.history.push(message);
-            }
+        Ok(())
+    }
+
+    fn land_mailbox(&mut self) -> Result<(), AgentError> {
+        let Some(mailbox) = &self.mailbox else {
+            return Ok(());
+        };
+        for message in mailbox.drain() {
+            self.land_observation(message)?;
         }
+        Ok(())
+    }
+
+    /// The line follows the observation into history, so frontends draw it
+    /// once and a restore draws it too. `detail` is what the model reads.
+    fn land_observation(&mut self, message: Message) -> Result<(), AgentError> {
+        let line = observation_line(&message).map(str::to_owned);
+        let detail = line
+            .as_ref()
+            .and(observation_detail(&message))
+            .map(str::to_owned);
+        let end = message.answered().map(|settled| settled.end);
+        let markdown = message.markdown;
+        self.history.push(message);
+        if let Some(text) = line {
+            self.event_tx.send(AgentEvent::ObservationLine {
+                text,
+                detail,
+                markdown,
+                end,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn turns_exhausted(&self) -> bool {
+        self.config
+            .max_turns
+            .is_some_and(|max| self.num_turns >= max)
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
@@ -334,11 +529,10 @@ impl<'h> Agent<'h> {
             // would compact against the old window and then overflow the new
             // one.
             self.sync_model();
-            if let Some(max) = self.config.max_turns
-                && self.num_turns >= max
-            {
+            if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
+            self.follow_served_window().await?;
             self.try_auto_compact().await?;
             match self.turn().await? {
                 TurnOutcome::Continue => {}
@@ -347,47 +541,150 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// Picks up a model chosen while the run was working, rebuilding the
-    /// prompt and tools with it so no request mixes one model's prompt with
-    /// another's capability gates.
+    /// The frame lives on while its fingerprint matches. Other tools (a plugin
+    /// reload, a model with other capabilities, the workflow toggle) or new
+    /// host prompt text can't be told in a message, so they start a new frame,
+    /// and the user hears that the cache is gone.
+    fn refresh_frame(&mut self) -> Result<(), AgentError> {
+        let candidate = (self.context)(&self.model, self.workflow);
+        self.prompt_facts.clone_from(&candidate.facts);
+        if fit_frame(self.history, candidate, self.mcp.as_ref(), &self.model) == FrameFit::Rebuilt {
+            info!(session = ?self.session_id, model = %self.model.id, "frame fingerprint changed, rebuilt the frame");
+            self.event_tx.send(AgentEvent::Notice {
+                text: FRAME_REBUILT.into(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Appends an update when the facts differ from what the model last
+    /// heard. Every fact is compared every time, so no path that changes one
+    /// (a run start, an interrupt switching modes, a model switch, a
+    /// compaction) has to remember to tell it.
+    fn tell_changes(&mut self) {
+        // Plan mode is in no rendered prompt, so only the agent knows it.
+        let now = LiveFacts {
+            plan: self.mode.plan_path().map(Path::to_path_buf),
+            prompt: self.prompt_facts.clone(),
+        };
+        if let Some(update) = self
+            .history
+            .told()
+            .and_then(|told| context_update(&told, &now, &self.prompt_slots))
+        {
+            self.history.push(update);
+        }
+    }
+
+    /// Picks up a model selected or refreshed while the run was working. The
+    /// prompt stays, and the next request tells the model about the switch.
     ///
-    /// Two kinds of switch wait for the next run instead. Another provider
-    /// shapes history its own way (signed thinking blocks, reasoning fields),
-    /// and turning thinking on mid tool loop leaves the trailing assistant
-    /// turn without the leading thinking block anthropic then demands. A run
-    /// starts after a user message, where neither bites.
+    /// Three kinds of switch wait for the next run. Another provider shapes
+    /// history its own way (signed thinking blocks, reasoning fields). Turning
+    /// thinking on mid tool loop leaves the last assistant turn without the
+    /// thinking block Anthropic then demands. And a model with other tools
+    /// (or without tool search) needs a new frame, which only a run start may
+    /// build.
     fn sync_model(&mut self) {
-        let Some((slot, builder)) = &self.model_sync else {
+        let Some(slot) = &self.model_sync else {
             return;
         };
-        let current = slot.load();
-        if current.model.spec() == self.model.spec()
+        let current = slot.load_full();
+        if current.model == *self.model
             || current.model.provider != self.model.provider
             || current.model.supports_thinking() != self.model.supports_thinking()
         {
             return;
         }
-        info!(model = %current.model.id, "adopted model switched mid-run");
-        let builder = Arc::clone(builder);
+        let candidate = (self.context)(&current.model, self.workflow);
+        let fingerprint = fingerprint(&candidate, self.mcp.as_ref(), &current.model);
+        if self
+            .history
+            .frame()
+            .is_none_or(|frame| frame.fingerprint != fingerprint)
+        {
+            debug!(model = %current.model.id, "model switch waits for the next run, its frame differs");
+            return;
+        }
+        info!(model = %current.model.id, "adopted model update mid-run");
+        self.prompt_facts = candidate.facts;
         self.provider = Arc::clone(&current.provider);
         self.model = Arc::new(current.model.clone());
-        let RunContext { system, tools } = builder(&self.model, &self.mode, self.workflow);
-        self.system = system;
-        self.tools = tools;
+    }
+
+    /// A local server may load the model with less room than it supports, and
+    /// then it quietly cuts the oldest tokens instead of letting maki compact
+    /// them. So the budget follows what the server says it serves. The slot
+    /// learns it too, or the next `sync_model` would hand back the old window.
+    async fn follow_served_window(&mut self) -> Result<(), AgentError> {
+        let Some(served) = self.provider.served_context_window(&self.model).await else {
+            return Ok(());
+        };
+        let planned = self.model.context_window;
+        if served == planned {
+            return Ok(());
+        }
+        info!(session = ?self.session_id, model = %self.model.id, served, planned, "following the served context window");
+        if served < planned {
+            self.event_tx.send(AgentEvent::Notice {
+                text: served_window_notice(&self.model.id, served, planned),
+            })?;
+        }
+        self.model = Arc::new(Model {
+            context_window: served,
+            ..(*self.model).clone()
+        });
+        if let Some(slot) = &self.model_sync {
+            slot.rcu(|current| {
+                let mut next = ModelSlot::clone(current);
+                if next.model.provider == self.model.provider && next.model.id == self.model.id {
+                    next.model.context_window = served;
+                }
+                next
+            });
+        }
+        Ok(())
+    }
+
+    /// Right before every request. A compaction drops the frame, so it may
+    /// have to be built again, and MCP servers that connected since the last
+    /// request join here too.
+    fn prepare_request(&mut self) -> Result<(), AgentError> {
+        if self.history.live_frame().is_none() {
+            self.refresh_frame()?;
+        }
+        if let Some(mcp) = &self.mcp {
+            self.history
+                .append_late_tools(mcp, ToolDeferral::for_model(&self.model));
+        }
+        // After a cut-off answer the request continues it, and an update
+        // there would get a reply instead. The next request tells it.
+        let continues_answer = self
+            .history
+            .as_slice()
+            .last()
+            .is_some_and(|m| matches!(m.role, Role::Assistant));
+        if !continues_answer {
+            self.tell_changes();
+        }
+        Ok(())
     }
 
     async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let tools = request_tools(&self.tools, self.mcp.as_ref());
+        self.prepare_request()?;
+        let Some((system, tools)) = self.history.request_prefix() else {
+            return Err(no_frame());
+        };
         let response = match stream_with_retry(
             StreamRequest {
                 provider: &*self.provider,
                 model: &self.model,
                 messages: self.history.as_slice(),
-                system: &self.system,
-                tools: tools.as_ref(),
+                system,
+                tools,
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
                 session_id: self.session_id.as_ref(),
@@ -407,10 +704,11 @@ impl<'h> Agent<'h> {
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
                 if !streamed.is_empty() {
+                    let note = self.cutter().cut_reply_note();
                     self.history.push(Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                            text: format!("{streamed}\n\n{note}"),
                         }],
                         ..Default::default()
                     });
@@ -423,12 +721,16 @@ impl<'h> Agent<'h> {
             Err(StreamError::Other(e)) if e.is_context_overflow() => {
                 return self.recover_from_overflow(e).await;
             }
+            Err(StreamError::Other(e)) if e.is_thinking_unbound() => {
+                return self.recover_unbound_thinking(e);
+            }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
                 return Err(e);
             }
         };
         self.num_turns += 1;
+        self.note_input_transformations(&response.input_transformations);
 
         let has_tools = response.message.has_tool_calls();
         let stop_reason = response.stop_reason;
@@ -449,7 +751,7 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             let history_len_before = self.history.len();
-            self.process_tool_calls(response).await?;
+            self.moved_last_round = self.process_tool_calls(response).await?;
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
         } else {
@@ -478,11 +780,155 @@ impl<'h> Agent<'h> {
             return Ok(TurnOutcome::Continue);
         }
 
+        // The request is going out anyway, so a notice rides along behind the
+        // tool results. After a final answer it stays queued: that is the wake.
         if has_tools {
-            Ok(TurnOutcome::Continue)
-        } else {
-            Ok(TurnOutcome::Done(stop_reason.into()))
+            self.land_mailbox()?;
+            return Ok(TurnOutcome::Continue);
         }
+        let reason = stop_reason.into();
+        if self.keep_going(reason).await? {
+            return Ok(TurnOutcome::Continue);
+        }
+        Ok(TurnOutcome::Done(reason))
+    }
+
+    /// After a model switch the API flags the old model's thinking again on
+    /// every request, which is normal, so it only gets a debug line. Anything
+    /// else means the prefix moved, and an enforcing account would answer
+    /// that with a 400. We log one line per request, not one per block, so a
+    /// long session cannot flood the log and hide the warning.
+    fn note_input_transformations(&self, transformations: &[InputTransformation]) {
+        let (model_switch, moved): (Vec<_>, Vec<_>) = transformations
+            .iter()
+            .partition(|t| t.reason == MODEL_BINDING_MISMATCH);
+        if !model_switch.is_empty() {
+            debug!(session = ?self.session_id, model = %self.model.id, count = model_switch.len(), "thinking from another model not carried over");
+        }
+        if let Some(first) = moved.first() {
+            let paths = moved
+                .iter()
+                .take(MAX_LOGGED_PATHS)
+                .map(|t| t.path.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(session = ?self.session_id, model = %self.model.id, count = moved.len(), kind = %first.kind, reason = %first.reason, paths = %paths, "thinking block failed the prefix check");
+        }
+    }
+
+    /// The session's own model and gauge, even when a compaction summarizes
+    /// with another model, because that is the run the layers are steering.
+    fn hooks(&self) -> AgentHooks<'_> {
+        AgentHooks {
+            registry: &self.registry,
+            session_id: self.session_id.as_ref(),
+            task_id: self.task_id.as_deref(),
+            model: &self.model,
+            cancel: &self.cancel,
+            context_size: self.gauge.size(),
+        }
+    }
+
+    /// `None` means a layer dropped the message. A rewrite is what history
+    /// keeps, and the frontend hears about it so the transcript can show the
+    /// two differ. A rewrite down to nothing counts as a drop, or the model
+    /// would be asked to answer a transcript with nothing new in it. Blank
+    /// text comes back empty, since providers refuse a whitespace-only block.
+    async fn filter_user_message(
+        &self,
+        message: String,
+        images: usize,
+        source: InputSource,
+    ) -> Result<Option<String>, AgentError> {
+        let blank = |text: &str| text.trim().is_empty();
+        if blank(&message) && images == 0 {
+            return Ok(Some(String::new()));
+        }
+        let hooks = self.hooks();
+        let verdict = hooks
+            .fire(
+                AgentSlot::UserMessage,
+                || json!({ FIELD_TEXT: message, "images": images, "source": source.as_str() }),
+            )
+            .await;
+        // A layer that redacts must not be skipped by pressing Esc on it.
+        if self.cancel.is_cancelled() && hooks.wraps(AgentSlot::UserMessage) {
+            return Err(AgentError::Cancelled);
+        }
+        let dropped = |reason: String| {
+            info!(source = source.as_str(), %reason, "agent.user_message dropped the message");
+            self.steer(SteerKind::MessageDropped, reason).map(|()| None)
+        };
+        let text = match verdict {
+            Verdict::Replaced(value) => match value.get(FIELD_TEXT).and_then(Value::as_str) {
+                Some(text) if blank(text) && images == 0 => {
+                    return dropped(EMPTIED_MESSAGE.into());
+                }
+                Some(text) if text != message => {
+                    info!(
+                        source = source.as_str(),
+                        "agent.user_message rewrote the message"
+                    );
+                    self.steer(SteerKind::MessageRewritten, text.to_owned())?;
+                    text.to_owned()
+                }
+                _ => message,
+            },
+            Verdict::Denied(reason) => return dropped(reason),
+            Verdict::Unchanged | Verdict::Ask { .. } => message,
+        };
+        Ok(Some(if blank(&text) { String::new() } else { text }))
+    }
+
+    fn steer(&self, kind: SteerKind, text: String) -> Result<(), AgentError> {
+        self.event_tx.send(AgentEvent::Steered { kind, text })
+    }
+
+    /// True when a layer kept the run going, with its message now last in
+    /// history. A run out of turns is not asked, because its continuation
+    /// would just sit there unanswered.
+    async fn keep_going(&mut self, reason: DoneReason) -> Result<bool, AgentError> {
+        if self.stop_continuations >= MAX_STOP_CONTINUATIONS || self.turns_exhausted() {
+            return Ok(false);
+        }
+        let reason = match reason {
+            DoneReason::MaxTokens => STOP_MAX_TOKENS,
+            _ => STOP_FINISHED,
+        };
+        let last_message = self
+            .history
+            .as_slice()
+            .last()
+            .filter(|m| matches!(m.role, Role::Assistant))
+            .and_then(Message::first_text_content)
+            .unwrap_or_default();
+        let verdict = self
+            .hooks()
+            .fire(AgentSlot::Stop, || {
+                json!({
+                    "reason": reason,
+                    "last_message": last_message,
+                    "num_turns": self.num_turns,
+                })
+            })
+            .await;
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        let Verdict::Replaced(value) = verdict else {
+            return Ok(false);
+        };
+        let Some(message) = compaction::continue_text(&value) else {
+            return Ok(false);
+        };
+        self.stop_continuations += 1;
+        info!(
+            continuations = self.stop_continuations,
+            "agent.stop kept the run going"
+        );
+        self.steer(SteerKind::Continued, message.to_owned())?;
+        self.history.push(Message::synthetic(message.to_owned()));
+        Ok(true)
     }
 
     /// The gauge is a chars/4 floor, so a prompt can overflow with the
@@ -500,7 +946,27 @@ impl<'h> Agent<'h> {
             context_size = self.gauge.size(),
             "prompt overflowed below the compaction threshold"
         );
-        self.compact_now().await?;
+        self.compact_now(CompactReason::Overflow).await?;
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// The account enforces thinking binding and something before a thinking
+    /// block moved: an evicted image, a tool that joined in full. A new frame
+    /// never gets here, because it clears the signatures when it is built.
+    /// The same body fails the same way every time, so every thinking block
+    /// goes, once. That edit is valid on every endpoint and leaves the prefix
+    /// append-only from here on. With none left to drop, the error is the
+    /// honest answer.
+    fn recover_unbound_thinking(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+        let dropped = self.history.strip_thinking();
+        if dropped == 0 {
+            error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
+            return Err(err);
+        }
+        warn!(session = ?self.session_id, model = %self.model.id, dropped, error = %err, "thinking bound to a moved prefix, dropped it all");
+        self.event_tx.send(AgentEvent::Notice {
+            text: THINKING_DROPPED.into(),
+        })?;
         Ok(TurnOutcome::Continue)
     }
 
@@ -509,7 +975,7 @@ impl<'h> Agent<'h> {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
         }
-        let Some(rx) = &self.user_response_rx else {
+        let Some(rx) = self.user_response_rx.as_ref().filter(|_| self.reauth) else {
             error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
             return Err(err);
         };
@@ -517,17 +983,12 @@ impl<'h> Agent<'h> {
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
         self.event_tx.send(AgentEvent::AuthRequired)?;
         let rx = rx.lock().await;
-        match futures_lite::future::race(rx.recv_async(), async {
-            self.cancel.cancelled().await;
-            Err(flume::RecvError::Disconnected)
-        })
-        .await
-        {
-            Ok(_) => {
+        match self.cancel.race(rx.recv_async()).await {
+            Ok(Ok(_)) => {
                 self.provider.refresh_auth().await?;
                 Ok(TurnOutcome::Continue)
             }
-            Err(_) => Err(AgentError::Cancelled),
+            _ => Err(AgentError::Cancelled),
         }
     }
 
@@ -581,7 +1042,9 @@ impl<'h> Agent<'h> {
     /// place in history. Returns true when the model was nudged to try again.
     fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
-        let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
+        let nudge = !self.moved_last_round
+            && nudges < MAX_NUDGES
+            && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         self.history.push(Message::empty_marker());
         if !nudge {
             return Ok(false);
@@ -596,8 +1059,15 @@ impl<'h> Agent<'h> {
         Ok(true)
     }
 
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        let ctx = self.tool_context();
+    /// Fails closed: the filter is the frame's, and without one no tool may
+    /// run under some other set. `true` when a call moved to the background.
+    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<bool, AgentError> {
+        let filter = self
+            .history
+            .live_frame()
+            .map(|live| Arc::clone(live.tools.filter()))
+            .ok_or_else(no_frame)?;
+        let ctx = self.tool_context(filter);
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
@@ -608,24 +1078,30 @@ impl<'h> Agent<'h> {
         .await
     }
 
-    fn tool_context(&self) -> ToolContext {
+    fn tool_context(&self, tool_filter: Arc<ToolFilter>) -> ToolContext {
         ToolContext {
             provider: Arc::clone(&self.provider),
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
+            reauth: self.reauth,
             loaded_instructions: self.loaded_instructions.clone(),
+            instruction_files: self.instruction_files.clone(),
             call_instructions: CallInstructions::default(),
+            call: None,
+            mailbox: self.mailbox.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
-            deadline: Deadline::None,
+            deadline: Deadline::default(),
             config: self.config.clone(),
-            tool_filter: Arc::clone(self.tools.filter()),
+            tool_filter,
             tool_output_lines: self.tool_output_lines,
+            output_mode: ToolOutputMode::Compact,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_access: Arc::clone(&self.file_access),
@@ -644,89 +1120,100 @@ impl<'h> Agent<'h> {
 
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
         let context_size = self.gauge.size();
-        if !self.auto_compact || !compaction::is_overflow(context_size, &self.model, &self.config) {
+        if !self.auto_compact
+            || !compaction::is_overflow(u64::from(context_size), &self.model, &self.config)
+        {
             return Ok(());
         }
         info!(context_size, "auto-compacting");
-        self.compact_now().await
+        self.compact_now(CompactReason::Auto).await
     }
 
-    async fn compact_now(&mut self) -> Result<(), AgentError> {
+    /// A layer may skip an automatic compaction to wait for a better moment,
+    /// but only until the provider itself refuses the prompt.
+    async fn compact_now(&mut self, reason: CompactReason) -> Result<(), AgentError> {
+        let Some(steer) =
+            compaction::steer_compaction(&self.hooks(), &self.config, reason, None).await
+        else {
+            return Ok(());
+        };
         self.event_tx.send(AgentEvent::AutoCompacting {
             context_size: self.gauge.size(),
             context_window: self.model.context_window,
         })?;
-        self.do_compact(None).await
+        self.do_compact(steer).await
     }
 
-    async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
+    async fn do_compact(&mut self, steer: CompactSteer) -> Result<(), AgentError> {
         // Compaction replaces the whole transcript, so input no turn has
         // answered yet would be summarized away before the model ever saw it,
         // images and all. `carry_from` is where that input starts: the run's
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
-        self.compact_and_bill(instructions, carry_len).await?;
-        // An unanswered prompt says what to do next better than the generic
-        // nudge, so it stands in for it.
-        if carry_len == 0 {
-            self.history
-                .push(Message::synthetic(compaction::continue_message(
-                    &self.config,
-                )));
-        }
-        Ok(())
-    }
-
-    async fn compact_and_bill(
-        &mut self,
-        instructions: Option<&str>,
-        carry_len: usize,
-    ) -> Result<(), AgentError> {
         let context_size_before = self.gauge.size();
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
             self.timeouts,
             &self.model_policy,
-        );
-        let compaction_usage = compaction::compact_history(
+        )
+        .await;
+        // Built from the fields, not `self.hooks()`, which would borrow all of
+        // `self` while `history` is lent out mutably.
+        let hooks = AgentHooks {
+            registry: &self.registry,
+            session_id: self.session_id.as_ref(),
+            task_id: self.task_id.as_deref(),
+            model: &self.model,
+            cancel: &self.cancel,
+            context_size: context_size_before,
+        };
+        let Compacted {
+            summary,
+            duration,
+            carried,
+        } = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
             &self.event_tx,
-            &self.cancel,
+            &hooks,
             &self.config,
-            instructions,
+            steer.instructions.as_deref(),
             carry_len,
-            self.session_id.as_ref(),
             self.timeouts.retry,
+            &self.ledger,
         )
         .await?;
-        // The summariser can be a different model, so price this with
-        // `compact_model` and not `self.model`. `list_cost` gates `fast`
-        // against whichever one it gets, and is the un-subsidised price the
-        // ledger wants either way.
-        let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
-        let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
-        self.ledger
-            .add(compaction_usage, compact_cost, compact_list_cost);
-        // The measurement the gauge holds describes the transcript that was
-        // just summarized away, so what is left is all it may count.
-        self.gauge.reset(
-            self.history.as_slice(),
-            &self.system,
-            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
-        );
-        let context_size_after = self.gauge.size();
-        let carry_from = self.history.len().saturating_sub(carry_len);
+        let carry_from = self.history.len() - carried;
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
+        // The old prefix has nothing worth keeping now, so the new prompt picks
+        // up every fact told since.
+        self.refresh_frame()?;
+        // An unanswered prompt says what to do next better than the generic
+        // nudge, so it stands in for it. A layer's own words still go in.
+        if carried == 0 {
+            self.history
+                .push(Message::synthetic(compaction::continue_message(
+                    steer.continue_text.as_deref(),
+                )));
+        } else if let Some(text) = steer.continue_text {
+            self.history.push(Message::synthetic(text));
+        }
+        // The measurement the gauge holds describes the transcript that was
+        // just summarized away, so what is left is all it may count.
+        if let Some((system, tools)) = self.history.request_prefix() {
+            self.gauge.reset(self.history.as_slice(), system, tools);
+        }
+        let context_size_after = self.gauge.size();
         self.event_tx.send(AgentEvent::CompactionDone {
             context_size_before,
             context_size_after,
             context_window: self.model.context_window,
-        })?;
-        Ok(())
+            summary,
+            duration_ms: duration.as_millis() as u64,
+        })
     }
 
     async fn handle_queued_command(&mut self) -> Result<bool, AgentError> {
@@ -736,81 +1223,193 @@ impl<'h> Agent<'h> {
         let Some(cmd) = source.poll() else {
             return Ok(false);
         };
+        // True only when something new landed for the model. Going on without
+        // it would send the finished answer back as the last message.
         match cmd {
             // The burst lands as consecutive user messages, so one request
             // carries all of it.
             ExtractedCommand::Interrupt(inputs) => {
-                for input in inputs {
+                let mut kept_any = false;
+                let last = inputs.len().saturating_sub(1);
+                for (index, input) in inputs.into_iter().enumerate() {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
                     })?;
-                    self.push_input_context(input.preamble);
-                    self.mode = input.mode;
-                    let wrapped = format!(
-                        "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
-                        input.message
-                    );
-                    self.history.push(Message {
-                        display_text: Some(
-                            if input.message.is_empty() && !input.images.is_empty() {
-                                IMAGE_PLACEHOLDER.into()
-                            } else {
-                                input.message
-                            },
-                        ),
-                        ..Message::user_with_images(wrapped, input.images)
-                    });
+                    let kept = self
+                        .filter_user_message(input.message, input.images.len(), input.source)
+                        .await?;
+                    let message =
+                        kept.map(|text| interrupt_message(text, input.images, input.source));
+                    if message.is_some() {
+                        self.mode = input.mode;
+                        // The user spoke, so `agent.stop` gets its full
+                        // allowance back.
+                        self.stop_continuations = 0;
+                        kept_any = true;
+                    }
+                    // Each prompt is drawn as it is consumed, so a note
+                    // drained earlier would show up between them.
+                    self.land_input(input.preamble, message, index == last)?;
                 }
+                Ok(kept_any)
             }
             ExtractedCommand::Compact(instructions) => {
-                self.do_compact(instructions.as_deref()).await?;
+                let Some(steer) = compaction::steer_compaction(
+                    &self.hooks(),
+                    &self.config,
+                    CompactReason::Manual,
+                    instructions.as_deref(),
+                )
+                .await
+                else {
+                    return Ok(false);
+                };
+                self.do_compact(steer).await?;
+                Ok(true)
             }
         }
-        Ok(true)
     }
 }
 
-/// `tools` holds base tools only. The MCP part is recomputed per request, so
-/// `tool_search` loads and late-connecting servers take effect on the next one.
-///
-/// Free-standing rather than a method, so a caller can hold the result and
-/// still reach `&mut self.gauge`, and so a frontend sizing the same prompt
-/// outside a run does not rebuild the array by hand.
-pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
-    match mcp {
-        Some(mcp) => {
-            let mut tools = tools.definitions().clone();
-            mcp.extend_tools(&mut tools);
-            Cow::Owned(tools)
+fn no_frame() -> AgentError {
+    AgentError::Config {
+        message: NO_FRAME.into(),
+    }
+}
+
+fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSource) -> Message {
+    let (tag, note) = match Cutter::of(source) {
+        Cutter::Parent => (PARENT_INTERRUPT_TAG, PARENT_INTERRUPT_NOTE),
+        Cutter::User => (USER_INTERRUPT_TAG, USER_INTERRUPT_NOTE),
+    };
+    let wrapped = format!("<{tag}>\n{note}\n\n{message}\n</{tag}>");
+    Message {
+        display_text: Some(if message.is_empty() && !images.is_empty() {
+            IMAGE_PLACEHOLDER.into()
+        } else {
+            message
+        }),
+        ..Message::user_with_images(wrapped, images)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{DefaultEffect, ModelPolicy, PermissionsConfig};
+    use maki_providers::Model;
+    use maki_providers::provider::Provider;
+
+    use super::AgentParams;
+    use crate::agent::frame::RunContext;
+    use crate::cancel::CancelMap;
+    use crate::permissions::PermissionManager;
+    use crate::prompt::ResolvedPrompts;
+    use crate::tools::{BackgroundFor, FileAccess, RequestTools, ToolAudience};
+    use crate::{AgentConfig, RunLedger, ToolOutputLines};
+
+    const TEST_DIR: &str = "/tmp";
+    const SYSTEM: &str = "system";
+
+    pub(crate) fn agent_params(provider: Arc<dyn Provider>, model: Model) -> AgentParams {
+        AgentParams {
+            provider,
+            model,
+            config: AgentConfig::default(),
+            tool_output_lines: ToolOutputLines::default(),
+            permissions: Arc::new(PermissionManager::new(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    rules: vec![],
+                    ..Default::default()
+                },
+                PathBuf::from(TEST_DIR),
+                project::resolve_noninteractive(Path::new(TEST_DIR), TrustMode::Session)
+                    .project_config,
+                Arc::default(),
+            )),
+            session_id: None,
+            background_for: BackgroundFor::None,
+            task_id: None,
+            mailbox: None,
+            timeouts: maki_providers::Timeouts::default(),
+            file_access: FileAccess::fresh(),
+            prompt_slots: Arc::new(ResolvedPrompts::default()),
+            subagent_cancels: Arc::new(CancelMap::new()),
+            ledger: Arc::new(RunLedger::default()),
+            audience: ToolAudience::MAIN,
+            model_policy: Arc::new(ModelPolicy::default()),
         }
-        None => Cow::Borrowed(tools.definitions()),
+    }
+
+    pub(crate) fn fixed_context() -> RunContext {
+        RunContext::fixed(SYSTEM.into(), RequestTools::default())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::borrow::Cow;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use maki_config::ProjectConfig;
+    use maki_providers::model::FastSupport;
     use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::test_support::isolated_home;
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
+        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
     };
+    use maki_storage::frame::{FactsUpdate, PlanChange};
+    use maki_storage::id::MakiId;
     use serde_json::Value;
     use test_case::test_case;
+    use tokio::sync::Mutex as AsyncMutex;
 
+    use super::compaction::FIELD_CONTINUE;
+    use super::testing::{agent_params, fixed_context};
     use super::*;
-    use crate::Envelope;
+    use crate::agent::Transcript;
+    use crate::agent::frame::RunContext;
+    use crate::agent::history::USER_CANCEL_MARKER;
+    use crate::agent::hook::testing::{Seen, script};
+    use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
-    use crate::permissions::PermissionManager;
+    use crate::prompt::{PromptId, Slot, SlotEntry};
+    use crate::session::StoredSession;
+    use crate::template::Vars;
+    use crate::tools::RequestTools;
+    use crate::tools::{
+        DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
+        ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+    };
+    use crate::{EarlierInput, Envelope, ToolOutput};
 
+    const MOVING_TOOL: &str = "moving_probe";
+    const MOVING_RECEIPT: &str = "Moved to the background. End your turn.";
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
+    const RESPONSE_TEXT: &str = "response";
+    const THOUGHT: &str = "pondered";
+    const THOUGHT_SIGNATURE: &str = "sig";
+    const STALE_THINKING_MSG: &str = "thinking from before a new frame must not stay signed";
+    const KEPT_THINKING_MSG: &str = "a new frame must keep the reasoning text";
+    const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
+    const CUSTOM_SYSTEM: &str = "You analyse information.";
+    const CUSTOM_CONVENTIONS: &str = "State the evidence and uncertainty.";
+    const CUSTOM_PLAN: &str = "Draft an analysis in {plan_path}.";
+    const FIRST_IDENTITY: &str = "You are the first research assistant.";
+    const LAST_IDENTITY: &str = "You are the last research assistant.";
+    const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
+    const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -830,17 +1429,50 @@ mod tests {
         }
     }
 
-    /// What one request carried, so a test can check the model, the prompt and
-    /// the tool catalog moved together.
+    /// Messages are kept serialized, because the cache and the thinking
+    /// bindings compare bytes, not values.
     struct CapturedRequest {
         model: String,
         system: String,
         tools: Value,
+        messages: Vec<Value>,
+        opts: RequestOptions,
+    }
+
+    impl CapturedRequest {
+        fn thinking(&self) -> Vec<ContentBlock> {
+            self.messages
+                .iter()
+                .flat_map(|m| {
+                    serde_json::from_value::<Message>(m.clone())
+                        .unwrap()
+                        .content
+                })
+                .filter(ContentBlock::is_thinking)
+                .collect()
+        }
+    }
+
+    /// The contract that keeps the cache and every thinking block valid:
+    /// `system` and `tools` only ever grow at the end, and so do messages.
+    #[track_caller]
+    fn assert_append_only(prev: &CapturedRequest, next: &CapturedRequest) {
+        assert_eq!(prev.system, next.system, "system changed");
+        let (prev_tools, next_tools) = (
+            prev.tools.as_array().unwrap(),
+            next.tools.as_array().unwrap(),
+        );
+        assert!(next_tools.starts_with(prev_tools), "tools were edited");
+        assert!(
+            next.messages.starts_with(&prev.messages),
+            "earlier messages were edited"
+        );
     }
 
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        served_window: Option<u32>,
     }
 
     impl MockProvider {
@@ -848,6 +1480,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 requests: Arc::default(),
+                served_window: None,
             }
         }
     }
@@ -856,18 +1489,23 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             model: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
+            opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.requests.lock().unwrap().push(CapturedRequest {
                     model: model.id.clone(),
                     system: system.to_owned(),
                     tools: tools.clone(),
+                    messages: messages
+                        .iter()
+                        .map(|m| serde_json::to_value(m).unwrap())
+                        .collect(),
+                    opts,
                 });
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
@@ -877,6 +1515,10 @@ mod tests {
 
         fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
             Box::pin(async { unimplemented!() })
+        }
+
+        fn served_context_window<'a>(&'a self, _: &'a Model) -> BoxFuture<'a, Option<u32>> {
+            Box::pin(async { self.served_window })
         }
     }
 
@@ -910,7 +1552,7 @@ mod tests {
                 }
                 match self.fail_status {
                     Some(status) => Err(AgentError::api(status, "stub")),
-                    None => futures_lite::future::pending().await,
+                    None => std::future::pending().await,
                 }
             })
         }
@@ -924,17 +1566,22 @@ mod tests {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
 
+    fn tool_search_model() -> Model {
+        Model::from_spec("anthropic/claude-sonnet-4-5").unwrap()
+    }
+
     fn text_response(stop_reason: StopReason) -> StreamResponse {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
-                    text: "response".into(),
+                    text: RESPONSE_TEXT.into(),
                 }],
                 ..Default::default()
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            ..Default::default()
         }
     }
 
@@ -949,6 +1596,28 @@ mod tests {
         }])
     }
 
+    fn thought_response() -> StreamResponse {
+        let mut response = text_response(StopReason::EndTurn);
+        response.message.content.insert(
+            0,
+            ContentBlock::Thinking {
+                thinking: THOUGHT.into(),
+                signature: Some(THOUGHT_SIGNATURE.into()),
+            },
+        );
+        response
+    }
+
+    fn is_signed(block: &ContentBlock) -> bool {
+        matches!(
+            block,
+            ContentBlock::Thinking {
+                signature: Some(_),
+                ..
+            } | ContentBlock::RedactedThinking { .. }
+        )
+    }
+
     fn assistant_response(content: Vec<ContentBlock>) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -958,6 +1627,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
         }
     }
 
@@ -976,42 +1646,16 @@ mod tests {
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
-        let agent = Agent::new(
-            AgentParams {
-                provider,
-                model,
-                config: AgentConfig::default(),
-                tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
-                    maki_config::PermissionsConfig {
-                        default: maki_config::DefaultEffect::Allow,
-                        rules: vec![],
-                        ..Default::default()
-                    },
-                    std::path::PathBuf::from("/tmp"),
-                    ProjectConfig::for_project(Path::new("/tmp")),
-                    Arc::default(),
-                )),
-                session_id: None,
-                task_id: None,
-                mailbox: None,
-                timeouts: maki_providers::Timeouts::default(),
-                file_access: FileAccess::fresh(),
-                prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
-                subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
-                ledger: Arc::new(RunLedger::default()),
-                registry: Arc::new(crate::tools::ToolRegistry::new()),
-                audience: ToolAudience::MAIN,
-                model_policy: Arc::new(ModelPolicy::default()),
-            },
+        let mut agent = Agent::new(
+            agent_params(provider, model),
             AgentRunParams {
                 history,
                 gauge: Box::leak(Box::default()),
-                system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
-                tools: RequestTools::default(),
+                context: Arc::new(|_, _| fixed_context()),
             },
         );
+        agent.registry = Arc::new(ToolRegistry::new());
         (agent, event_rx)
     }
 
@@ -1021,87 +1665,578 @@ mod tests {
             mode: AgentMode::Build,
             images: Vec::new(),
             preamble: Vec::new(),
+            earlier: Vec::new(),
             thinking: Default::default(),
             fast: false,
             workflow: false,
             prompt: None,
+            source: InputSource::Tui,
         }
     }
 
-    #[test]
-    fn run_ingests_preamble_then_mailbox_then_user_message() {
-        smol::block_on(async {
-            let id = maki_storage::id::MakiId::generate();
-            let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
-            let mut history = History::new(Vec::new());
-            let (mut agent, _event_rx) = make_agent(
-                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-                &mut history,
-            );
-            agent.mailbox = Some(mailbox);
-            let mut input = default_input();
-            input.preamble = vec![Message::observation("preamble".into())];
-
-            agent.run(input).await.unwrap();
+    #[test_case(false ; "section_replacement")]
+    #[test_case(true ; "complete_replacement")]
+    #[tokio::test]
+    async fn prompt_policy_reuses_then_rebuilds_the_request_frame(complete: bool) {
+        let mock = MockProvider::new((0..3).map(|_| text_response(StopReason::EndTurn)).collect());
+        let requests = Arc::clone(&mock.requests);
+        let provider: Arc<dyn Provider> = Arc::new(mock);
+        let mut history = History::new(Vec::new());
+        for changed in [true, true, false] {
+            let mut prompts = ResolvedPrompts::default();
+            if changed {
+                if complete {
+                    prompts.set_template(PromptId::System, CUSTOM_SYSTEM.into());
+                } else {
+                    prompts.set_section(
+                        PromptId::System,
+                        Slot::Conventions,
+                        CUSTOM_CONVENTIONS.into(),
+                    );
+                }
+            }
+            let prompts = Arc::new(prompts);
+            let (mut agent, events) =
+                make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+            agent.prompt_slots = Arc::clone(&prompts);
+            agent.context = Arc::new(move |model, _| {
+                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+            });
+            agent.run(default_input()).await.unwrap();
             drop(agent);
-
-            assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
-            assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
-            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
-        });
+            let rebuilt = drain_events(&events).iter().any(|event| {
+                matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
+            });
+            assert_eq!(rebuilt, !changed);
+        }
+        let requests = requests.lock().unwrap();
+        assert_append_only(&requests[0], &requests[1]);
+        if complete {
+            assert_eq!(requests[0].system, CUSTOM_SYSTEM);
+        } else {
+            assert!(requests[0].system.contains(CUSTOM_CONVENTIONS));
+            assert!(
+                !requests[0]
+                    .system
+                    .contains("Never assume a library is available")
+            );
+        }
+        assert!(
+            requests[2]
+                .system
+                .contains("Never assume a library is available")
+        );
     }
 
-    #[test]
-    fn queued_input_drains_preamble_and_mailbox() {
-        smol::block_on(async {
-            let id = maki_storage::id::MakiId::generate();
-            let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
-            let mut input = default_input();
-            input.preamble = vec![Message::observation("preamble".into())];
+    #[test_case(false ; "no_persona")]
+    #[test_case(true ; "explicit_default_persona")]
+    #[tokio::test]
+    async fn legacy_frame_resume_does_not_announce_default_singletons(explicit_defaults: bool) {
+        let mut prompts = ResolvedPrompts::default();
+        if explicit_defaults {
+            for slot in [Slot::Identity, Slot::Tone] {
+                prompts.insert(
+                    PromptId::System,
+                    slot,
+                    SlotEntry {
+                        plugin: Arc::from("persona"),
+                        content: PromptId::System.default_section(slot).into(),
+                    },
+                );
+            }
+        }
+        let prompts = Arc::new(prompts);
+        let model = default_model();
+        let context =
+            RunContext::render(&Vars::new(), "", &prompts, &model, RequestTools::default());
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, context, None, &model);
+        let mut stored = history.frame().unwrap().as_ref().clone();
+        stored.facts.as_mut().unwrap().hints.clear();
+        let mut history = History::restored(Vec::new()).with_frame(Some(Arc::new(stored)));
+        let (mut agent, events) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.context = Arc::new(move |model, _| {
+            RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+        });
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+        assert!(updates(&history).is_empty());
+        assert!(!drain_events(&events).iter().any(|event| {
+            matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
+        }));
+    }
+
+    #[test_case("{environment}\n{{instructions}}", true ; "environment_and_instructions")]
+    #[test_case("A static analysis policy.", false ; "no_fact_markers")]
+    #[tokio::test]
+    async fn custom_main_template_reuses_frame_for_live_fact_changes(
+        template: &str,
+        renders_instructions: bool,
+    ) {
+        const OLD_DATE: &str = "2026-10-02";
+        const OLD_ENV: &str = "Previous environment";
+        const NEW_ENV: &str = "Current environment";
+        const OLD_INSTRUCTIONS: &str = "Previous instructions";
+        const NEW_INSTRUCTIONS: &str = "Current instructions";
+        let mock = MockProvider::new((0..2).map(|_| text_response(StopReason::EndTurn)).collect());
+        let requests = Arc::clone(&mock.requests);
+        let provider: Arc<dyn Provider> = Arc::new(mock);
+        let mut prompts = ResolvedPrompts::default();
+        prompts.set_template(PromptId::System, template.into());
+        let prompts = Arc::new(prompts);
+        let mut history = History::new(Vec::new());
+        for changed in [false, true] {
+            let vars = Vars::new()
+                .set("{environment}", if changed { NEW_ENV } else { OLD_ENV })
+                .set("{cwd}", if changed { "/new" } else { "/old" })
+                .set("{date}", if changed { NEXT_DATE } else { OLD_DATE });
+            let instructions = if changed {
+                NEW_INSTRUCTIONS
+            } else {
+                OLD_INSTRUCTIONS
+            };
+            let slots = Arc::clone(&prompts);
+            let (mut agent, events) =
+                make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+            agent.prompt_slots = Arc::clone(&prompts);
+            agent.context = Arc::new(move |model, _| {
+                RunContext::render(&vars, instructions, &slots, model, RequestTools::default())
+            });
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert!(!drain_events(&events).iter().any(|event| {
+                matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
+            }));
+        }
+        let requests = requests.lock().unwrap();
+        assert_append_only(&requests[0], &requests[1]);
+        let updates = updates(&history);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].contains("/new"));
+        assert!(updates[0].contains(NEXT_DATE));
+        assert_eq!(updates[0].contains(NEW_INSTRUCTIONS), renders_instructions);
+    }
+
+    #[tokio::test]
+    async fn singleton_unload_updates_the_effective_identity() {
+        let mock = MockProvider::new((0..3).map(|_| text_response(StopReason::EndTurn)).collect());
+        let requests = Arc::clone(&mock.requests);
+        let provider: Arc<dyn Provider> = Arc::new(mock);
+        let mut history = History::new(Vec::new());
+        for owners in [
+            vec![("aaa", FIRST_IDENTITY), ("zzz", LAST_IDENTITY)],
+            vec![("aaa", FIRST_IDENTITY)],
+            Vec::new(),
+        ] {
+            let mut prompts = ResolvedPrompts::default();
+            for (plugin, content) in owners {
+                prompts.insert(
+                    PromptId::System,
+                    Slot::Identity,
+                    SlotEntry {
+                        plugin: Arc::from(plugin),
+                        content: content.into(),
+                    },
+                );
+            }
+            let prompts = Arc::new(prompts);
+            let (mut agent, _events) =
+                make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+            agent.prompt_slots = Arc::clone(&prompts);
+            agent.context = Arc::new(move |model, _| {
+                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+            });
+            agent.run(default_input()).await.unwrap();
+        }
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].system.starts_with(LAST_IDENTITY));
+        assert_append_only(&requests[0], &requests[1]);
+        assert_append_only(&requests[1], &requests[2]);
+        let second = requests[1]
+            .messages
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+        let third = requests[2]
+            .messages
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+        assert!(second.contains(FIRST_IDENTITY));
+        assert!(third.contains("`prompt/identity` no longer applies."));
+        assert!(!third.contains(DEFAULT_IDENTITY_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn changed_plan_policy_applies_on_next_entry() {
+        let mock = MockProvider::new((0..4).map(|_| text_response(StopReason::EndTurn)).collect());
+        let requests = Arc::clone(&mock.requests);
+        let provider: Arc<dyn Provider> = Arc::new(mock);
+        let mut history = History::new(Vec::new());
+        for (custom, plan) in [(false, true), (true, true), (true, false), (true, true)] {
+            let mut prompts = ResolvedPrompts::default();
+            if custom {
+                prompts.set_template(PromptId::Plan, CUSTOM_PLAN.into());
+            }
+            let prompts = Arc::new(prompts);
+            let (mut agent, _events) =
+                make_agent_with(Arc::clone(&provider), default_model(), &mut history);
+            agent.prompt_slots = Arc::clone(&prompts);
+            agent.context = Arc::new(move |model, _| {
+                RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
+            });
+            agent
+                .run(AgentInput {
+                    mode: if plan {
+                        AgentMode::Plan(Path::new("/plans/analysis.md").to_path_buf())
+                    } else {
+                        AgentMode::Build
+                    },
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+        }
+        let requests = requests.lock().unwrap();
+        let messages = requests[1]
+            .messages
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+        assert_eq!(messages.matches("Plan mode ACTIVE").count(), 1);
+        assert!(!messages.contains("Draft an analysis in /plans/analysis.md."));
+        let updates = updates(&history);
+        assert_eq!(updates.len(), 3);
+        assert!(
+            updates
+                .last()
+                .unwrap()
+                .contains("Draft an analysis in /plans/analysis.md.")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_ingests_preamble_then_mailbox_then_user_message() {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox);
+        let mut input = default_input();
+        input.preamble = vec![Message::observation("preamble".into())];
+
+        agent.run(input).await.unwrap();
+        drop(agent);
+
+        assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
+        assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
+        assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn queued_input_drains_preamble_and_mailbox() {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
+        let mut input = default_input();
+        input.preamble = vec![Message::observation("preamble".into())];
+        let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        agent.mailbox = Some(mailbox);
+        let mut agent = agent.with_interrupt_source(source);
+
+        assert!(agent.handle_queued_command().await.unwrap());
+        drop(agent);
+
+        let text = history
+            .as_slice()
+            .iter()
+            .map(Message::user_text)
+            .collect::<Vec<_>>();
+        assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
+        assert!(history.as_slice()[0].is_observation());
+        assert!(history.as_slice()[1].is_observation());
+    }
+
+    #[tokio::test]
+    async fn wake_only_run_does_not_insert_an_empty_user_turn() {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, "failed".into(), None, true).unwrap();
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox);
+        let mut input = default_input();
+        input.message.clear();
+
+        agent.run(input).await.unwrap();
+        drop(agent);
+
+        assert_eq!(history.as_slice().len(), 2);
+        assert!(history.as_slice()[0].is_observation());
+        assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+    }
+
+    /// Where an accepted notice enters the loop.
+    #[derive(Clone, Copy)]
+    enum NoticePath {
+        WakePreamble,
+        WakeBatchedWithPrompt,
+        PromptPreamble,
+        NextPrompt,
+        Interrupt,
+    }
+
+    fn notice_lines(events: &[Envelope]) -> Vec<(&str, Option<&str>)> {
+        events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                AgentEvent::ObservationLine { text, detail, .. } => {
+                    Some((text.as_str(), detail.as_deref()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn observations(history: &History) -> Vec<&Message> {
+        history
+            .as_slice()
+            .iter()
+            .filter(|message| message.is_observation())
+            .collect()
+    }
+
+    #[test_case(NoticePath::WakePreamble ; "wake_preamble")]
+    #[test_case(NoticePath::WakeBatchedWithPrompt ; "wake_batched_with_prompt")]
+    #[test_case(NoticePath::PromptPreamble ; "prompt_preamble")]
+    #[test_case(NoticePath::NextPrompt ; "next_prompt")]
+    #[test_case(NoticePath::Interrupt ; "interrupt")]
+    #[tokio::test]
+    async fn an_accepted_notice_draws_its_line_once(path: NoticePath) {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), true).unwrap();
+        let mut input = default_input();
+        match path {
+            NoticePath::WakePreamble => {
+                input.message.clear();
+                input.preamble = mailbox.claim_wake();
+            }
+            NoticePath::WakeBatchedWithPrompt => {
+                input.earlier = vec![EarlierInput {
+                    message: String::new(),
+                    images: Vec::new(),
+                    preamble: mailbox.claim_wake(),
+                }];
+            }
+            NoticePath::PromptPreamble => input.preamble = mailbox.drain(),
+            NoticePath::NextPrompt | NoticePath::Interrupt => {}
+        }
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox);
+
+        if let NoticePath::Interrupt = path {
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
-            let mut history = History::new(Vec::new());
-            let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
-            agent.mailbox = Some(mailbox);
             let mut agent = agent.with_interrupt_source(source);
-
             assert!(agent.handle_queued_command().await.unwrap());
-            drop(agent);
+        } else {
+            agent.run(input).await.unwrap();
+        }
 
-            let text = history
-                .as_slice()
-                .iter()
-                .map(Message::user_text)
-                .collect::<Vec<_>>();
-            assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
-            assert!(history.as_slice()[0].is_observation());
-            assert!(history.as_slice()[1].is_observation());
-        });
+        assert_eq!(
+            notice_lines(&drain_events(&event_rx)),
+            [(NOTICE_LINE, Some(NOTICE_BODY))]
+        );
+        let landed = observations(&history);
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].display_text.as_deref(), Some(NOTICE_LINE));
+        assert_eq!(landed[0].first_text_content(), Some(NOTICE_BODY));
     }
 
-    #[test]
-    fn wake_only_run_does_not_insert_an_empty_user_turn() {
-        smol::block_on(async {
-            let id = maki_storage::id::MakiId::generate();
-            let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "failed".into(), true).unwrap();
-            let mut history = History::new(Vec::new());
-            let (mut agent, _event_rx) = make_agent(
-                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-                &mut history,
-            );
-            agent.mailbox = Some(mailbox);
-            let mut input = default_input();
-            input.message.clear();
-
-            agent.run(input).await.unwrap();
-            drop(agent);
-
-            assert_eq!(history.as_slice().len(), 2);
-            assert!(history.as_slice()[0].is_observation());
-            assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+    /// An interrupt burst is drawn prompt by prompt, so its notices land with
+    /// the last prompt, or wait for the next landing when that one is dropped.
+    #[test_case(false ; "last_kept")]
+    #[test_case(true ; "last_dropped")]
+    #[tokio::test]
+    async fn an_interrupt_burst_lands_notices_with_its_last_prompt(drop_last: bool) {
+        const LATER: &str = "later prompt";
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), false).unwrap();
+        let mut history = History::new(Vec::new());
+        let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+            ExtractedCommand::Interrupt(vec![
+                default_input(),
+                AgentInput {
+                    message: LATER.into(),
+                    ..default_input()
+                },
+            ]),
+        ]));
+        agent.mailbox = Some(mailbox.clone());
+        script(&agent.registry, move |slot, value| match slot {
+            AgentSlot::UserMessage if drop_last && value[FIELD_TEXT] == LATER => {
+                Verdict::Denied(LATER.into())
+            }
+            _ => Verdict::Unchanged,
         });
+
+        assert!(agent.handle_queued_command().await.unwrap());
+        drop(agent);
+
+        let kinds: Vec<_> = history
+            .as_slice()
+            .iter()
+            .map(Message::is_observation)
+            .collect();
+        let events = drain_events(&event_rx);
+        let lines = notice_lines(&events);
+        if drop_last {
+            assert_eq!(kinds, [false]);
+            assert!(lines.is_empty());
+            assert_eq!(mailbox.drain().len(), 1);
+        } else {
+            assert_eq!(kinds, [false, true, false]);
+            assert_eq!(lines, [(NOTICE_LINE, Some(NOTICE_BODY))]);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unlabelled_notice_lands_without_a_line() {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::notify(id, NOTICE_BODY.into(), None, false).unwrap();
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox);
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+        let landed = observations(&history);
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].display_text, None);
+    }
+
+    /// Lands a notice when the loop looks for queued input, which is right
+    /// after the tool results are in and before the next request goes out.
+    struct NotifyOnce {
+        session: MakiId,
+        wake: bool,
+        armed: AtomicBool,
+    }
+
+    impl NotifyOnce {
+        fn new(session: MakiId, wake: bool) -> Arc<Self> {
+            Arc::new(Self {
+                session,
+                wake,
+                armed: AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl InterruptSource for NotifyOnce {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            if self.armed.swap(false, Ordering::Relaxed) {
+                SessionMailbox::notify(
+                    self.session,
+                    NOTICE_BODY.into(),
+                    Some(NOTICE_LINE),
+                    self.wake,
+                )
+                .unwrap();
+            }
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notice_landing_mid_run_follows_the_tool_results_in_the_next_request() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let mock = MockProvider::new(vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&mock.requests);
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(mock, &mut history);
+        agent.mailbox = Some(mailbox.clone());
+        let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, false));
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        let messages = history.as_slice();
+        let [.., results, notice, _answer] = messages else {
+            panic!("history too short: {messages:?}");
+        };
+        assert!(
+            results
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        );
+        assert!(notice.is_observation());
+        assert_eq!(notice.first_text_content(), Some(NOTICE_BODY));
+        assert_eq!(observations(&history).len(), 1);
+        assert!(mailbox.drain().is_empty());
+        assert_eq!(
+            notice_lines(&drain_events(&event_rx)),
+            [(NOTICE_LINE, Some(NOTICE_BODY))]
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_append_only(&requests[0], &requests[1]);
+        assert_eq!(
+            requests[1].messages.last(),
+            Some(&serde_json::to_value(notice).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_landing_as_the_model_answers_stays_queued() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+        let requests = Arc::clone(&mock.requests);
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(mock, &mut history);
+        agent.mailbox = Some(mailbox.clone());
+        let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, true));
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(observations(&history).is_empty());
+        assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+        let woken = mailbox.claim_wake();
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].first_text_content(), Some(NOTICE_BODY));
     }
 
     fn drain_events(rx: &flume::Receiver<Envelope>) -> Vec<Envelope> {
@@ -1110,6 +2245,21 @@ mod tests {
             events.push(e);
         }
         events
+    }
+
+    fn compaction_events(events: &[Envelope]) -> Vec<&AgentEvent> {
+        events
+            .iter()
+            .map(|envelope| &envelope.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::AutoCompacting { .. }
+                        | AgentEvent::CompactionStarted
+                        | AgentEvent::CompactionDone { .. }
+                )
+            })
+            .collect()
     }
 
     async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
@@ -1135,7 +2285,7 @@ mod tests {
     fn has_interrupt_in_history(history: &[Message]) -> bool {
         history.iter().any(|m| {
             m.content.iter().any(
-                |b| matches!(b, ContentBlock::Text { text } if text.contains("<user-interrupt>")),
+                |b| matches!(b, ContentBlock::Text { text } if text.contains(USER_INTERRUPT_TAG)),
             )
         })
     }
@@ -1153,6 +2303,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
         }
     }
 
@@ -1165,35 +2316,134 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
         }
     }
 
-    #[test]
-    fn mcp_definitions_refresh_per_request() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![
-                tool_use_response(
-                    crate::mcp::TOOL_SEARCH_TOOL_NAME,
-                    serde_json::json!({"query": "fetch issue"}),
-                ),
-                text_response(StopReason::EndTurn),
-            ]);
-            let captured = Arc::clone(&provider.requests);
-            let mut history = History::new(Vec::new());
-            let (agent, _event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
-                "srv.fetch_issue",
-                "Fetch a GitHub issue",
-            )])));
-            agent.run(default_input()).await.unwrap();
+    async fn search_turn(model: Model) -> (Vec<Value>, ContentBlock) {
+        let provider = MockProvider::new(vec![
+            tool_use_response(
+                crate::mcp::TOOL_SEARCH_TOOL_NAME,
+                serde_json::json!({"query": "fetch issue"}),
+            ),
+            text_response(StopReason::EndTurn),
+        ]);
+        let captured = Arc::clone(&provider.requests);
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent_with(Arc::new(provider), model, &mut history);
+        let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
+            "srv.fetch_issue",
+            "Fetch a GitHub issue",
+        )])));
+        agent.run(default_input()).await.unwrap();
 
-            let captured = captured.lock().unwrap();
-            assert_eq!(captured.len(), 2);
-            let first = tool_names(&captured[0].tools);
-            assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
-            assert!(!first.contains(&"srv__fetch_issue"));
-            assert!(tool_names(&captured[1].tools).contains(&"srv__fetch_issue"));
-        });
+        let tools = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.tools.clone())
+            .collect();
+        let result = history
+            .as_slice()
+            .iter()
+            .flat_map(|m| &m.content)
+            .find(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .cloned()
+            .unwrap();
+        (tools, result)
+    }
+
+    #[tokio::test]
+    async fn mcp_definitions_refresh_per_request() {
+        let _home = isolated_home();
+        let (tools, result) = search_turn(Model::from_spec("openai/gpt-5").unwrap()).await;
+        assert_eq!(tools.len(), 2);
+        let first = tool_names(&tools[0]);
+        assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+        assert!(!first.contains(&"srv__fetch_issue"));
+        assert!(tool_names(&tools[1]).contains(&"srv__fetch_issue"));
+        assert!(
+            matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
+            "got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_deferral_keeps_tools_array_stable_across_a_load() {
+        let _home = isolated_home();
+        let (tools, result) = search_turn(tool_search_model()).await;
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], tools[1]);
+        let deferred = tools[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "srv__fetch_issue")
+            .expect("deferred definition ships in the array");
+        assert!(maki_providers::is_deferred_tool(deferred));
+        assert!(
+            matches!(&result, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools == &["srv__fetch_issue"]),
+            "got: {result:?}"
+        );
+    }
+
+    #[test_case(200_000, 32_768, true ; "smaller_window_compacts_and_tells")]
+    #[test_case(32_768, 200_000, false ; "larger_window_is_silent")]
+    #[test_case(200_000, 200_000, false ; "same_window_changes_nothing")]
+    #[tokio::test]
+    async fn budget_follows_the_served_window(planned: u32, served: u32, shrinks: bool) {
+        let mut h = Harness::new(Vec::new());
+        h.model = small_context_model(planned, 8_192);
+        h.served_window = Some(served);
+        let first_turn = StreamResponse {
+            usage: TokenUsage {
+                input: 30_000,
+                ..Default::default()
+            },
+            ..tool_call_response("glob", "t1")
+        };
+        let replies = vec![
+            first_turn,
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        let mut slot = None;
+        let (_, events) = h
+            .run(default_input(), replies, |agent| {
+                let shared = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                    model: start,
+                    provider: Arc::clone(&agent.provider),
+                }));
+                agent.model_sync = Some(Arc::clone(&shared));
+                agent.auto_compact = true;
+                slot = Some(shared);
+            })
+            .await;
+
+        let notice = served_window_notice(&h.model.id, served, planned);
+        assert_eq!(
+            has_event(
+                &events,
+                |event| matches!(event, AgentEvent::Notice { text } if *text == notice)
+            ),
+            shrinks
+        );
+        assert_eq!(
+            has_event(&events, |event| matches!(
+                event,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            shrinks
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEvent::TurnComplete(turn) => Some(turn.context_window),
+                _ => None,
+            }),
+            Some(served)
+        );
+        assert_eq!(slot.unwrap().load().model.context_window, served);
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
@@ -1208,7 +2458,7 @@ mod tests {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(
-            matches!(&last.content[0], ContentBlock::Text { text } if text == "[Cancelled by user]")
+            matches!(&last.content[0], ContentBlock::Text { text } if text == USER_CANCEL_MARKER)
         );
     }
 
@@ -1218,67 +2468,69 @@ mod tests {
     #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], None, 2, DoneReason::EndTurn ; "max_tokens_continues")]
     #[test_case(&[StopReason::MaxTokens; 4], None, 4, DoneReason::MaxTokens ; "max_tokens_gives_up_after_limit")]
     #[test_case(&[StopReason::MaxTokens, StopReason::EndTurn], Some(1), 1, DoneReason::MaxTurns ; "turn_budget_exhausted")]
-    fn turn_counting(
+    #[tokio::test]
+    async fn turn_counting(
         stops: &[StopReason],
         max_turns: Option<u32>,
         expected_turns: u32,
         expected_reason: DoneReason,
     ) {
-        smol::block_on(async {
-            let responses: Vec<_> = stops.iter().map(|s| text_response(*s)).collect();
-            let provider = MockProvider::new(responses);
-            let (turns, reason) = run_agent(provider, max_turns).await;
-            assert_eq!(turns, expected_turns);
-            assert_eq!(reason, expected_reason);
-        });
+        let responses: Vec<_> = stops.iter().map(|s| text_response(*s)).collect();
+        let provider = MockProvider::new(responses);
+        let (turns, reason) = run_agent(provider, max_turns).await;
+        assert_eq!(turns, expected_turns);
+        assert_eq!(reason, expected_reason);
     }
 
     #[test_case(Some(true),  true,  true  ; "after_tool_use_turn")]
     #[test_case(Some(false), true,  true  ; "after_text_only_turn")]
     #[test_case(None,        false, false ; "channel_empty")]
-    fn interrupt_handling(queued: Option<bool>, expect_consumed: bool, expect_injected: bool) {
-        smol::block_on(async {
-            let source = if queued.is_some() {
-                Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                    vec![default_input()],
-                )]))
-            } else {
-                None
-            };
+    #[tokio::test]
+    async fn interrupt_handling(
+        queued: Option<bool>,
+        expect_consumed: bool,
+        expect_injected: bool,
+    ) {
+        let source = if queued.is_some() {
+            Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                vec![default_input()],
+            )]))
+        } else {
+            None
+        };
 
-            let tool_use = queued.unwrap_or(true);
-            let responses = if tool_use {
-                vec![
-                    tool_call_response("glob", "t1"),
-                    text_response(StopReason::EndTurn),
-                ]
-            } else {
-                vec![
-                    text_response(StopReason::EndTurn),
-                    text_response(StopReason::EndTurn),
-                ]
-            };
+        let tool_use = queued.unwrap_or(true);
+        let responses = if tool_use {
+            vec![
+                tool_call_response("glob", "t1"),
+                text_response(StopReason::EndTurn),
+            ]
+        } else {
+            vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]
+        };
 
-            let mut history = History::new(Vec::new());
-            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            if let Some(s) = source {
-                agent = agent.with_interrupt_source(s);
-            }
-            let _ = agent.run(default_input()).await;
-            let events = drain_events(&event_rx);
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        if let Some(s) = source {
+            agent = agent.with_interrupt_source(s);
+        }
+        let _ = agent.run(default_input()).await;
+        let events = drain_events(&event_rx);
 
-            assert_eq!(
-                has_event(&events, |e| matches!(
-                    e,
-                    AgentEvent::QueueItemConsumed { .. }
-                )),
-                expect_consumed,
-            );
-            assert_eq!(
-                has_interrupt_in_history(history.as_slice()),
-                expect_injected
-            );
-        });
+        assert_eq!(
+            has_event(&events, |e| matches!(
+                e,
+                AgentEvent::QueueItemConsumed { .. }
+            )),
+            expect_consumed,
+        );
+        assert_eq!(
+            has_interrupt_in_history(history.as_slice()),
+            expect_injected
+        );
     }
 
     /// Stands in for a user picking another model while the run works. The
@@ -1301,133 +2553,947 @@ mod tests {
     }
 
     const ADOPTED_MSG: &str =
-        "the next request must move to the new model, prompt and tools with it";
+        "the next request must go out on the new model, and the model told so";
     const HELD_MSG: &str = "this switch must wait for the next run, nothing may move";
+    const REFRESHED_WINDOW_MSG: &str =
+        "discovered limits must reach the running agent before its compaction check";
+    const REFRESHED_COMPACTION_MSG: &str = "auto-compaction must use the refreshed context window";
 
-    /// A picker can swap the model while a run sits between turns, and the
-    /// next request then goes out on it with a prompt and tools rebuilt from
-    /// the same hook.
-    ///
-    /// Two swaps are held back instead. Crossing providers changes how history
-    /// is shaped, and turning thinking on mid tool loop leaves the trailing
-    /// assistant turn without the leading thinking block the API demands.
-    #[test_case("anthropic", ThinkingSupport::No, true ; "same_provider_and_thinking")]
-    #[test_case("anthropic", ThinkingSupport::Yes, false ; "thinking_support_changed")]
-    #[test_case("openai", ThinkingSupport::No, false ; "provider_changed")]
-    fn model_switched_between_turns(
+    #[test_case(200_000, 262_144, 180_000, false ; "discovery_expands_protocol_default")]
+    #[test_case(1_000_000, 262_144, 220_000, true ; "discovery_shrinks_context_window")]
+    #[test_case(200_000, 1_000_000, 180_000, false ; "discovery_expands_context_window")]
+    #[tokio::test]
+    async fn same_model_refresh_updates_auto_compaction(
+        initial_window: u32,
+        discovered_window: u32,
+        context_size: u64,
+        expected_compaction: bool,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        h.model = small_context_model(initial_window, 8_192);
+        let refreshed = Model {
+            context_window: discovered_window,
+            ..h.model.clone()
+        };
+        let first_turn = StreamResponse {
+            usage: TokenUsage {
+                input: context_size,
+                ..Default::default()
+            },
+            ..tool_call_response("glob", "t1")
+        };
+        let replies = vec![
+            first_turn,
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        let (_, events) = h
+            .run(default_input(), replies, |agent| {
+                let provider = Arc::clone(&agent.provider);
+                let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                    model: start,
+                    provider: Arc::clone(&provider),
+                }));
+                agent.model_sync = Some(Arc::clone(&slot));
+                agent.interrupt_source = Some(Arc::new(ModelPicker {
+                    slot,
+                    provider,
+                    model: refreshed,
+                }));
+                agent.auto_compact = true;
+            })
+            .await;
+
+        assert_eq!(
+            has_event(&events, |event| matches!(
+                event,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            expected_compaction,
+            "{REFRESHED_COMPACTION_MSG}"
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match &event.event {
+                AgentEvent::TurnComplete(turn) => Some(turn.context_window),
+                _ => None,
+            }),
+            Some(discovered_window),
+            "{REFRESHED_WINDOW_MSG}"
+        );
+        if !expected_compaction {
+            h.assert_append_only();
+        }
+        assert!(updates(&h.history).is_empty());
+    }
+
+    /// A picker can swap the model while a run sits between turns. The next
+    /// request goes out on it under the same frame, and an update tells the
+    /// model. Another provider, a thinking change or other tools wait for the
+    /// next run (see `sync_model` for why).
+    #[test_case("anthropic", ThinkingSupport::No, true, true ; "same_provider_thinking_and_tools")]
+    #[test_case("anthropic", ThinkingSupport::No, false, false ; "tools_changed")]
+    #[test_case("anthropic", ThinkingSupport::Yes, true, false ; "thinking_support_changed")]
+    #[test_case("openai", ThinkingSupport::No, true, false ; "provider_changed")]
+    #[tokio::test]
+    async fn model_switched_between_turns(
         switched_provider: &str,
         switched_thinking: ThinkingSupport,
+        same_tools: bool,
         adopted: bool,
     ) {
-        smol::block_on(async {
-            let mock = MockProvider::new(vec![
-                tool_call_response("glob", "t1"),
-                text_response(StopReason::EndTurn),
-            ]);
-            let requests = Arc::clone(&mock.requests);
-            let provider: Arc<dyn Provider> = Arc::new(mock);
-            let start = Model {
-                thinking_override: Some(ThinkingSupport::No),
-                ..default_model()
+        let mock = MockProvider::new(vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+        ]);
+        let requests = Arc::clone(&mock.requests);
+        let provider: Arc<dyn Provider> = Arc::new(mock);
+        let start = Model {
+            thinking_override: Some(ThinkingSupport::No),
+            ..default_model()
+        };
+        let switched = Model {
+            id: "claude-opus-4-1-20250805".into(),
+            provider: switched_provider.into(),
+            thinking_override: Some(switched_thinking),
+            ..start.clone()
+        };
+        let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: start.clone(),
+            provider: Arc::clone(&provider),
+        }));
+        let picker = Arc::new(ModelPicker {
+            slot: Arc::clone(&slot),
+            provider: Arc::clone(&provider),
+            model: switched.clone(),
+        });
+        let build = move |model: &Model, _: bool| {
+            let tool = if same_tools {
+                "glob".to_owned()
+            } else {
+                format!("tool_for_{}", model.id)
             };
-            let switched = Model {
-                id: "claude-opus-4-1-20250805".into(),
-                provider: switched_provider.into(),
-                thinking_override: Some(switched_thinking),
-                ..start.clone()
-            };
-            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
-                model: start.clone(),
-                provider: Arc::clone(&provider),
-            }));
-            let picker = Arc::new(ModelPicker {
-                slot: Arc::clone(&slot),
-                provider: Arc::clone(&provider),
-                model: switched.clone(),
-            });
-            let build = |model: &Model, _: &AgentMode, _: bool| RunContext {
-                system: format!("system for {}", model.spec()),
+            RunContext {
+                system: "system".into(),
                 tools: RequestTools::assembled(
-                    serde_json::json!([{ "name": format!("tool_for_{}", model.id) }]),
+                    serde_json::json!([{ "name": tool }]),
                     &AgentConfig::default(),
                     model,
                 ),
-            };
+                facts: Some(PromptFacts {
+                    model: model.spec(),
+                    ..Default::default()
+                }),
+                authored: String::new(),
+            }
+        };
 
-            let input = default_input();
-            let mut history = History::new(Vec::new());
-            let (agent, _event_rx) =
-                make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
-            let mut agent = agent
-                .with_model_sync(slot, Arc::new(build))
-                .with_interrupt_source(picker);
-            // The frontend opens a run from the same builder, so the first
-            // request and the rebuilt one are comparable.
-            let RunContext { system, tools } = build(&start, &input.mode, input.workflow);
-            agent.system = system;
-            agent.tools = tools;
-            agent.run(input).await.unwrap();
-            drop(agent);
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) =
+            make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
+        let mut agent = agent.with_model_sync(slot).with_interrupt_source(picker);
+        agent.context = Arc::new(build);
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
 
-            let requests = requests.lock().unwrap();
-            let expected = if adopted { &switched } else { &start };
-            let msg = if adopted { ADOPTED_MSG } else { HELD_MSG };
-            assert_eq!(requests[0].model, start.id);
-            assert_eq!(requests[0].system, format!("system for {}", start.spec()));
-            assert_eq!(requests[1].model, expected.id, "{msg}");
-            assert_eq!(
-                requests[1].system,
-                format!("system for {}", expected.spec()),
-                "{msg}"
-            );
-            assert!(
-                tool_names(&requests[1].tools)
-                    .contains(&format!("tool_for_{}", expected.id).as_str()),
-                "{msg}"
-            );
-        });
+        let requests = requests.lock().unwrap();
+        let expected = if adopted { &switched } else { &start };
+        let msg = if adopted { ADOPTED_MSG } else { HELD_MSG };
+        assert_eq!(requests[0].model, start.id);
+        assert_eq!(requests[1].model, expected.id, "{msg}");
+        assert_append_only(&requests[0], &requests[1]);
+        let told = updates(&history)
+            .iter()
+            .any(|update| update.contains(&switched.spec()));
+        assert_eq!(told, adopted, "{msg}");
     }
 
+    const NEXT_DATE: &str = "2026-10-03";
+    const MEMORY_HINT: &str = "memory/after_instructions";
+    const PLAN_FILE: &str = "/plans/p.md";
+    const SWITCHED_MODEL: &str = "claude-opus-4-1-20250805";
+    const PLAN_TOLD_ONCE_MSG: &str =
+        "plan mode is in no rendered prompt, so after a compaction it must be told exactly once";
+
+    /// What a frontend would render, under the test's control. The prompt
+    /// spells out every fact, so a rebuilt prompt can never pass for the old one.
+    #[derive(Clone, Default)]
+    struct World {
+        facts: Arc<Mutex<PromptFacts>>,
+        tool: Arc<Mutex<&'static str>>,
+        authored: Arc<Mutex<&'static str>>,
+        /// The host wrote the prompt, so it states no facts maki knows of.
+        host_written: Arc<Mutex<bool>>,
+    }
+
+    impl World {
+        fn change(&self, f: impl FnOnce(&mut PromptFacts)) {
+            f(&mut self.facts.lock().unwrap());
+        }
+
+        fn builder(&self) -> RunContextBuilder {
+            let world = self.clone();
+            Arc::new(move |model, _| {
+                let facts = PromptFacts {
+                    model: model.spec(),
+                    ..world.facts.lock().unwrap().clone()
+                };
+                RunContext {
+                    system: format!("system {facts:?}"),
+                    tools: RequestTools::assembled(
+                        serde_json::json!([{ "name": *world.tool.lock().unwrap() }]),
+                        &AgentConfig::default(),
+                        model,
+                    ),
+                    facts: (!*world.host_written.lock().unwrap()).then_some(facts),
+                    authored: world.authored.lock().unwrap().to_string(),
+                }
+            })
+        }
+    }
+
+    /// One session over many runs and restarts, with every request it sent.
+    struct Harness {
+        world: World,
+        model: Model,
+        history: History,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        served_window: Option<u32>,
+    }
+
+    impl Harness {
+        fn new(prior: Vec<Message>) -> Self {
+            Self {
+                world: World::default(),
+                model: default_model(),
+                history: History::new(prior),
+                requests: Arc::default(),
+                served_window: None,
+            }
+        }
+
+        async fn run(
+            &mut self,
+            input: AgentInput,
+            responses: Vec<StreamResponse>,
+            configure: impl FnOnce(&mut Agent<'_>),
+        ) -> (DoneReason, Vec<Envelope>) {
+            let mut mock = MockProvider::new(responses);
+            mock.requests = Arc::clone(&self.requests);
+            mock.served_window = self.served_window;
+            let (mut agent, event_rx) =
+                make_agent_with(Arc::new(mock), self.model.clone(), &mut self.history);
+            agent.context = self.world.builder();
+            configure(&mut agent);
+            let reason = agent.run(input).await.unwrap();
+            drop(agent);
+            (reason, drain_events(&event_rx))
+        }
+
+        async fn run_in(&mut self, mode: AgentMode) -> Vec<Envelope> {
+            let input = AgentInput {
+                mode,
+                ..default_input()
+            };
+            self.run(input, vec![text_response(StopReason::EndTurn)], |_| {})
+                .await
+                .1
+        }
+
+        /// A new process loading the session, cut to `kept` messages.
+        fn restart(&mut self, kept: usize) {
+            let mut messages = self.history.as_slice().to_vec();
+            messages.truncate(kept);
+            self.history = History::restored(messages).with_frame(self.history.frame().cloned());
+        }
+
+        fn assert_append_only(&self) {
+            for pair in self.requests.lock().unwrap().windows(2) {
+                assert_append_only(&pair[0], &pair[1]);
+            }
+        }
+    }
+
+    fn updates(history: &History) -> Vec<&str> {
+        history
+            .as_slice()
+            .iter()
+            .filter(|m| m.is_context_update())
+            .filter_map(Message::first_text_content)
+            .collect()
+    }
+
+    fn with_compact(agent: &mut Agent<'_>) {
+        let compact = vec![ExtractedCommand::Compact(None)];
+        agent.interrupt_source = Some(MockInterruptSource::new(compact));
+    }
+
+    /// Saving a memory used to reorder a hint line in the prompt and throw the
+    /// whole cache away. Now that change, like a model switch, arrives as a
+    /// message at the end.
+    #[test_case(|h: &mut Harness| h.world.change(|f| { f.hints.insert(MEMORY_HINT.into(), "tags: b, a".into()); }), MEMORY_HINT ; "memory_write")]
+    #[test_case(|h: &mut Harness| h.model.id = SWITCHED_MODEL.into(), SWITCHED_MODEL ; "model_switch")]
+    #[tokio::test]
+    async fn change_between_runs_is_appended(change: fn(&mut Harness), says: &str) {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        change(&mut h);
+        h.run_in(AgentMode::Build).await;
+
+        h.assert_append_only();
+        let updates = updates(&h.history);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].contains(says));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_round_trip_is_appended() {
+        let mut h = Harness::new(Vec::new());
+        let plan = AgentMode::Plan(PLAN_FILE.into());
+        for mode in [plan.clone(), AgentMode::Build, plan] {
+            h.run_in(mode).await;
+        }
+
+        h.assert_append_only();
+        let updates = updates(&h.history);
+        assert_eq!(updates.len(), 3);
+        assert!(updates[0].contains(PLAN_FILE));
+        assert!(updates[1].contains(PLAN_ENDED));
+        assert!(updates[2].contains(PLAN_FILE));
+    }
+
+    /// Neither fits in an update. Other tools need another array, and a prompt
+    /// the host wrote itself (an sdk `--system-prompt`) is not a fact.
+    #[test_case(|w: &World| *w.tool.lock().unwrap() = "reloaded" ; "tools")]
+    #[test_case(|w: &World| *w.authored.lock().unwrap() = "custom prompt" ; "authored_prompt")]
+    #[tokio::test]
+    async fn fingerprint_change_starts_a_new_frame_with_a_notice(change: fn(&World)) {
+        let mut h = Harness::new(Vec::new());
+        h.run(default_input(), vec![thought_response()], |_| {})
+            .await;
+        let first_frame = h.history.frame().cloned();
+        change(&h.world);
+        let events = h.run_in(AgentMode::Build).await;
+
+        assert_ne!(h.history.frame().cloned(), first_frame);
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AgentEvent::Notice { text } if text == FRAME_REBUILT
+        )));
+        let requests = h.requests.lock().unwrap();
+        let thinking = requests.last().unwrap().thinking();
+        assert!(!thinking.is_empty(), "{KEPT_THINKING_MSG}");
+        assert!(!thinking.iter().any(is_signed), "{STALE_THINKING_MSG}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+        let rebuilt = |events: &[Envelope]| {
+            events.iter().any(|e| {
+                matches!(
+                    &e.event,
+                    AgentEvent::Notice { text } if text == FRAME_REBUILT
+                )
+            })
+        };
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let first_frame = h.history.frame().cloned();
+        *h.world.tool.lock().unwrap() = "reloaded";
+
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let (reason, events) = h
+            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .await;
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(!rebuilt(&events));
+        assert_eq!(h.history.frame().cloned(), first_frame);
+
+        assert!(rebuilt(&h.run_in(AgentMode::Build).await));
+        assert_ne!(h.history.frame().cloned(), first_frame);
+    }
+
+    /// Swapping maki's prompt for one the host wrote, or back, rebuilds the
+    /// frame. No fact may be told blank, or repeated when the new prompt
+    /// already states it, while plan mode is still told under either.
+    #[test_case(false ; "rendered_to_host_written")]
+    #[test_case(true ; "host_written_to_rendered")]
+    #[tokio::test]
+    async fn switching_who_wrote_the_prompt_tells_only_plan_mode(host_written_first: bool) {
+        let mut h = Harness::new(Vec::new());
+        *h.world.host_written.lock().unwrap() = host_written_first;
+        h.run_in(AgentMode::Plan(PLAN_FILE.into())).await;
+        h.world.change(|f| f.date = NEXT_DATE.into());
+        *h.world.host_written.lock().unwrap() = !host_written_first;
+        *h.world.authored.lock().unwrap() = "host prompt";
+        h.run_in(AgentMode::Build).await;
+
+        let updates = updates(&h.history);
+        assert_eq!(updates.len(), 2);
+        assert!(updates[0].contains(PLAN_FILE));
+        assert!(updates[1].contains(PLAN_ENDED));
+        assert!(!updates[1].contains(NEXT_DATE));
+    }
+
+    /// A new process keeps the stored prompt instead of rendering today's, and
+    /// learns what the model last heard from the transcript alone. The frame
+    /// can't help with that, because it never mentions plan mode, and a rewind
+    /// can take back an update the model already got.
+    #[test_case(false ; "resume")]
+    #[test_case(true ; "rewind")]
+    #[tokio::test]
+    async fn restored_session_continues_the_prefix(rewind: bool) {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Plan(PLAN_FILE.into())).await;
+        let kept = h.history.len();
+        h.world.change(|f| f.date = NEXT_DATE.into());
+        if rewind {
+            h.run_in(AgentMode::Build).await;
+            h.requests.lock().unwrap().pop();
+        }
+        h.restart(kept);
+        h.run_in(AgentMode::Build).await;
+
+        h.assert_append_only();
+        let updates = updates(&h.history);
+        let last = updates.last().unwrap();
+        assert!(last.contains(NEXT_DATE));
+        assert!(last.contains(PLAN_ENDED));
+    }
+
+    const ORIGIN_DATE: &str = "2026-10-01";
+    const STALE_DATE: &str = "2026-09-30";
+    const ORIGIN_CWD: &str = "/origin";
+    const HERE_CWD: &str = "/here";
+    const ELSEWHERE_CWD: &str = "/elsewhere";
+    const ORIGIN_INSTRUCTIONS: &str = "\n\nProject instructions:\nbe nice";
+    const HERE_INSTRUCTIONS: &str = "\n\nProject instructions:\nbe terse";
+    const ORIGIN_HINT: &str = "tags: a";
+    const STALE_UPDATE: &str = "<context-update>Date is now 2026-10-01.</context-update>";
+    const RELOADED_TOOL: &str = "reloaded";
+    const TOLD_WHAT_MOVED_MSG: &str =
+        "a new frame must be followed by exactly what moved, never instructions or hints";
+    const MESSAGES_KEPT_MSG: &str = "a rebuilt frame must not edit earlier messages";
+
+    /// What the origin machine's prompt stated, with the model this test runs
+    /// on, so only what a case changes differs.
+    fn origin_facts() -> PromptFacts {
+        PromptFacts {
+            date: ORIGIN_DATE.into(),
+            cwd: ORIGIN_CWD.into(),
+            model: default_model().spec(),
+            instructions: ORIGIN_INSTRUCTIONS.into(),
+            hints: BTreeMap::from([(MEMORY_HINT.into(), ORIGIN_HINT.into())]),
+        }
+    }
+
+    fn cwd_moved() -> FactsUpdate {
+        FactsUpdate {
+            cwd: Some(HERE_CWD.into()),
+            ..FactsUpdate::default()
+        }
+    }
+
+    fn date_moved(date: &str) -> FactsUpdate {
+        FactsUpdate {
+            date: Some(date.into()),
+            ..FactsUpdate::default()
+        }
+    }
+
+    fn prior_turn() -> Vec<Message> {
+        vec![
+            Message::user(QUEUED_MESSAGES[0].into()),
+            text_response(StopReason::EndTurn).message,
+        ]
+    }
+
+    /// Stored by `into_session` and opened the way every resume opens one.
+    fn imported(facts: Option<PromptFacts>, messages: Vec<Message>) -> History {
+        let mut session = Transcript {
+            facts,
+            messages,
+            ..Transcript::default()
+        }
+        .into_session(StoredSession::new("", HERE_CWD))
+        .unwrap();
+        History::restored(session.drain_messages()).with_frame(session.frame().cloned())
+    }
+
+    /// The imported facts are older than the update after them, so the model
+    /// holds the update's date and every diff has to start from there.
+    async fn after_import(h: &mut Harness) -> usize {
+        let stale_update = Message::context_update(STALE_UPDATE.into(), date_moved(ORIGIN_DATE));
+        let facts = PromptFacts {
+            date: STALE_DATE.into(),
+            ..origin_facts()
+        };
+        h.history = imported(Some(facts), [vec![stale_update], prior_turn()].concat());
+        h.world.change(|f| *f = origin_facts());
+        h.history.len()
+    }
+
+    async fn after_rebuild_on_resume(h: &mut Harness) -> usize {
+        h.world.change(|f| *f = origin_facts());
+        h.run_in(AgentMode::Build).await;
+        let resumed_len = h.history.len();
+        *h.world.tool.lock().unwrap() = RELOADED_TOOL;
+        h.restart(resumed_len);
+        resumed_len
+    }
+
+    fn appended_updates(history: &History, from: usize) -> Vec<FactsUpdate> {
+        history.as_slice()[from..]
+            .iter()
+            .filter_map(Message::facts_update)
+            .cloned()
+            .collect()
+    }
+
+    fn announced_rebuild(events: &[Envelope]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(&e.event, AgentEvent::Notice { text } if text == FRAME_REBUILT))
+    }
+
+    #[test_case(|_: &mut PromptFacts| {}, vec![] ; "facts_match")]
+    #[test_case(|f: &mut PromptFacts| f.cwd = HERE_CWD.into(), vec![cwd_moved()] ; "cwd_moved")]
+    #[test_case(|f: &mut PromptFacts| f.date = NEXT_DATE.into(), vec![date_moved(NEXT_DATE)] ; "date_moved")]
+    #[test_case(|f: &mut PromptFacts| { f.instructions = HERE_INSTRUCTIONS.into(); f.hints.clear(); }, vec![] ; "instructions_and_hints_never")]
+    #[tokio::test]
+    async fn first_run_after_import_tells_what_moved(
+        change: fn(&mut PromptFacts),
+        told: Vec<FactsUpdate>,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        let imported_len = after_import(&mut h).await;
+        h.world.change(change);
+        let events = h.run_in(AgentMode::Build).await;
+        h.run_in(AgentMode::Build).await;
+
+        h.assert_append_only();
+        assert!(!announced_rebuild(&events), "an import loses no cache");
+        assert_eq!(
+            appended_updates(&h.history, imported_len),
+            told,
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_without_facts_tells_nothing() {
+        let mut h = Harness::new(Vec::new());
+        h.history = imported(None, prior_turn());
+        h.world.change(|f| *f = origin_facts());
+        let events = h.run_in(AgentMode::Build).await;
+
+        assert!(!announced_rebuild(&events));
+        assert!(updates(&h.history).is_empty());
+    }
+
+    /// The same hole as an import: a fact only the old prompt stated used to
+    /// be dropped silently when the frame was rebuilt on resume.
+    #[test_case(|_: &mut PromptFacts| {}, vec![] ; "facts_match")]
+    #[test_case(|f: &mut PromptFacts| f.cwd = HERE_CWD.into(), vec![cwd_moved()] ; "cwd_moved")]
+    #[test_case(|f: &mut PromptFacts| f.date = NEXT_DATE.into(), vec![date_moved(NEXT_DATE)] ; "date_moved")]
+    #[test_case(|f: &mut PromptFacts| { f.instructions = HERE_INSTRUCTIONS.into(); f.hints.clear(); }, vec![] ; "instructions_and_hints_never")]
+    #[tokio::test]
+    async fn rebuilt_frame_on_resume_tells_what_moved(
+        change: fn(&mut PromptFacts),
+        told: Vec<FactsUpdate>,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        let resumed_len = after_rebuild_on_resume(&mut h).await;
+        h.world.change(change);
+        let events = h.run_in(AgentMode::Build).await;
+        h.run_in(AgentMode::Build).await;
+
+        assert!(announced_rebuild(&events));
+        assert_eq!(
+            appended_updates(&h.history, resumed_len),
+            told,
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+        let requests = h.requests.lock().unwrap();
+        assert!(
+            requests[1].messages.starts_with(&requests[0].messages),
+            "{MESSAGES_KEPT_MSG}"
+        );
+        assert_append_only(&requests[1], &requests[2]);
+    }
+
+    /// The correction rides on the update before the first prompt, so editing
+    /// that prompt cuts it. The frame still knows what the transcript says.
+    #[tokio::test]
+    async fn rewind_past_the_correction_tells_it_again() {
+        let mut h = Harness::new(Vec::new());
+        let imported_len = after_import(&mut h).await;
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build).await;
+        h.requests.lock().unwrap().clear();
+        h.restart(imported_len);
+        h.run_in(AgentMode::Build).await;
+        h.run_in(AgentMode::Build).await;
+
+        h.assert_append_only();
+        assert_eq!(
+            appended_updates(&h.history, imported_len),
+            vec![cwd_moved()],
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    /// A frame rebuilt after an update must not keep what that update told.
+    /// Rewinding past the update leaves only the first frame's cwd in the
+    /// transcript, so moving to the updated cwd again has to be told.
+    #[tokio::test]
+    async fn rewind_past_an_update_before_a_rebuild_tells_it_again() {
+        let mut h = Harness::new(Vec::new());
+        h.world.change(|f| *f = origin_facts());
+        h.run_in(AgentMode::Build).await;
+        let before_update = h.history.len();
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build).await;
+        *h.world.tool.lock().unwrap() = RELOADED_TOOL;
+        h.world.change(|f| f.cwd = ELSEWHERE_CWD.into());
+        h.run_in(AgentMode::Build).await;
+        h.restart(before_update);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build).await;
+
+        assert_eq!(
+            appended_updates(&h.history, before_update),
+            vec![cwd_moved()],
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    /// What moved and what changed since are one update, never two in a row.
+    #[test_case(after_import ; "import")]
+    #[test_case(after_rebuild_on_resume ; "rebuild_on_resume")]
+    #[tokio::test]
+    async fn new_frame_tells_one_update_per_run_start(setup: impl AsyncFn(&mut Harness) -> usize) {
+        let mut h = Harness::new(Vec::new());
+        let from = setup(&mut h).await;
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Plan(PLAN_FILE.into())).await;
+
+        assert_eq!(
+            appended_updates(&h.history, from),
+            vec![FactsUpdate {
+                plan: Some(PlanChange::Entered(PLAN_FILE.into())),
+                ..cwd_moved()
+            }]
+        );
+    }
+
+    /// Which servers are up by now is luck, so a resumed process sends the MCP
+    /// tools its frame went out with and only appends the new ones.
+    #[tokio::test]
+    async fn resumed_session_keeps_the_mcp_part_of_its_frame() {
+        let _home = isolated_home();
+        let mut h = Harness::new(Vec::new());
+        h.model = tool_search_model();
+        let reply = || vec![text_response(StopReason::EndTurn)];
+        h.run(default_input(), reply(), |agent| {
+            agent.mcp = Some(stub_session(&[("srv.first", "")]));
+        })
+        .await;
+        h.restart(h.history.len());
+        h.run(default_input(), reply(), |agent| {
+            agent.mcp = Some(stub_session(&[("srv.first", ""), ("srv.second", "")]));
+        })
+        .await;
+
+        h.assert_append_only();
+        let requests = h.requests.lock().unwrap();
+        let resumed = tool_names(&requests.last().unwrap().tools);
+        assert_eq!(resumed.last(), Some(&"srv__second"));
+        assert_eq!(
+            h.history.frame().unwrap().mcp_tools.len(),
+            resumed.len() - 1,
+            "the appended tool is stored with the frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_refreshes_the_frame() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        h.world.change(|f| f.date = NEXT_DATE.into());
+        let replies = (0..3).map(|_| thought_response()).collect();
+        h.run(default_input(), replies, with_compact).await;
+
+        let requests = h.requests.lock().unwrap();
+        assert_append_only(&requests[0], &requests[1]);
+        let after = requests.last().unwrap();
+        assert!(after.system.contains(NEXT_DATE));
+        assert!(
+            !after.thinking().iter().any(is_signed),
+            "{STALE_THINKING_MSG}"
+        );
+        assert!(updates(&h.history).is_empty());
+    }
+
+    /// The prompt a compaction builds can't say plan mode either. If the
+    /// update was summarized away it has to be told again, and if it was
+    /// carried over with the unanswered prompt it must not be told twice.
+    #[test_case(false ; "summarized_away")]
+    #[test_case(true ; "carried_over")]
+    #[tokio::test]
+    async fn plan_mode_survives_compaction(carried: bool) {
+        let (prior, replies) = if carried {
+            let prior = (0..OVERFLOW_CHUNKS)
+                .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+                .collect();
+            (prior, 2)
+        } else {
+            (Vec::new(), 3)
+        };
+        let mut h = Harness::new(prior);
+        if carried {
+            h.model = small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT);
+        }
+        let input = AgentInput {
+            mode: AgentMode::Plan(PLAN_FILE.into()),
+            ..default_input()
+        };
+        let replies = (0..replies)
+            .map(|_| text_response(StopReason::EndTurn))
+            .collect();
+        h.run(input, replies, |agent| {
+            if carried {
+                agent.auto_compact = true;
+            } else {
+                with_compact(agent);
+            }
+        })
+        .await;
+
+        let updates = updates(&h.history);
+        assert_eq!(updates.len(), 1, "{PLAN_TOLD_ONCE_MSG}");
+        assert!(updates[0].contains(PLAN_FILE), "{PLAN_TOLD_ONCE_MSG}");
+        let told_at = h
+            .history
+            .as_slice()
+            .iter()
+            .position(Message::is_context_update)
+            .unwrap();
+        let last_request = h.requests.lock().unwrap().last().unwrap().messages.len();
+        assert!(told_at < last_request, "{PLAN_TOLD_ONCE_MSG}");
+    }
+
+    /// The model never sees a dropped message, so it must not see the change
+    /// that came with it either. The next kept message brings it along, right
+    /// in front of itself and after anything a dropped message left behind.
+    #[tokio::test]
+    async fn dropped_message_leaves_the_change_for_the_next_kept_one() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        h.world.change(|f| f.date = NEXT_DATE.into());
+        let drop_layer = |agent: &mut Agent<'_>| {
+            script(&agent.registry, drop_blocked);
+        };
+        let blocked = AgentInput {
+            message: BLOCKED.into(),
+            ..default_input()
+        };
+        let (reason, _) = h.run(blocked, Vec::new(), drop_layer).await;
+        assert_eq!(reason, DoneReason::Dropped);
+        assert!(updates(&h.history).is_empty());
+
+        let burst = AgentInput {
+            earlier: vec![EarlierInput {
+                message: BLOCKED.into(),
+                images: Vec::new(),
+                preamble: vec![Message::observation(SHELL_RESULT.into())],
+            }],
+            ..default_input()
+        };
+        h.run(burst, vec![text_response(StopReason::EndTurn)], drop_layer)
+            .await;
+
+        h.assert_append_only();
+        let updates = updates(&h.history);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].contains(NEXT_DATE));
+        let messages = h.history.as_slice();
+        let told_at = messages
+            .iter()
+            .position(Message::is_context_update)
+            .unwrap();
+        assert_eq!(messages[told_at - 1].user_text(), Some(SHELL_RESULT));
+        assert_eq!(
+            messages[told_at + 1].user_text(),
+            Some(default_input().message.as_str())
+        );
+    }
+
+    /// An interrupt can switch modes. The model hears it right before the
+    /// message that switched, not whenever another change comes along.
+    #[tokio::test]
+    async fn interrupt_switching_mode_is_told_with_it() {
+        let mut h = Harness::new(Vec::new());
+        let interrupt = AgentInput {
+            mode: AgentMode::Plan(PLAN_FILE.into()),
+            ..default_input()
+        };
+        let replies = vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+        ];
+        h.run(default_input(), replies, |agent| {
+            agent.interrupt_source =
+                Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                    vec![interrupt],
+                )]));
+        })
+        .await;
+
+        h.assert_append_only();
+        let messages = h.history.as_slice();
+        let told_at = messages
+            .iter()
+            .position(Message::is_context_update)
+            .unwrap();
+        assert!(updates(&h.history)[0].contains(PLAN_FILE));
+        assert!(has_interrupt_in_history(&messages[told_at + 1..]));
+        let last_request = h.requests.lock().unwrap().last().unwrap().messages.len();
+        assert_eq!(last_request, messages.len() - 1, "the update went out");
+    }
+
+    const CONTINUE_KEPT_MSG: &str =
+        "an update is no unanswered input, so the compacted transcript must still say to continue";
+
+    /// A switch to a smaller window compacts before the next request. The
+    /// prompt the compaction builds already names the new model, so nothing
+    /// is told, and the transcript still ends on the nudge to continue.
+    #[tokio::test]
+    async fn compaction_after_a_mid_run_switch_still_continues() {
+        let mut h = Harness::new(Vec::new());
+        let switched = Model {
+            id: SWITCHED_MODEL.into(),
+            ..small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT)
+        };
+        let big_turn = StreamResponse {
+            usage: TokenUsage {
+                input: u64::from(TINY_CONTEXT_WINDOW) * 10,
+                ..Default::default()
+            },
+            ..tool_call_response("glob", "t1")
+        };
+        let replies = vec![
+            big_turn,
+            text_response(StopReason::EndTurn),
+            text_response(StopReason::EndTurn),
+        ];
+        let start = h.model.clone();
+        h.run(default_input(), replies, |agent| {
+            let provider = Arc::clone(&agent.provider);
+            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: start,
+                provider: Arc::clone(&provider),
+            }));
+            agent.model_sync = Some(Arc::clone(&slot));
+            agent.interrupt_source = Some(Arc::new(ModelPicker {
+                slot,
+                provider,
+                model: switched,
+            }));
+            agent.auto_compact = true;
+        })
+        .await;
+
+        let continue_text = compaction::continue_message(None);
+        let messages = h.history.as_slice();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.first_text_content() == Some(continue_text.as_str())),
+            "{CONTINUE_KEPT_MSG}"
+        );
+        assert!(updates(&h.history).is_empty(), "{CONTINUE_KEPT_MSG}");
+        let requests = h.requests.lock().unwrap();
+        assert_eq!(requests.last().unwrap().model, SWITCHED_MODEL);
+    }
+
+    /// A cut-off answer is continued by sending it back last. An update after
+    /// it would get a reply instead, so the change waits for a user turn.
+    #[tokio::test]
+    async fn change_waits_while_an_answer_is_continued() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        h.world.change(|f| f.date = NEXT_DATE.into());
+        let builder = h.world.builder();
+        let (mut agent, _event_rx) = make_agent_with(
+            Arc::new(MockProvider::new(Vec::new())),
+            h.model.clone(),
+            &mut h.history,
+        );
+        agent.context = builder;
+        agent.refresh_frame().unwrap();
+
+        agent.prepare_request().unwrap();
+        assert!(matches!(
+            agent.history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
+        agent.history.push(Message::user(PENDING_PROMPT.into()));
+        agent.prepare_request().unwrap();
+        assert!(agent.history.as_slice().last().unwrap().is_context_update());
+    }
+
+    /// The filter comes from the frame. Without one no tool may run under
+    /// some other, wider set.
+    #[tokio::test]
+    async fn tool_calls_without_a_frame_fail_closed() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let err = agent
+            .process_tool_calls(tool_call_response("glob", "t1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Config { message } if message == NO_FRAME));
+    }
     /// Two responses are the whole budget: the opening turn, then the one turn
     /// that answers all three queued messages. Answering them one by one would
     /// ask the mock for a response it does not have.
-    #[test]
-    fn queued_messages_are_delivered_in_one_turn() {
-        smol::block_on(async {
-            let inputs = Vec::from(QUEUED_MESSAGES.map(|text| AgentInput {
-                message: text.into(),
-                ..default_input()
-            }));
-            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(inputs)]);
-            let mut history = History::new(Vec::new());
-            let (agent, event_rx) = make_agent(
-                MockProvider::new(vec![
-                    text_response(StopReason::EndTurn),
-                    text_response(StopReason::EndTurn),
-                ]),
-                &mut history,
-            );
+    #[tokio::test]
+    async fn queued_messages_are_delivered_in_one_turn() {
+        let inputs = Vec::from(QUEUED_MESSAGES.map(|text| AgentInput {
+            message: text.into(),
+            ..default_input()
+        }));
+        let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(inputs)]);
+        let mut history = History::new(Vec::new());
+        let (agent, event_rx) = make_agent(
+            MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
 
-            let mut agent = agent.with_interrupt_source(source);
-            agent.run(default_input()).await.unwrap();
-            let events = drain_events(&event_rx);
-            drop(agent);
+        let mut agent = agent.with_interrupt_source(source);
+        agent.run(default_input()).await.unwrap();
+        let events = drain_events(&event_rx);
+        drop(agent);
 
-            let user_texts: Vec<_> = history
-                .as_slice()
+        let user_texts: Vec<_> = history
+            .as_slice()
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .filter_map(Message::user_text)
+            .collect();
+        assert_eq!(user_texts[1..], QUEUED_MESSAGES);
+        assert_eq!(
+            events
                 .iter()
-                .filter(|m| matches!(m.role, Role::User))
-                .filter_map(Message::user_text)
-                .collect();
-            assert_eq!(user_texts[1..], QUEUED_MESSAGES);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| matches!(e.event, AgentEvent::QueueItemConsumed { .. }))
-                    .count(),
-                QUEUED_MESSAGES.len()
-            );
-        });
+                .filter(|e| matches!(e.event, AgentEvent::QueueItemConsumed { .. }))
+                .count(),
+            QUEUED_MESSAGES.len()
+        );
     }
 
     #[test_case(
@@ -1436,55 +3502,59 @@ mod tests {
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
     )]
-    fn compaction_through_interrupt(
+    #[tokio::test]
+    async fn compaction_through_interrupt(
         prior: Vec<Message>,
         commands: Vec<ExtractedCommand>,
         responses: Vec<StreamResponse>,
     ) {
-        smol::block_on(async {
-            let source = MockInterruptSource::new(commands);
+        let source = MockInterruptSource::new(commands);
 
-            let mut history = History::new(prior);
-            let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let result = agent
-                .with_interrupt_source(source)
-                .run(default_input())
-                .await;
+        let mut history = History::new(prior);
+        let (agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let result = agent
+            .with_interrupt_source(source)
+            .run(default_input())
+            .await;
 
-            assert!(result.is_ok());
-        });
+        assert!(result.is_ok());
+        assert!(matches!(
+            compaction_events(&drain_events(&event_rx)).as_slice(),
+            [
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionDone { .. }
+            ]
+        ));
     }
 
     /// `TurnComplete`, `Done` and the auto-compaction trigger all report the
     /// same context number, so nobody downstream thinks it has spare room.
-    #[test]
-    fn context_size_is_one_gauge_across_turn_complete_and_done() {
-        smol::block_on(async {
-            let mut response = text_response(StopReason::EndTurn);
-            response.usage = TokenUsage {
-                input: 1_000,
-                output: 400,
-                cache_read: 250,
-                cache_creation: 50,
-                ..Default::default()
-            };
-            let expected = response.usage.total_input();
-            let mut history = History::new(vec![Message::user("go".into())]);
-            let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
-            agent.run(default_input()).await.unwrap();
-            drop(agent);
+    #[tokio::test]
+    async fn context_size_is_one_gauge_across_turn_complete_and_done() {
+        let mut response = text_response(StopReason::EndTurn);
+        response.usage = TokenUsage {
+            input: 1_000,
+            output: 400,
+            cache_read: 250,
+            cache_creation: 50,
+            ..Default::default()
+        };
+        let expected = response.usage.total_input() as u32;
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
 
-            let events = drain_events(&event_rx);
-            let reported: Vec<u32> = events
-                .iter()
-                .filter_map(|e| match &e.event {
-                    AgentEvent::TurnComplete(tc) => tc.context_size,
-                    AgentEvent::Done { context_size, .. } => Some(*context_size),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(reported, vec![expected, expected], "{ONE_GAUGE_MSG}");
-        });
+        let events = drain_events(&event_rx);
+        let reported: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                AgentEvent::TurnComplete(tc) => tc.context_size,
+                AgentEvent::Done { context_size, .. } => Some(*context_size),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported, vec![expected, expected], "{ONE_GAUGE_MSG}");
     }
 
     /// The ledger banks the un-subsidised list price for metered models too,
@@ -1492,67 +3562,130 @@ mod tests {
     /// turns happened to be subsidised. `TurnComplete` stays narrow: it only
     /// carries the reference figure shown beside a `$0` bill, and a metered
     /// model has none.
-    #[test]
-    fn ledger_banks_list_cost_on_a_metered_model() {
-        smol::block_on(async {
-            let mut response = text_response(StopReason::EndTurn);
-            response.usage = TokenUsage {
-                input: 1_000,
-                output: 400,
-                cache_read: 250,
-                cache_creation: 50,
-                ..Default::default()
-            };
-            let usage = response.usage;
-            let mut history = History::new(vec![Message::user("go".into())]);
-            let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
-            agent.run(default_input()).await.unwrap();
-            drop(agent);
+    #[tokio::test]
+    async fn ledger_banks_list_cost_on_a_metered_model() {
+        let mut response = text_response(StopReason::EndTurn);
+        response.usage = TokenUsage {
+            input: 1_000,
+            output: 400,
+            cache_read: 250,
+            cache_creation: 50,
+            ..Default::default()
+        };
+        let usage = response.usage;
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
 
-            let expected = default_model()
-                .list_cost(&usage, false)
-                .expect("the curated table prices this model");
-            assert!(expected > 0.0);
+        let expected = default_model()
+            .list_cost(&usage, false)
+            .expect("the curated table prices this model");
+        assert!(expected > 0.0);
 
-            let events = drain_events(&event_rx);
-            let turn_subsidised_list_cost = events.iter().find_map(|e| match &e.event {
-                AgentEvent::TurnComplete(tc) => Some(tc.subsidised_list_cost),
-                _ => None,
-            });
-            let done_list_cost = events.iter().find_map(|e| match &e.event {
-                AgentEvent::Done { list_cost, .. } => Some(*list_cost),
-                _ => None,
-            });
-            assert_eq!(turn_subsidised_list_cost, Some(None));
-            assert_eq!(done_list_cost, Some(Some(expected)));
+        let events = drain_events(&event_rx);
+        let turn_subsidised_list_cost = events.iter().find_map(|e| match &e.event {
+            AgentEvent::TurnComplete(tc) => Some(tc.subsidised_list_cost),
+            _ => None,
         });
+        let done_list_cost = events.iter().find_map(|e| match &e.event {
+            AgentEvent::Done { list_cost, .. } => Some(*list_cost),
+            _ => None,
+        });
+        assert_eq!(turn_subsidised_list_cost, Some(None));
+        assert_eq!(done_list_cost, Some(Some(expected)));
+    }
+
+    /// The summary request never asks for fast mode, so a fast session must
+    /// not price it at fast rates, even when the summary turns out unusable
+    /// and its retry is paid for too.
+    #[test_case(|| text_response(StopReason::EndTurn), 1 ; "usable_summary")]
+    #[test_case(thinking_response, 2 ; "unusable_summary_and_its_retry")]
+    #[tokio::test]
+    async fn fast_session_bills_compaction_at_standard_rates(
+        response: fn() -> StreamResponse,
+        attempts: u64,
+    ) {
+        const INPUT_TOKENS: u64 = 1_000;
+        const OUTPUT_TOKENS: u64 = 100;
+        let usage = TokenUsage {
+            input: INPUT_TOKENS,
+            output: OUTPUT_TOKENS,
+            ..Default::default()
+        };
+        let provider = MockProvider::new(
+            (0..attempts)
+                .map(|_| StreamResponse {
+                    usage,
+                    ..response()
+                })
+                .collect(),
+        );
+        let requests = Arc::clone(&provider.requests);
+        let mut model = default_model();
+        model.supports_fast_override = Some(FastSupport::Supported);
+        model.pricing = ModelPricing {
+            input: 1.0,
+            output: 2.0,
+            fast: Some(FastPricing {
+                input: 3.0,
+                output: 6.0,
+            }),
+            ..Default::default()
+        };
+        let mut history = History::new(vec![Message::user(CARRIED.into())]);
+        let (mut agent, _event_rx) = make_agent_with(Arc::new(provider), model, &mut history);
+        agent.opts.fast = true;
+        agent.carry_from = agent.history.len();
+
+        let _ = agent.do_compact(CompactSteer::default()).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), attempts as usize);
+        assert!(requests.iter().all(|request| !request.opts.fast));
+        let billed = TokenUsage {
+            input: INPUT_TOKENS * attempts,
+            output: OUTPUT_TOKENS * attempts,
+            ..Default::default()
+        };
+        let totals = agent.ledger.totals();
+        assert_eq!(totals.usage, billed);
+        assert_eq!(totals.cost, agent.model.billed_cost(&billed, false));
+        assert_eq!(totals.list_cost, agent.model.list_cost(&billed, false));
     }
 
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
     #[test_case(true,  150_000, false ; "enabled_but_below_threshold")]
     #[test_case(false, 170_000, false ; "disabled_even_over_threshold")]
-    fn try_auto_compact_behavior(enabled: bool, context_size: u32, expected: bool) {
-        smol::block_on(async {
-            let responses = if expected {
-                vec![text_response(StopReason::EndTurn)]
-            } else {
-                vec![]
-            };
-            let mut history = History::new(vec![Message::user("go".into())]);
-            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            *agent.gauge = ContextGauge::restored(context_size);
-            agent.model = Arc::new(small_context_model(200_000, 8_192));
-            agent.auto_compact = enabled;
-            agent.try_auto_compact().await.unwrap();
-            drop(agent);
-            assert_eq!(
-                has_event(&drain_events(&event_rx), |e| matches!(
-                    e,
-                    AgentEvent::AutoCompacting { .. }
-                )),
-                expected,
-            );
-        });
+    #[tokio::test]
+    async fn try_auto_compact_behavior(enabled: bool, context_size: u32, expected: bool) {
+        let responses = if expected {
+            vec![text_response(StopReason::EndTurn)]
+        } else {
+            vec![]
+        };
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        *agent.gauge = ContextGauge::restored(context_size);
+        agent.model = Arc::new(small_context_model(200_000, 8_192));
+        agent.auto_compact = enabled;
+        agent.try_auto_compact().await.unwrap();
+        drop(agent);
+        let events = drain_events(&event_rx);
+        assert_eq!(
+            matches!(
+                compaction_events(&events).as_slice(),
+                [
+                    AgentEvent::AutoCompacting { .. },
+                    AgentEvent::CompactionStarted,
+                    AgentEvent::CompactionDone { .. }
+                ]
+            ),
+            expected,
+        );
+        if !expected {
+            assert!(compaction_events(&events).is_empty());
+        }
     }
 
     const OVERFLOW_CHUNK: &str = "restored transcript chunk ";
@@ -1568,53 +3701,51 @@ mod tests {
     /// A resumed transcript that already fills the window has to be caught
     /// before the first request, and the prompt that triggered the run must
     /// not be summarized away along with it.
-    #[test]
-    fn resumed_overflowing_history_compacts_before_first_request() {
-        smol::block_on(async {
-            let prior = (0..OVERFLOW_CHUNKS)
-                .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
-                .collect();
-            let mut history = History::new(prior);
-            let (mut agent, event_rx) = make_agent(
-                MockProvider::new(vec![
-                    text_response(StopReason::EndTurn),
-                    text_response(StopReason::EndTurn),
-                ]),
-                &mut history,
-            );
-            agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
-            agent.auto_compact = true;
-            agent
-                .run(AgentInput {
-                    message: PENDING_PROMPT.into(),
-                    ..default_input()
-                })
-                .await
-                .unwrap();
-            drop(agent);
+    #[tokio::test]
+    async fn resumed_overflowing_history_compacts_before_first_request() {
+        let prior = (0..OVERFLOW_CHUNKS)
+            .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .collect();
+        let mut history = History::new(prior);
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
+        agent.auto_compact = true;
+        agent
+            .run(AgentInput {
+                message: PENDING_PROMPT.into(),
+                ..default_input()
+            })
+            .await
+            .unwrap();
+        drop(agent);
 
-            let first = drain_events(&event_rx)
-                .into_iter()
-                .map(|e| e.event)
-                .find(|e| {
-                    matches!(
-                        e,
-                        AgentEvent::AutoCompacting { .. } | AgentEvent::TurnComplete(_)
-                    )
-                });
-            assert!(
-                matches!(first, Some(AgentEvent::AutoCompacting { .. })),
-                "{COMPACT_FIRST_MSG}"
-            );
-            assert!(
-                history
-                    .as_slice()
-                    .iter()
-                    .flat_map(|m| &m.content)
-                    .any(|b| matches!(b, ContentBlock::Text { text } if text == PENDING_PROMPT)),
-                "{PROMPT_KEPT_MSG}"
-            );
-        });
+        let first = drain_events(&event_rx)
+            .into_iter()
+            .map(|e| e.event)
+            .find(|e| {
+                matches!(
+                    e,
+                    AgentEvent::AutoCompacting { .. } | AgentEvent::TurnComplete(_)
+                )
+            });
+        assert!(
+            matches!(first, Some(AgentEvent::AutoCompacting { .. })),
+            "{COMPACT_FIRST_MSG}"
+        );
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == PENDING_PROMPT)),
+            "{PROMPT_KEPT_MSG}"
+        );
     }
 
     const OVERFLOW_STATUS: u16 = 413;
@@ -1658,26 +3789,106 @@ mod tests {
     /// overflow means it did not help.
     #[test_case(0, true, RECOVER_MSG ; "unpredicted_overflow_compacts_and_retries")]
     #[test_case(MAX_OVERFLOW_RECOVERIES, false, GIVE_UP_MSG ; "exhausted_recoveries_surface_the_error")]
-    fn overflow_recovery(recoveries: u32, expected: bool, message: &str) {
-        smol::block_on(async {
-            let mut history = History::new(vec![Message::user("go".into())]);
-            let (mut agent, event_rx) = make_agent(OverflowProvider(Mutex::new(1)), &mut history);
-            agent.auto_compact = true;
-            agent.overflow_recoveries = recoveries;
+    #[tokio::test]
+    async fn overflow_recovery(recoveries: u32, expected: bool, message: &str) {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, event_rx) = make_agent(OverflowProvider(Mutex::new(1)), &mut history);
+        agent.auto_compact = true;
+        agent.overflow_recoveries = recoveries;
 
-            let recovered = agent.run(default_input()).await.is_ok();
-            drop(agent);
+        let recovered = agent.run(default_input()).await.is_ok();
+        drop(agent);
 
-            assert_eq!(recovered, expected, "{message}");
-            assert_eq!(
-                has_event(&drain_events(&event_rx), |e| matches!(
-                    e,
-                    AgentEvent::AutoCompacting { .. }
-                )),
-                expected,
-                "{message}"
-            );
+        assert_eq!(recovered, expected, "{message}");
+        assert_eq!(
+            has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            expected,
+            "{message}"
+        );
+    }
+
+    const UNBOUND_MESSAGE: &str = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
+    const UNBOUND_RECOVER_MSG: &str =
+        "thinking bound to a moved prefix must be dropped once and the turn retried";
+    const UNBOUND_GIVE_UP_MSG: &str = "with no thinking left to drop, the error must surface";
+
+    /// Fails while a request still carries thinking, or always.
+    struct UnboundThinkingProvider {
+        always: bool,
+    }
+
+    impl Provider for UnboundThinkingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let thinking = messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(ContentBlock::is_thinking);
+            Box::pin(async move {
+                if self.always || thinking {
+                    Err(AgentError::api(400, UNBOUND_MESSAGE))
+                } else {
+                    Ok(text_response(StopReason::EndTurn))
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    #[test_case(false, true, UNBOUND_RECOVER_MSG ; "drops_thinking_and_retries")]
+    #[test_case(true, false, UNBOUND_GIVE_UP_MSG ; "nothing_left_to_drop_surfaces_the_error")]
+    #[tokio::test]
+    async fn unbound_thinking_recovery(always: bool, expected: bool, message: &str) {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "hmm".into(),
+                    signature: Some("sig".into()),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ],
+            ..Default::default()
         });
+        let (mut agent, event_rx) = make_agent(UnboundThinkingProvider { always }, &mut history);
+
+        let recovered = agent.run(default_input()).await.is_ok();
+        drop(agent);
+
+        assert_eq!(recovered, expected, "{message}");
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .all(|b| !b.is_thinking()),
+            "{message}"
+        );
+        assert!(
+            has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::Notice { text } if text == THINKING_DROPPED
+            )),
+            "{message}"
+        );
     }
 
     const QUEUED_INPUT: &str = "actually, check the other module first";
@@ -1686,177 +3897,169 @@ mod tests {
 
     /// The turn before it already appended an assistant message, so the tail
     /// alone cannot tell that this input is still unanswered.
-    #[test]
-    fn compaction_carries_input_queued_mid_run() {
-        smol::block_on(async {
-            let mut history = History::new(Vec::new());
-            let filling = StreamResponse {
-                usage: TokenUsage {
-                    input: TINY_CONTEXT_WINDOW,
-                    ..Default::default()
-                },
-                ..text_response(StopReason::EndTurn)
-            };
-            let (mut agent, event_rx) = make_agent(
-                MockProvider::new(vec![
-                    filling,
-                    text_response(StopReason::EndTurn),
-                    text_response(StopReason::EndTurn),
-                ]),
-                &mut history,
-            );
-            agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
-            agent.auto_compact = true;
-            agent.interrupt_source =
-                Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                    vec![AgentInput {
-                        message: QUEUED_INPUT.into(),
-                        ..default_input()
-                    }],
-                )]));
-            agent.run(default_input()).await.unwrap();
-            drop(agent);
-
-            assert!(
-                has_event(&drain_events(&event_rx), |e| matches!(
-                    e,
-                    AgentEvent::AutoCompacting { .. }
-                )),
-                "{QUEUED_COMPACTED_MSG}"
-            );
-            assert!(
-                history.as_slice().iter().flat_map(|m| &m.content).any(
-                    |b| matches!(b, ContentBlock::Text { text } if text.contains(QUEUED_INPUT))
-                ),
-                "{QUEUED_KEPT_MSG}"
-            );
-        });
-    }
-
-    #[test]
-    fn do_compact_appends_post_instructions_to_continue_message() {
-        smol::block_on(async {
-            const POST: &str = "Re-read plan.md";
-            let mut history = History::new(vec![Message::user("go".into())]);
-            let (mut agent, _event_rx) = make_agent(
-                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
-                &mut history,
-            );
-            agent.config.post_compaction_instructions = Some(POST.into());
-            agent.carry_from = agent.history.len();
-            agent.do_compact(None).await.unwrap();
-            drop(agent);
-
-            let last = history.as_slice().last().unwrap();
-            assert!(matches!(
-                &last.content[0],
-                ContentBlock::Text { text } if text.ends_with(POST) && text != POST
-            ));
-        });
-    }
-
-    #[test]
-    fn cancel_token_aborts_during_api_call() {
-        smol::block_on(async {
-            let (trigger, cancel) = CancelToken::new();
-            trigger.cancel();
-
-            let mut history = History::new(Vec::new());
-            let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
-            let mut agent = agent.with_cancel(cancel);
-
-            assert_eq!(
-                agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
-            );
-            drop(agent);
-            assert_ends_with_cancel_marker(&history);
-            assert!(has_event(&drain_events(&event_rx), |e| matches!(
-                e,
-                AgentEvent::Done {
-                    reason: DoneReason::Cancelled,
-                    ..
-                }
-            )));
-        });
-    }
-
-    #[test]
-    fn cancel_mid_stream_keeps_partial_text_in_history() {
-        const PARTIAL: &str = "partial answer";
-        smol::block_on(async {
-            let (trigger, cancel) = CancelToken::new();
-            let provider = StubStreamProvider {
-                delta: Some(PARTIAL),
-                cancel_after_delta: Mutex::new(Some(trigger)),
+    #[tokio::test]
+    async fn compaction_carries_input_queued_mid_run() {
+        let mut history = History::new(Vec::new());
+        let filling = StreamResponse {
+            usage: TokenUsage {
+                input: u64::from(TINY_CONTEXT_WINDOW),
                 ..Default::default()
-            };
-            let mut history = History::new(Vec::new());
-            let (agent, _event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_cancel(cancel);
+            },
+            ..text_response(StopReason::EndTurn)
+        };
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![
+                filling,
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
+        agent.auto_compact = true;
+        agent.interrupt_source = Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+            vec![AgentInput {
+                message: QUEUED_INPUT.into(),
+                ..default_input()
+            }],
+        )]));
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
 
-            assert_eq!(
-                agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
-            );
-            drop(agent);
-            assert_ends_with_cancel_marker(&history);
-            let messages = history.as_slice();
-            let partial = &messages[messages.len() - 2];
-            assert!(matches!(partial.role, Role::Assistant));
-            let expected = format!("{PARTIAL}\n\n{CANCELLED_TEXT_NOTE}");
-            assert!(
-                matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
-                "kept text must carry the truncation note so the model never resumes it"
-            );
-        });
+        assert!(
+            has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::AutoCompacting { .. }
+            )),
+            "{QUEUED_COMPACTED_MSG}"
+        );
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(QUEUED_INPUT))),
+            "{QUEUED_KEPT_MSG}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_token_aborts_during_api_call() {
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+
+        let mut history = History::new(Vec::new());
+        let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
+        let mut agent = agent.with_cancel(cancel);
+
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::Cancelled
+        );
+        drop(agent);
+        assert_ends_with_cancel_marker(&history);
+        assert!(has_event(&drain_events(&event_rx), |e| matches!(
+            e,
+            AgentEvent::Done {
+                reason: DoneReason::Cancelled,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_keeps_partial_text_in_history() {
+        const PARTIAL: &str = "partial answer";
+        let (trigger, cancel) = CancelToken::new();
+        let provider = StubStreamProvider {
+            delta: Some(PARTIAL),
+            cancel_after_delta: Mutex::new(Some(trigger)),
+            ..Default::default()
+        };
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(provider, &mut history);
+        let mut agent = agent.with_cancel(cancel);
+
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::Cancelled
+        );
+        drop(agent);
+        assert_ends_with_cancel_marker(&history);
+        let messages = history.as_slice();
+        let partial = &messages[messages.len() - 2];
+        assert!(matches!(partial.role, Role::Assistant));
+        let expected = format!("{PARTIAL}\n\n{}", Cutter::User.cut_reply_note());
+        assert!(
+            matches!(&partial.content[0], ContentBlock::Text { text } if *text == expected),
+            "kept text must carry the truncation note so the model never resumes it"
+        );
     }
 
     /// The `Retry` event already made the view drop the failed attempt's
     /// text, so history must not resurrect it (see `StreamError`).
-    #[test]
-    fn cancel_during_retry_backoff_discards_failed_attempt_text() {
+    #[tokio::test]
+    async fn cancel_during_retry_backoff_discards_failed_attempt_text() {
         const PARTIAL: &str = "doomed attempt";
-        smol::block_on(async {
-            let (trigger, cancel) = CancelToken::new();
-            let provider = StubStreamProvider {
-                delta: Some(PARTIAL),
-                fail_status: Some(529),
-                ..Default::default()
-            };
-            let mut history = History::new(Vec::new());
-            let (agent, event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_cancel(cancel);
+        let (trigger, cancel) = CancelToken::new();
+        let provider = StubStreamProvider {
+            delta: Some(PARTIAL),
+            fail_status: Some(529),
+            ..Default::default()
+        };
+        let mut history = History::new(Vec::new());
+        let (agent, event_rx) = make_agent(provider, &mut history);
+        let mut agent = agent.with_cancel(cancel);
 
-            let mut trigger = Some(trigger);
-            let pump = smol::spawn(async move {
-                while let Ok(envelope) = event_rx.recv_async().await {
-                    if matches!(envelope.event, AgentEvent::Retry { .. })
-                        && let Some(t) = trigger.take()
-                    {
-                        t.cancel();
-                    }
+        let mut trigger = Some(trigger);
+        let pump = tokio::spawn(async move {
+            while let Ok(envelope) = event_rx.recv_async().await {
+                if matches!(envelope.event, AgentEvent::Retry { .. })
+                    && let Some(t) = trigger.take()
+                {
+                    t.cancel();
                 }
-            });
-
-            assert_eq!(
-                agent.run(default_input()).await.unwrap(),
-                DoneReason::Cancelled
-            );
-            drop(agent);
-            pump.await;
-
-            assert_ends_with_cancel_marker(&history);
-            assert!(
-                history
-                    .as_slice()
-                    .iter()
-                    .all(|m| !m.content.iter().any(
-                        |b| matches!(b, ContentBlock::Text { text } if text.contains(PARTIAL))
-                    )),
-                "failed attempt's text must not reach history"
-            );
+            }
         });
+
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::Cancelled
+        );
+        drop(agent);
+        pump.await.unwrap();
+
+        assert_ends_with_cancel_marker(&history);
+        assert!(
+            history.as_slice().iter().all(|m| !m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(PARTIAL)))),
+            "failed attempt's text must not reach history"
+        );
+    }
+
+    const UNAUTHORIZED: u16 = 401;
+
+    /// SDK and ACP hold a response channel for questions only, so having one
+    /// must not park a 401 on a re-login nothing will ever send.
+    #[tokio::test]
+    async fn auth_error_fails_the_run_without_reauth() {
+        let provider = StubStreamProvider {
+            fail_status: Some(UNAUTHORIZED),
+            ..Default::default()
+        };
+        let mut history = History::new(Vec::new());
+        let (agent, event_rx) = make_agent(provider, &mut history);
+        let answer_rx = flume::unbounded::<String>().1;
+        let mut agent = agent.with_user_response_rx(Arc::new(AsyncMutex::new(answer_rx)));
+
+        assert!(agent.run(default_input()).await.is_err());
+        assert!(
+            event_rx
+                .drain()
+                .all(|e| !matches!(e.event, AgentEvent::AuthRequired))
+        );
     }
 
     #[test_case(
@@ -1869,19 +4072,18 @@ mod tests {
         "t3"
         ; "doom_loop"
     )]
-    fn error_emits_tool_done_event(responses: Vec<StreamResponse>, expected_error_id: &str) {
-        smol::block_on(async {
-            let mut history = History::new(Vec::new());
-            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
-            drop(agent);
-            let events = drain_events(&event_rx);
+    #[tokio::test]
+    async fn error_emits_tool_done_event(responses: Vec<StreamResponse>, expected_error_id: &str) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let _ = agent.run(default_input()).await;
+        drop(agent);
+        let events = drain_events(&event_rx);
 
-            assert!(has_event(&events, |e| matches!(
-                e,
-                AgentEvent::ToolDone(done) if done.is_error && done.id == expected_error_id
-            )));
-        });
+        assert!(has_event(&events, |e| matches!(
+            e,
+            AgentEvent::ToolDone(done) if done.is_error && done.id == expected_error_id
+        )));
     }
 
     #[test_case(
@@ -1917,64 +4119,135 @@ mod tests {
         1, 0
         ; "no_nudge_without_recent_tools"
     )]
-    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expected_nudges: usize) {
-        smol::block_on(async {
-            let mut history = History::new(Vec::new());
-            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
-            drop(agent);
-            let events = drain_events(&event_rx);
+    #[tokio::test]
+    async fn nudge_behavior(
+        responses: Vec<StreamResponse>,
+        expected_turns: u32,
+        expected_nudges: usize,
+    ) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let _ = agent.run(default_input()).await;
+        drop(agent);
+        let events = drain_events(&event_rx);
 
-            let nudges = events
+        let nudges = events
+            .iter()
+            .filter(|e| matches!(e.event, AgentEvent::Nudge))
+            .count();
+        assert_eq!(nudges, expected_nudges);
+
+        let done = events
+            .iter()
+            .find_map(|e| match &e.event {
+                AgentEvent::Done { num_turns, .. } => Some(*num_turns),
+                _ => None,
+            })
+            .expect("expected Done event");
+        assert_eq!(done, expected_turns);
+
+        assert!(
+            history
+                .as_slice()
                 .iter()
-                .filter(|e| matches!(e.event, AgentEvent::Nudge))
-                .count();
-            assert_eq!(nudges, expected_nudges);
-
-            let done = events
-                .iter()
-                .find_map(|e| match &e.event {
-                    AgentEvent::Done { num_turns, .. } => Some(*num_turns),
-                    _ => None,
-                })
-                .expect("expected Done event");
-            assert_eq!(done, expected_turns);
-
-            assert!(
-                history
-                    .as_slice()
-                    .iter()
-                    .all(|m| m.content.iter().any(|b| !b.is_thinking())),
-                "history holds a message no provider will accept: {:?}",
-                history.as_slice()
-            );
-        });
+                .all(|m| m.content.iter().any(|b| !b.is_thinking())),
+            "history holds a message no provider will accept: {:?}",
+            history.as_slice()
+        );
     }
 
     /// Pins the regression where a stale nudge counter made a follow-up
     /// "continue" end instantly: the budget lives in the history tail, and
     /// the new user message breaks the streak.
-    #[test]
-    fn nudge_budget_resets_on_new_run() {
-        smol::block_on(async {
-            let responses = [tool_call_response("glob", "t1")]
-                .into_iter()
-                .chain((0..=MAX_NUDGES).map(|_| empty_response()))
-                .chain([empty_response(), text_response(StopReason::EndTurn)])
-                .collect();
-            let mut history = History::new(Vec::new());
-            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
-            let _ = agent.run(default_input()).await;
-            drop(agent);
-            let events = drain_events(&event_rx);
+    #[tokio::test]
+    async fn nudge_budget_resets_on_new_run() {
+        let responses = [tool_call_response("glob", "t1")]
+            .into_iter()
+            .chain((0..=MAX_NUDGES).map(|_| empty_response()))
+            .chain([empty_response(), text_response(StopReason::EndTurn)])
+            .collect();
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let _ = agent.run(default_input()).await;
+        let _ = agent.run(default_input()).await;
+        drop(agent);
+        let events = drain_events(&event_rx);
 
-            let nudges = events
-                .iter()
-                .filter(|e| matches!(e.event, AgentEvent::Nudge))
-                .count();
-            assert_eq!(nudges, MAX_NUDGES as usize + 1);
-        });
+        let nudges = events
+            .iter()
+            .filter(|e| matches!(e.event, AgentEvent::Nudge))
+            .count();
+        assert_eq!(nudges, MAX_NUDGES as usize + 1);
+    }
+
+    /// Answers every call with a receipt, as `bash(background = true)` does.
+    struct MovingTool;
+
+    struct MovingInvocation;
+
+    impl ToolInvocation for MovingInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(MOVING_TOOL.into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async {
+                ToolExecResult {
+                    moved: Some(MovedCall {
+                        result: Box::pin(async { None }),
+                        land: Box::new(drop),
+                    }),
+                    ..Ok(ToolOutput::Plain(MOVING_RECEIPT.into())).into()
+                }
+            })
+        }
+    }
+
+    impl Tool for MovingTool {
+        fn name(&self) -> &str {
+            MOVING_TOOL
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            MOVING_TOOL.into()
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(MovingInvocation))
+        }
+    }
+
+    /// The receipt tells the model to end its turn, so a reply with only
+    /// thinking after it is the answer asked for, not a stall to nudge.
+    #[test_case(MOVING_TOOL, 0 ; "no_nudge_after_a_moved_call")]
+    #[test_case("glob", 1 ; "nudge_after_a_call_that_stayed")]
+    #[tokio::test]
+    async fn nudge_after_a_tool_round(tool: &str, expected_nudges: usize) {
+        let responses = vec![
+            tool_call_response(tool, "t1"),
+            thinking_response(),
+            text_response(StopReason::EndTurn),
+        ];
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let registry = ToolRegistry::new();
+        registry
+            .register(
+                Arc::new(MovingTool),
+                ToolSource {
+                    plugin: MOVING_TOOL.into(),
+                },
+            )
+            .unwrap();
+        agent.registry = Arc::new(registry);
+        let _ = agent.run(default_input()).await;
+        drop(agent);
+
+        let nudges = drain_events(&event_rx)
+            .iter()
+            .filter(|e| matches!(e.event, AgentEvent::Nudge))
+            .count();
+        assert_eq!(nudges, expected_nudges);
     }
 
     /// Wiring this to `None` to make the struct literal compile would
@@ -1983,12 +4256,562 @@ mod tests {
     fn tool_context_carries_the_session() {
         let mut history = History::new(Vec::new());
         let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
-        assert_eq!(agent.tool_context().session_id, None);
+        assert_eq!(agent.tool_context(Arc::default()).session_id, None);
 
         let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
             .parse()
             .expect("valid session id");
         agent.session_id = Some(session.clone());
-        assert_eq!(agent.tool_context().session_id, Some(session));
+        assert_eq!(agent.tool_context(Arc::default()).session_id, Some(session));
+    }
+
+    fn answer_only(
+        slot: AgentSlot,
+        value: Value,
+    ) -> impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static {
+        move |fired, _| {
+            if fired == slot {
+                Verdict::Replaced(value.clone())
+            } else {
+                Verdict::Unchanged
+            }
+        }
+    }
+
+    fn steers(events: &[Envelope]) -> Vec<(SteerKind, String)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.event {
+                AgentEvent::Steered { kind, text } => Some((*kind, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const REWRITTEN: &str = "hello, with the CI log attached";
+    const DROP_REASON: &str = "that prompt is on the blocklist";
+    const KEEP_GOING: &str = "The todo list still has open items.";
+    const BLOCKED: &str = "blocked";
+    const SHELL_RESULT: &str = "shell result";
+
+    fn drop_blocked(slot: AgentSlot, value: &Value) -> Verdict {
+        match slot {
+            AgentSlot::UserMessage if value[FIELD_TEXT] == BLOCKED => {
+                Verdict::Denied(DROP_REASON.into())
+            }
+            AgentSlot::CompactBefore => Verdict::Replaced(json!({ compaction::FIELD_SKIP: true })),
+            _ => Verdict::Unchanged,
+        }
+    }
+
+    #[tokio::test]
+    async fn user_message_rewrite_is_what_the_model_sees() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let seen = script(
+            &agent.registry,
+            answer_only(AgentSlot::UserMessage, json!({ FIELD_TEXT: REWRITTEN })),
+        );
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(history.as_slice()[0].user_text(), Some(REWRITTEN));
+        let (slot, value) = seen.lock().unwrap()[0].clone();
+        assert_eq!(slot, AgentSlot::UserMessage);
+        assert_eq!(value["source"], InputSource::Tui.as_str());
+        assert_eq!(
+            steers(&drain_events(&event_rx)),
+            [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
+        );
+    }
+
+    /// A cut turn ends on its marker, so a dropped interrupt still leaves
+    /// work to go on with. After a finished answer it leaves nothing, and a
+    /// request then would end on the model's own reply. The mock panics on a
+    /// request it has no reply for, so the second case proves none went out.
+    #[test_case(Message::synthetic(USER_CANCEL_MARKER.into()), vec![text_response(StopReason::EndTurn)], DoneReason::EndTurn ; "after_a_cut_turn_the_work_goes_on")]
+    #[test_case(text_response(StopReason::EndTurn).message, Vec::new(), DoneReason::Dropped ; "after_a_finished_answer_nothing_is_sent")]
+    #[tokio::test]
+    async fn resume_with_a_dropped_interrupt(
+        last: Message,
+        replies: Vec<StreamResponse>,
+        expected: DoneReason,
+    ) {
+        let mut history = History::new(vec![Message::user("go".into()), last]);
+        let (agent, _event_rx) = make_agent(MockProvider::new(replies), &mut history);
+        let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+            ExtractedCommand::Interrupt(vec![AgentInput {
+                message: BLOCKED.into(),
+                ..default_input()
+            }]),
+        ]));
+        script(&agent.registry, drop_blocked);
+
+        let reason = agent
+            .resume(Vec::new(), RequestOptions::default())
+            .await
+            .unwrap();
+        drop(agent);
+
+        assert_eq!(reason, expected);
+        assert!(matches!(
+            history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
+    }
+
+    /// The mock has no responses and panics on any request, so passing proves
+    /// the model never heard the message.
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), DROP_REASON ; "denied")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: " " })), EMPTIED_MESSAGE ; "rewritten_to_nothing")]
+    #[tokio::test]
+    async fn user_message_drop_ends_the_run_before_any_request(
+        answer: fn(AgentSlot, &Value) -> Verdict,
+        reason: &str,
+    ) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        script(&agent.registry, answer);
+
+        let done = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(done, DoneReason::Dropped);
+        assert!(history.is_empty());
+        assert_eq!(
+            steers(&drain_events(&event_rx)),
+            [(SteerKind::MessageDropped, reason.to_owned())]
+        );
+    }
+
+    /// The mock holds one response, so a run that went on anyway would panic
+    /// on its second request.
+    #[test_case(ExtractedCommand::Interrupt(vec![AgentInput { message: BLOCKED.into(), ..default_input() }]) ; "dropped_interrupt")]
+    #[test_case(ExtractedCommand::Compact(None) ; "skipped_compact")]
+    #[tokio::test]
+    async fn queued_command_that_lands_nothing_ends_the_run(cmd: ExtractedCommand) {
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![cmd]));
+        script(&agent.registry, drop_blocked);
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::EndTurn);
+        assert!(matches!(
+            history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
+    }
+
+    /// The shell result lands in every case, even when every message around
+    /// it is dropped. The user already ran that command, so it is not a layer's
+    /// call to make.
+    #[test_case(BLOCKED, "hello", &[SHELL_RESULT, "hello"], DoneReason::EndTurn ; "earlier_dropped")]
+    #[test_case("first", BLOCKED, &[SHELL_RESULT, "first"], DoneReason::EndTurn ; "last_dropped")]
+    #[test_case(BLOCKED, BLOCKED, &[SHELL_RESULT], DoneReason::Dropped ; "all_dropped")]
+    #[tokio::test]
+    async fn burst_filters_every_message(
+        first: &str,
+        last: &str,
+        expected: &[&str],
+        expected_reason: DoneReason,
+    ) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        script(&agent.registry, drop_blocked);
+        let input = AgentInput {
+            message: last.into(),
+            earlier: vec![EarlierInput {
+                message: first.into(),
+                images: Vec::new(),
+                preamble: vec![Message::observation(SHELL_RESULT.into())],
+            }],
+            ..default_input()
+        };
+
+        let reason = agent.run(input).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, expected_reason);
+        let users: Vec<_> = history
+            .as_slice()
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .filter_map(Message::user_text)
+            .collect();
+        assert_eq!(users, expected);
+    }
+
+    /// A layer that always says "continue" is exactly what both bounds are
+    /// for. The mock holds one turn past what the bound allows, so a missing
+    /// bound panics instead of looping.
+    #[test_case(None, MAX_STOP_CONTINUATIONS ; "capped_in_a_row")]
+    #[test_case(Some(1), 0 ; "not_asked_on_the_last_turn")]
+    #[tokio::test]
+    async fn stop_continuations_are_bounded(max_turns: Option<u32>, allowed: u32) {
+        let allowed = allowed as usize;
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(
+                (0..=allowed)
+                    .map(|_| text_response(StopReason::EndTurn))
+                    .collect(),
+            ),
+            &mut history,
+        );
+        agent.config.max_turns = max_turns;
+        script(
+            &agent.registry,
+            answer_only(AgentSlot::Stop, json!({ FIELD_CONTINUE: KEEP_GOING })),
+        );
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::EndTurn);
+        assert_continued(&drain_events(&event_rx), &history, allowed);
+    }
+
+    /// The user is told about every continuation and the model reads each one.
+    fn assert_continued(events: &[Envelope], history: &History, expected: usize) {
+        assert_eq!(steers(events).len(), expected);
+        let continued = history
+            .as_slice()
+            .iter()
+            .filter(|m| m.first_text_content() == Some(KEEP_GOING))
+            .count();
+        assert_eq!(continued, expected);
+    }
+
+    /// A slow stop layer is the widest window a cancel can land in after the
+    /// answer is done, and the frontend must still hear it was cancelled.
+    #[tokio::test]
+    async fn cancel_during_stop_layer_reports_cancelled() {
+        let (trigger, cancel) = CancelToken::new();
+        let trigger = Mutex::new(Some(trigger));
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let mut agent = agent.with_cancel(cancel);
+        script(&agent.registry, move |slot, _| {
+            if slot == AgentSlot::Stop
+                && let Some(trigger) = trigger.lock().unwrap().take()
+            {
+                trigger.cancel();
+            }
+            Verdict::Unchanged
+        });
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert_ends_with_cancel_marker(&history);
+    }
+
+    /// The mock has no responses, so a message that got through would panic
+    /// on the request.
+    #[tokio::test]
+    async fn cancel_during_user_message_layer_keeps_the_message_out() {
+        let (trigger, cancel) = CancelToken::new();
+        let trigger = Mutex::new(Some(trigger));
+        let mut history = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let mut agent = agent.with_cancel(cancel);
+        script(&agent.registry, move |_, _| {
+            if let Some(trigger) = trigger.lock().unwrap().take() {
+                trigger.cancel();
+            }
+            Verdict::Unchanged
+        });
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_sees_the_last_answer() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
+
+        agent.run(default_input()).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        let (_, stop) = seen.iter().find(|(s, _)| *s == AgentSlot::Stop).unwrap();
+        assert_eq!(stop["reason"], STOP_FINISHED);
+        assert_eq!(stop["last_message"], RESPONSE_TEXT);
+        assert_eq!(stop["num_turns"], 1);
+    }
+
+    #[test_case(drop_blocked, CompactReason::Auto, false ; "auto_is_skipped")]
+    #[test_case(drop_blocked, CompactReason::Overflow, true ; "overflow_ignores_the_skip")]
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), CompactReason::Auto, false ; "denied_auto_is_skipped")]
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), CompactReason::Overflow, true ; "denied_overflow_still_compacts")]
+    #[tokio::test]
+    async fn compact_before_skip(
+        answer: fn(AgentSlot, &Value) -> Verdict,
+        reason: CompactReason,
+        compacts: bool,
+    ) {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        script(&agent.registry, answer);
+
+        agent.compact_now(reason).await.unwrap();
+        drop(agent);
+
+        let events = drain_events(&event_rx);
+        assert_eq!(
+            matches!(
+                compaction_events(&events).as_slice(),
+                [
+                    AgentEvent::AutoCompacting { .. },
+                    AgentEvent::CompactionStarted,
+                    AgentEvent::CompactionDone { .. }
+                ]
+            ),
+            compacts
+        );
+        if !compacts {
+            assert!(compaction_events(&events).is_empty());
+        }
+    }
+
+    const POST_COMPACTION: &str = "Re-read plan.md";
+
+    #[tokio::test]
+    async fn compact_before_continue_follows_the_configured_instructions() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.config.post_compaction_instructions = Some(POST_COMPACTION.into());
+        agent.carry_from = agent.history.len();
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ FIELD_CONTINUE: KEEP_GOING }),
+            ),
+        );
+
+        agent.compact_now(CompactReason::Auto).await.unwrap();
+        drop(agent);
+
+        let last = history
+            .as_slice()
+            .last()
+            .unwrap()
+            .first_text_content()
+            .unwrap();
+        assert_eq!(
+            history.as_slice()[2].first_text_content(),
+            Some(POST_COMPACTION)
+        );
+        assert_eq!(last, compaction::continue_message(Some(KEEP_GOING)));
+    }
+
+    const CARRIED: &str = "answer this next";
+    const SUMMARY: &str = "We fixed the flaky test in run.rs";
+
+    /// The carried prompt already says what to do next, so the layer's words
+    /// follow it and the generic nudge stays out.
+    #[tokio::test]
+    async fn compact_before_continue_follows_carried_input() {
+        let mut history = History::new(vec![
+            Message::user("go".into()),
+            Message::user(CARRIED.into()),
+        ]);
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.carry_from = 1;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ FIELD_CONTINUE: KEEP_GOING }),
+            ),
+        );
+
+        agent.compact_now(CompactReason::Auto).await.unwrap();
+        drop(agent);
+
+        let tail: Vec<_> = history.as_slice()[2..]
+            .iter()
+            .map(Message::first_text_content)
+            .collect();
+        assert_eq!(tail, [Some(CARRIED), Some(KEEP_GOING)]);
+    }
+
+    fn summary_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: SUMMARY.into(),
+        }])
+    }
+
+    /// The continuation lands after the summary, so measuring before it would
+    /// report a context short by that message.
+    #[tokio::test]
+    async fn compaction_done_describes_the_final_history() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, event_rx) =
+            make_agent(MockProvider::new(vec![summary_response()]), &mut history);
+        agent.carry_from = agent.history.len();
+
+        agent
+            .do_compact(CompactSteer {
+                continue_text: Some(KEEP_GOING.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut expected_gauge = ContextGauge::default();
+        let (system, tools) = agent.history.request_prefix().unwrap();
+        expected_gauge.reset(agent.history.as_slice(), system, tools);
+        assert_eq!(agent.gauge.size(), expected_gauge.size());
+        let completions: Vec<_> = drain_events(&event_rx)
+            .into_iter()
+            .filter_map(|e| match e.event {
+                AgentEvent::CompactionDone {
+                    summary,
+                    context_size_after,
+                    ..
+                } => Some((summary, context_size_after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions, [(SUMMARY.into(), expected_gauge.size())]);
+    }
+
+    /// The configured instructions close the summary block, ahead of the
+    /// carried input. A truncated answer stays last so it can be continued, and
+    /// the next compaction summarizes the old copy instead of carrying it.
+    #[test_case(Vec::new(), 1 ; "not_carried")]
+    #[test_case(vec![Message::user(CARRIED.into())], 1 ; "carried")]
+    #[test_case(vec![Message::user(CARRIED.into())], 2 ; "repeated_compaction")]
+    #[test_case(
+        vec![Message::user(PENDING_PROMPT.into()), text_response(StopReason::MaxTokens).message], 1
+        ; "truncated_answer"
+    )]
+    #[tokio::test]
+    async fn post_compaction_instructions_close_the_summary(
+        carried: Vec<Message>,
+        compactions: usize,
+    ) {
+        let mut history = History::new(
+            [Message::user("go".into())]
+                .into_iter()
+                .chain(carried.iter().cloned())
+                .collect(),
+        );
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new((0..compactions).map(|_| summary_response()).collect()),
+            &mut history,
+        );
+        agent.config.post_compaction_instructions = Some(POST_COMPACTION.into());
+        agent.carry_from = 1;
+
+        for _ in 0..compactions {
+            agent.do_compact(CompactSteer::default()).await.unwrap();
+        }
+
+        let messages = agent.history.as_slice();
+        assert_eq!(
+            messages[1..agent.carry_from],
+            [
+                summary_response().message,
+                Message::synthetic(POST_COMPACTION.into())
+            ]
+        );
+        let expected_tail = if carried.is_empty() {
+            vec![Message::synthetic(compaction::continue_message(None))]
+        } else {
+            carried
+        };
+        assert_eq!(messages[agent.carry_from..], expected_tail);
+    }
+
+    /// Lands its command once the stop layer has spent the allowance, keyed on
+    /// what the layer was asked rather than on how often the loop polls.
+    struct InterruptWhenSpent {
+        seen: Seen,
+        cmd: Mutex<Option<ExtractedCommand>>,
+    }
+
+    impl InterruptSource for InterruptWhenSpent {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            let stops = self
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(slot, _)| *slot == AgentSlot::Stop)
+                .count();
+            (stops >= MAX_STOP_CONTINUATIONS as usize)
+                .then(|| self.cmd.lock().unwrap().take())
+                .flatten()
+        }
+    }
+
+    /// The mock holds exactly two allowances' worth of turns plus the one the
+    /// interrupt adds, so a missing reset ends the run early and a missing
+    /// bound panics on the request after.
+    #[tokio::test]
+    async fn interrupt_restores_the_stop_allowance() {
+        let allowed = 2 * MAX_STOP_CONTINUATIONS as usize;
+        let mut history = History::new(Vec::new());
+        let (agent, event_rx) = make_agent(
+            MockProvider::new(
+                (0..allowed + 2)
+                    .map(|_| text_response(StopReason::EndTurn))
+                    .collect(),
+            ),
+            &mut history,
+        );
+        let seen = script(
+            &agent.registry,
+            answer_only(AgentSlot::Stop, json!({ FIELD_CONTINUE: KEEP_GOING })),
+        );
+        let mut agent = agent.with_interrupt_source(Arc::new(InterruptWhenSpent {
+            seen,
+            cmd: Mutex::new(Some(ExtractedCommand::Interrupt(vec![AgentInput {
+                message: QUEUED_INPUT.into(),
+                ..default_input()
+            }]))),
+        }));
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::EndTurn);
+        assert_continued(&drain_events(&event_rx), &history, allowed);
     }
 }

@@ -1,25 +1,92 @@
-//! The bridge between [`maki_agent::tools::hook`] and the slot chains plugins
-//! register. Everything here is a hop: dispatch asks, the Lua thread answers,
-//! and nothing decides anything on the way.
+//! The bridge from the host's hooks ([`maki_agent::tools::hook`] and
+//! [`maki_agent::agent::hook`]) to the slot chains plugins register.
+//! Everything here is a hop: the agent asks, the Lua thread answers, and
+//! nothing decides anything on the way.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use flume::Sender;
-use maki_agent::tools::hook::{HookCall, HookStage, ToolHook, Verdict};
+use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
+use maki_agent::permissions::LayerAnswer;
+use maki_agent::tools::ToolContext;
+use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
-use crate::api::slot::{LayeredTools, host_slot_name};
-use crate::runtime::{HookRun, Request};
+use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
+use crate::api::util::ctx::LuaCtx;
+use crate::plugin_permissions::Permission;
+use crate::runtime::{HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
+
+/// Every `agent.*` slot steers what the agent does next: the prompt it
+/// answers, whether it stops, what it remembers after a compaction. No
+/// narrower price would be honest.
+const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
+
+/// Conversation content, both ways, on every stage. A layer that sees the
+/// call reads what the model wrote (the file `write` puts on disk, the page
+/// `webfetch` asks for), and every layer decides what the model reads back:
+/// an output layer rewrites the result, while an input layer or a prompt can
+/// refuse with any text it likes, or turn a command into `echo`. Without this
+/// a `net`-only plugin could ship the input `ToolDone` keeps from it, or put
+/// words in front of the model.
+const TOOL_LAYER_CONTENT: &[Permission] = &[Permission::SessionRead, Permission::SessionWrite];
+
+/// How long past a chain's deadline this thread may still answer it. It polls
+/// a chain before it checks the deadline, so a layer that finishes in its
+/// first slice is reported however late it started. That slice may queue
+/// behind another task's, which the watchdog cuts at [`SLICE_KILL`], and may
+/// itself run [`KILL_GRACE`] before it is shot. Each kill lands within a
+/// watchdog poll, which also covers the round trip of the reply.
+const ANSWER_GRACE: Duration = SLICE_KILL
+    .saturating_add(KILL_GRACE)
+    .saturating_add(WATCHDOG_POLL_INTERVAL.saturating_mul(2));
+
+/// What every layer on a tool call pays, `permission.prompt` included: the
+/// call's {authority}, plus [`TOOL_LAYER_CONTENT`].
+fn tool_layer_cost(authority: Authority) -> LayerCost<'static> {
+    LayerCost::Host {
+        authority,
+        content: TOOL_LAYER_CONTENT,
+    }
+}
 
 pub(crate) struct SlotHook {
     pub(crate) tx: Sender<Request>,
     pub(crate) layered: Arc<LayeredTools>,
 }
 
+fn deadline_ms(deadline: Instant) -> u64 {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64
+}
+
+impl SlotHook {
+    /// A runtime that is gone, or one that drops the request on the way
+    /// down, leaves the value as it found it. A missing opinion is not a
+    /// failure of whatever asked for it.
+    fn send(&self, run: HookRun) -> BoxFuture<'_, Verdict> {
+        let (reply, answer) = oneshot::channel();
+        let request = Request::RunHook { run, reply };
+        Box::pin(async move {
+            if self.tx.send_async(request).await.is_err() {
+                return Verdict::Unchanged;
+            }
+            answer.await.unwrap_or(Verdict::Unchanged)
+        })
+    }
+}
+
 impl ToolHook for SlotHook {
     fn wraps(&self, tool: &str, stage: HookStage) -> bool {
         self.layered.wraps(tool, stage)
+    }
+
+    fn answer_grace(&self) -> Duration {
+        ANSWER_GRACE
     }
 
     fn run<'a>(
@@ -28,32 +95,94 @@ impl ToolHook for SlotHook {
         value: Value,
         call: &'a HookCall<'a>,
     ) -> BoxFuture<'a, Verdict> {
-        let (reply, answer) = flume::bounded(1);
-        let request = Request::RunHook {
-            run: HookRun {
-                slot: host_slot_name(call.tool, stage),
-                authority: call.authority,
+        self.send(HookRun {
+            slots: vec![
+                host_slot_name(call.tool, stage),
+                host_slot_name(ANY_TOOL, stage),
+            ],
+            cost: tool_layer_cost(call.authority),
+            cancel: call.cancel.clone(),
+            deadline: call.deadline,
+            value,
+            // The `ctx` table a layer receives.
+            call: json!({
+                "tool": call.tool,
+                "tool_id": call.tool_id,
+                "tool_kind": call.tool_kind,
+                "input": call.input,
+                "session_id": call.session_id,
+                "origin": call.origin.as_str(),
+                "output_mode": call.output_mode.as_str(),
+                "receipt": call.receipt,
+                "deadline_ms": deadline_ms(call.deadline),
+            }),
+            may_ask: stage == HookStage::Input,
+        })
+    }
+
+    fn prompt<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            if !self.layered.layers_surface(PERMISSION_PROMPT_SLOT) {
+                return None;
+            }
+            let (reply, answer) = oneshot::channel();
+            let run = PromptRun {
+                cost: tool_layer_cost(call.authority),
                 cancel: call.cancel.clone(),
                 deadline: call.deadline,
-                value,
-                // The `ctx` table a layer receives.
-                call: json!({
+                req: json!({
                     "tool": call.tool,
                     "tool_id": call.tool_id,
-                    "session_id": call.session_id,
-                    "origin": call.origin.as_str(),
+                    "input": input,
+                    "scopes": scopes,
                 }),
-            },
-            reply,
-        };
-        // A runtime that is gone, or one that drops the request on the way
-        // down, leaves the call as it found it. A missing opinion about a
-        // call is not a failure of that call.
-        Box::pin(async move {
-            if self.tx.send_async(request).await.is_err() {
-                return Verdict::Unchanged;
-            }
-            answer.recv_async().await.unwrap_or(Verdict::Unchanged)
+                ctx: Box::new(LuaCtx::handler(ctx)),
+            };
+            self.tx
+                .send_async(Request::RunPrompt { run, reply })
+                .await
+                .ok()?;
+            answer.await.ok().flatten()
+        })
+    }
+}
+
+impl AgentHook for SlotHook {
+    fn wraps(&self, slot: AgentSlot) -> bool {
+        self.layered.layers_surface(slot.name())
+    }
+
+    fn answer_grace(&self) -> Duration {
+        ANSWER_GRACE
+    }
+
+    fn run<'a>(
+        &'a self,
+        slot: AgentSlot,
+        value: Value,
+        call: &'a AgentCall<'a>,
+    ) -> BoxFuture<'a, Verdict> {
+        self.send(HookRun {
+            slots: vec![slot.name().to_owned()],
+            cost: AGENT_SLOT_COST,
+            cancel: call.cancel.clone(),
+            deadline: call.deadline,
+            value,
+            call: json!({
+                "session_id": call.session_id,
+                "task_id": call.task_id,
+                "model": call.model,
+                "context_size": call.context_size,
+                "context_window": call.context_window,
+                "deadline_ms": deadline_ms(call.deadline),
+            }),
+            may_ask: false,
         })
     }
 }

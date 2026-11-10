@@ -4,8 +4,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use maki_agent::session::{SessionHeader, StoredSession};
 use maki_agent::{AgentEvent, Envelope};
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredMode;
 use serde::Serialize;
 
 use crate::EventHandle;
@@ -15,6 +18,8 @@ pub const MODE_PLAN: &str = "plan";
 pub const STATUS_IDLE: &str = "idle";
 pub const STATUS_WORKING: &str = "working";
 pub const STATUS_NEEDS_INPUT: &str = "needs_input";
+/// A session no runtime here has open, read from disk.
+pub const STATUS_STORED: &str = "stored";
 
 #[derive(Serialize)]
 pub struct SessionSnapshot {
@@ -29,7 +34,14 @@ pub struct SessionSnapshot {
     pub model: String,
     /// [`MODE_BUILD`] or [`MODE_PLAN`].
     pub mode: &'static str,
-    /// [`STATUS_IDLE`], [`STATUS_WORKING`], or [`STATUS_NEEDS_INPUT`].
+    /// Spelled like the thinking setting. Left out by hosts that do not
+    /// track it (the headless drivers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+    /// [`STATUS_IDLE`], [`STATUS_WORKING`], [`STATUS_NEEDS_INPUT`], or
+    /// [`STATUS_STORED`].
     pub status: &'static str,
     /// Whether this is the session the user is looking at. Always true
     /// for the single-session headless drivers.
@@ -46,12 +58,58 @@ pub struct SessionSnapshot {
     pub usage: TokenUsage,
     /// Main session only. A subagent fills its own window, not ours.
     pub context_size: u32,
-    pub context_window: u32,
+    /// Left out for a stored session: the window belongs to a model that is
+    /// only resolved when the session opens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     /// What the session bills, `None` on an unpriced model. No list price
     /// twin here, because `cost` is re-settled from stored usage when a
     /// session resumes and list price is not stored. Per turn list price
     /// lives on the `TurnEnd` autocmd instead.
     pub cost: Option<f64>,
+}
+
+impl SessionSnapshot {
+    /// What the file says. Nothing runs it here, so no cost: that is settled
+    /// against the model's rates when the session opens.
+    pub fn stored(session: &StoredSession) -> Self {
+        Self::unhosted(session.id, SessionHeader::of(session), STATUS_STORED)
+    }
+
+    /// A session a headless driver runs, answered from what it publishes
+    /// rather than from a file it may not have written yet.
+    pub fn live_headless(id: MakiId, header: SessionHeader) -> Self {
+        let status = if header.working {
+            STATUS_WORKING
+        } else {
+            STATUS_IDLE
+        };
+        Self::unhosted(id, header, status)
+    }
+
+    /// A session this host holds no runtime for: no window, cost or queue.
+    fn unhosted(id: MakiId, header: SessionHeader, status: &'static str) -> Self {
+        Self {
+            id: id.to_string(),
+            cwd: header.cwd,
+            title: Some(header.title),
+            model: header.model,
+            mode: match header.mode {
+                Some(StoredMode::Plan) => MODE_PLAN,
+                _ => MODE_BUILD,
+            },
+            thinking: header.thinking.map(|thinking| thinking.to_string()),
+            fast: Some(header.fast),
+            status,
+            focused: false,
+            updated_at: header.updated_at,
+            queue: None,
+            usage: header.usage,
+            context_size: header.context_size,
+            context_window: None,
+            cost: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -101,6 +159,10 @@ impl HeadlessSnapshot {
         // an ending means the agent is busy. Sdk mode runs many turns and no
         // driver has to remember to clear a flag between them.
         totals.working = !matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. });
+        // Each run ending carries that run's whole bill, subagents and
+        // compaction included, so summing them lands on the exact session
+        // total. A failed run paid for its rounds too. Summing `TurnComplete`
+        // would miss compaction.
         match event {
             AgentEvent::Done {
                 usage,
@@ -109,13 +171,14 @@ impl HeadlessSnapshot {
                 context_window,
                 ..
             } => {
-                // Each turn's `Done` carries that turn's whole bill, subagents
-                // and compaction included, so summing them lands on the exact
-                // session total. Summing `TurnComplete` would miss compaction.
                 totals.usage += *usage;
                 add_cost(&mut totals.cost, *cost);
                 totals.context_size = *context_size;
                 totals.context_window = *context_window;
+            }
+            AgentEvent::Error { totals: run, .. } => {
+                totals.usage += run.usage;
+                add_cost(&mut totals.cost, run.cost);
             }
             AgentEvent::TurnComplete(turn) if envelope.subagent.is_none() => {
                 totals.context_size = turn.context_size.unwrap_or(totals.context_size);
@@ -153,6 +216,8 @@ impl HeadlessSnapshot {
                 title: None,
                 model: meta.model.clone(),
                 mode,
+                thinking: None,
+                fast: None,
                 status: if totals.working {
                     STATUS_WORKING
                 } else {
@@ -163,7 +228,7 @@ impl HeadlessSnapshot {
                 queue: None,
                 usage: totals.usage,
                 context_size: totals.context_size,
-                context_window: totals.context_window,
+                context_window: Some(totals.context_window),
                 cost: totals.cost,
             })
             .map_err(|e| e.to_string())
@@ -173,7 +238,7 @@ impl HeadlessSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::{DoneReason, TurnCompleteEvent};
+    use maki_agent::{DoneReason, RunTotals, TurnCompleteEvent};
     use maki_providers::Message;
 
     use super::*;
@@ -210,7 +275,7 @@ mod tests {
     fn done(input: u32) -> Envelope {
         envelope(AgentEvent::Done {
             usage: TokenUsage {
-                input,
+                input: u64::from(input),
                 ..Default::default()
             },
             cost: Some(TURN_COST),
@@ -242,10 +307,38 @@ mod tests {
         assert!(!totals.working);
         assert_eq!(
             totals.usage.input,
-            FIRST_TURN_INPUT + SECOND_TURN_INPUT,
+            u64::from(FIRST_TURN_INPUT + SECOND_TURN_INPUT),
             "{GROWS_MSG}"
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
         assert_eq!(totals.context_size, SECOND_TURN_INPUT);
+    }
+
+    #[test]
+    fn failed_run_bill_joins_the_session_totals() {
+        let snapshot = HeadlessSnapshot::default();
+        snapshot.observe(&done(FIRST_TURN_INPUT));
+
+        snapshot.observe(&envelope(AgentEvent::Error {
+            message: String::new(),
+            auth: false,
+            totals: RunTotals {
+                usage: TokenUsage {
+                    input: u64::from(SECOND_TURN_INPUT),
+                    ..Default::default()
+                },
+                cost: Some(TURN_COST),
+                list_cost: None,
+            },
+        }));
+
+        let totals = lock(&snapshot.0);
+        assert!(!totals.working);
+        assert_eq!(
+            totals.usage.input,
+            u64::from(FIRST_TURN_INPUT + SECOND_TURN_INPUT)
+        );
+        assert_eq!(totals.cost, Some(TURN_COST * 2.0));
+        assert_eq!(totals.context_size, FIRST_TURN_INPUT);
     }
 }

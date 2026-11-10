@@ -87,6 +87,12 @@ pub enum ParamSchema {
         properties: &'static [Property],
         description: &'static str,
     },
+    /// `{"type": "object"}` with no `properties`: any object, keys kept as
+    /// they come. Unlike `Any`, the model sees the type and a stringified
+    /// object still gets decoded.
+    OpenObject {
+        description: &'static str,
+    },
     Any {
         description: &'static str,
     },
@@ -141,6 +147,13 @@ pub fn to_json_schema(s: &ParamSchema) -> Value {
             if !required.is_empty() {
                 v["required"] = json!(required);
             }
+            if !description.is_empty() {
+                v["description"] = json!(description);
+            }
+            v
+        }
+        ParamSchema::OpenObject { description } => {
+            let mut v = json!({ "type": "object" });
             if !description.is_empty() {
                 v["description"] = json!(description);
             }
@@ -207,6 +220,7 @@ pub fn try_from_json(v: &Value) -> Result<&'static ParamSchema, String> {
             let items: &'static ParamSchema = try_from_json(items_val)?;
             ParamSchema::Array { items, description }
         }
+        Some("object") if v.get("properties").is_none() => ParamSchema::OpenObject { description },
         Some("object") => parse_object_schema(v, description)?,
         // A schema that spells out `properties` but forgets `type` is an object
         // and nothing else. Reading it as "any value" used to throw the whole
@@ -344,6 +358,7 @@ pub enum ToolInputErrorKind {
     NotInEnum {
         expected: &'static [&'static str],
         got: String,
+        suggested_variant: Option<&'static str>,
     },
     InternalBug {
         detail: String,
@@ -389,7 +404,11 @@ impl Display for ToolInputError {
                 }
                 Ok(())
             }
-            ToolInputErrorKind::NotInEnum { expected, got } => {
+            ToolInputErrorKind::NotInEnum {
+                expected,
+                got,
+                suggested_variant,
+            } => {
                 f.write_str("expected one of [")?;
                 for (i, v) in expected.iter().enumerate() {
                     if i > 0 {
@@ -397,7 +416,11 @@ impl Display for ToolInputError {
                     }
                     f.write_str(v)?;
                 }
-                write!(f, "], got \"{got}\"")
+                write!(f, "], got {got}")?;
+                if let Some(variant) = suggested_variant {
+                    write!(f, ". Use {} alone.", preview(variant))?;
+                }
+                Ok(())
             }
             ToolInputErrorKind::InternalBug { detail } => {
                 write!(f, "internal validator bug: {detail}")
@@ -445,6 +468,7 @@ fn walk(schema: &ParamSchema, value: Value, path: &mut JsonPath) -> Result<Value
         ParamSchema::Enum { variants, .. } => validate_enum(variants, value, path),
         ParamSchema::Array { items, .. } => validate_array(items, value, path),
         ParamSchema::Object { properties, .. } => validate_object(properties, value, path),
+        ParamSchema::OpenObject { .. } => coerce_container(value, ParamKind::Object, path),
     }
 }
 
@@ -491,6 +515,10 @@ fn validate_enum(
             ToolInputErrorKind::NotInEnum {
                 expected: variants,
                 got: preview(s),
+                suggested_variant: variants.iter().copied().find(|variant| {
+                    s.strip_prefix(variant)
+                        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                }),
             },
         )),
         other => Err(ToolInputError::at(
@@ -524,7 +552,7 @@ fn schema_type_name(schema: &ParamSchema) -> &'static str {
         ParamSchema::Primitive { kind, .. } => kind.as_str(),
         ParamSchema::Enum { .. } => "string (enum)",
         ParamSchema::Array { .. } => "array",
-        ParamSchema::Object { .. } => "object",
+        ParamSchema::Object { .. } | ParamSchema::OpenObject { .. } => "object",
         ParamSchema::Any { .. } => "any",
     }
 }
@@ -640,12 +668,20 @@ fn coerce_primitive(v: &Value, expected: ParamKind) -> Option<Value> {
             .or_else(|| f64_as_i64(s.parse::<f64>().ok()?))
             .map(Value::from),
         ParamKind::Number => s.parse::<f64>().ok().map(Value::from),
-        ParamKind::Bool => match s {
-            "true" => Some(Value::Bool(true)),
-            "false" => Some(Value::Bool(false)),
-            _ => None,
-        },
+        ParamKind::Bool => parse_bool_like(s).map(Value::Bool),
         _ => None,
+    }
+}
+
+/// Models stringify booleans, and some capitalize the word, so accept either
+/// spelling in any case instead of bouncing the call back.
+fn parse_bool_like(s: &str) -> Option<bool> {
+    if s.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if s.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -835,7 +871,9 @@ mod tests {
     const MSG_MISSING: &str = "required, expected";
     const MSG_EXPECTED_ARRAY: &str = "expected array";
     const MSG_JSON_ENCODED_HINT: &str = "Pass a JSON array";
-    const MSG_EXPECTED_ONE_OF: &str = "expected one of";
+    const MSG_ENUM_ERROR: &str =
+        "invalid tool input: expected one of [research, general], got \"human\"";
+    const MSG_ENUM_ARGUMENTS_HINT: &str = ". Use \"research\" alone.";
 
     const ANY_DESCRIPTION: &str = "Any value";
     const ANY_PROP: &str = "value";
@@ -980,7 +1018,11 @@ mod tests {
     #[test_case(json!("NaN"),                     ParamKind::Integer, None              ; "nan_string_rejected")]
     #[test_case(json!("inf"),                     ParamKind::Integer, None              ; "inf_string_rejected")]
     #[test_case(json!("1.25"),                   ParamKind::Number,  Some(json!(1.25)) ; "string_to_float")]
-    #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_bool")]
+    #[test_case(json!("true"),                   ParamKind::Bool,    Some(json!(true)) ; "string_to_true")]
+    #[test_case(json!("false"),                  ParamKind::Bool,    Some(json!(false)) ; "string_to_false")]
+    #[test_case(json!("True"),                   ParamKind::Bool,    Some(json!(true)) ; "capitalized_string_to_true")]
+    #[test_case(json!("FALSE"),                  ParamKind::Bool,    Some(json!(false)) ; "uppercase_string_to_false")]
+    #[test_case(json!("yes"),                    ParamKind::Bool,    None              ; "non_bool_word_rejected")]
     #[test_case(json!(30),                       ParamKind::Integer, None              ; "already_correct_type_no_coercion")]
     fn coerce_primitive_cases(value: Value, expected: ParamKind, wanted: Option<Value>) {
         assert_eq!(coerce_primitive(&value, expected), wanted);
@@ -1010,9 +1052,31 @@ mod tests {
 
         let value_err = validate(&MODE_ENUM, json!("human")).unwrap_err();
         let rendered = value_err.to_string();
-        assert!(rendered.contains(MSG_EXPECTED_ONE_OF));
-        assert!(rendered.contains("research"));
-        assert!(rendered.contains("human"));
+        assert_eq!(rendered, MSG_ENUM_ERROR);
+    }
+
+    #[test_case("research notes.md tags: [a]", true ; "space_separated_arguments")]
+    #[test_case("research\tnotes.md", true ; "tab_separated_arguments")]
+    #[test_case("research\nnotes.md", true ; "newline_separated_arguments")]
+    #[test_case("research\u{2003}notes.md", true ; "unicode_whitespace")]
+    #[test_case("research ", true ; "trailing_whitespace")]
+    #[test_case("researcher notes.md", false ; "partial_variant")]
+    #[test_case("research=notes.md", false ; "no_whitespace")]
+    #[test_case("human notes.md", false ; "unknown_variant")]
+    fn enum_errors_hint_when_arguments_follow_a_variant(input: &str, has_hint: bool) {
+        let err = validate(&MODE_ENUM, json!(input)).unwrap_err();
+        assert!(matches!(err.kind, ToolInputErrorKind::NotInEnum { .. }));
+        assert_eq!(err.to_string().contains(MSG_ENUM_ARGUMENTS_HINT), has_hint);
+    }
+
+    #[test]
+    fn enum_accepts_exact_multiword_variant() {
+        const SCHEMA: ParamSchema = ParamSchema::Enum {
+            variants: &["research", "research notes"],
+            description: "",
+        };
+        let input = json!("research notes");
+        assert_eq!(validate(&SCHEMA, input.clone()).unwrap(), input);
     }
 
     #[test]
@@ -1112,10 +1176,9 @@ mod tests {
         assert!(validate(schema, json!({})).is_err());
     }
 
-    #[test_case(json!({"type": "object"}) ; "nested_object_without_properties")]
-    #[test_case(json!({"type": "array"}) ; "nested_array_without_items")]
-    fn try_from_json_typeless_root_with_broken_property_degrades_to_any(broken: Value) {
-        let properties = json!({ ANY_PROP: broken });
+    #[test]
+    fn try_from_json_typeless_root_with_broken_property_degrades_to_any() {
+        let properties = json!({ ANY_PROP: {"type": "array"} });
         let typeless = try_from_json(&json!({ "properties": properties })).unwrap();
         assert!(
             matches!(typeless, ParamSchema::Any { .. }),
@@ -1124,6 +1187,15 @@ mod tests {
 
         let explicit = try_from_json(&json!({ "type": "object", "properties": properties }));
         assert!(explicit.is_err(), "{EXPLICIT_OBJECT_STILL_FAILS}");
+    }
+
+    #[test_case(json!({"a": 1}) ; "object_passes_through")]
+    #[test_case(json!("{\"a\": 1}") ; "stringified_object_is_decoded")]
+    fn open_object_keeps_keys_and_decodes_strings(value: Value) {
+        let schema = try_from_json(&json!({ "type": "object" })).unwrap();
+        assert_eq!(to_json_schema(schema), json!({ "type": "object" }));
+        assert_eq!(validate(schema, value).unwrap(), json!({"a": 1}));
+        assert!(validate(schema, json!([1])).is_err());
     }
 
     #[test_case(json!({}) ; "empty_schema")]

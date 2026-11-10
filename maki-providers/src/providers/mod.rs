@@ -1,58 +1,64 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::io;
+use std::iter;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_lite::StreamExt;
-use futures_lite::io::AsyncBufRead;
-use isahc::config::{Configurable, VersionNegotiation};
-use isahc::http::request::Builder;
+use futures::TryStreamExt;
+use reqwest::redirect::Policy;
+use reqwest::{Client, ClientBuilder, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::io::{AsyncBufRead, Lines};
+use tokio::task::spawn_blocking;
+use tokio::time::timeout;
+use tokio_util::io::StreamReader;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
+use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
+use crate::http::{Lookup, error_chain, proxy_env};
 use crate::retry::RetryPolicy;
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
 pub(crate) mod catalog;
+pub(crate) mod codec;
 pub(crate) mod copilot;
 pub mod custom;
-pub(crate) mod deepseek;
-pub mod dynamic;
 pub(crate) mod google;
 pub(crate) mod llama_cpp;
 pub(crate) mod local;
-pub(crate) mod mistral;
+pub(crate) mod managed_auth;
 pub(crate) mod oauth_loopback;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
 pub mod opencode;
-pub(crate) mod openrouter;
-pub(crate) mod regolo;
-pub(crate) mod requesty;
-pub(crate) mod synthetic;
-pub(crate) mod tensorx;
+pub mod plugin;
 pub(crate) mod xai;
 pub(crate) mod zai;
 
-const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
-const UNAUTHORIZED_STATUS: u16 = 401;
+pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
+const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+
+/// Boxed so [`ok_sse`] can name the reader its parse closure takes.
+pub(crate) type SseBody = Pin<Box<dyn AsyncBufRead + Send>>;
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
 }
 
-pub(crate) fn user_agent() -> &'static str {
+pub fn user_agent() -> &'static str {
     concat!(
         "maki/v",
         env!("CARGO_PKG_VERSION"),
@@ -102,14 +108,25 @@ impl From<&maki_config::ProviderConfig> for Timeouts {
 /// token means only a real refresh gets us out of the loop, whatever the
 /// expiry clock says, because that clock is wrong exactly when a server
 /// revokes early or the local time drifts.
-pub(crate) fn refreshed_tokens(
+///
+/// Only a 400 or 401 from the token endpoint, its answer for a dead refresh
+/// token, deletes the token file. Anything else keeps it (a 429, a 5xx, a
+/// firewall's 403, a proxy's login page, a dropped connection): a token kept
+/// by mistake costs one failed refresh, one deleted by mistake a new login.
+pub(crate) async fn refreshed_tokens(
     dir: &StateDir,
     provider: &str,
     rejected: Option<&str>,
-    refresh: impl FnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
+    refresh: impl AsyncFnOnce(&OAuthTokens) -> Result<OAuthTokens, AgentError>,
 ) -> Result<OAuthTokens, AgentError> {
-    let _lock = lock_tokens(dir, provider);
-    let current = load_tokens(dir, provider).ok_or_else(|| {
+    // The file lock is held across the refresh request, so two processes never
+    // spend the same refresh token; the blocking pool takes the lock and the
+    // file reads and writes, the request itself is awaited.
+    let (lock, current) = {
+        let (dir, provider) = (dir.clone(), provider.to_owned());
+        spawn_blocking(move || (lock_tokens(&dir, &provider), load_tokens(&dir, &provider))).await?
+    };
+    let current = current.ok_or_else(|| {
         AgentError::api(
             UNAUTHORIZED_STATUS,
             format!("{provider} OAuth tokens not found on disk"),
@@ -118,15 +135,44 @@ pub(crate) fn refreshed_tokens(
     if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
     }
-    let fresh = refresh(&current)?;
-    // Not `?`: every caller reads an error here as "these credentials are
-    // dead" and deletes the token file, so a full disk would log the user out
-    // over a refresh that actually succeeded. The run keeps the token it just
-    // got and the next start refreshes again.
-    if let Err(e) = save_tokens(dir, provider, &fresh) {
-        warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
+    let fresh = refresh(&current).await;
+    let (dir, provider) = (dir.clone(), provider.to_owned());
+    spawn_blocking(move || {
+        let _lock = lock;
+        let fresh = fresh.inspect_err(|e| {
+            let cleared = matches!(
+                e,
+                AgentError::Api {
+                    status: BAD_REQUEST_STATUS | UNAUTHORIZED_STATUS,
+                    ..
+                }
+            );
+            warn!(provider, cleared, error = %e, "OAuth refresh failed");
+            if cleared {
+                let _ = delete_tokens(&dir, &provider);
+            }
+        })?;
+        // Not `?`: every caller reads an error here as "these credentials are
+        // dead" and falls back to other auth, so a full disk would log the user
+        // out over a refresh that actually succeeded. The run keeps the token
+        // it just got and the next start refreshes again.
+        if let Err(e) = save_tokens(&dir, &provider, &fresh) {
+            warn!(provider, error = %e, "could not persist refreshed OAuth tokens");
+        }
+        Ok(fresh)
+    })
+    .await?
+}
+
+/// Whether `held` must give way to the stored tokens: it expired, or a peer
+/// rotated, cleared or logged in. A stored copy older than `held` is a failed
+/// save whose refresh token may be spent, so it waits until `held` expires.
+pub(crate) fn needs_refresh(dir: &StateDir, provider: &str, held: Option<&OAuthTokens>) -> bool {
+    match (load_tokens(dir, provider), held) {
+        (Some(stored), Some(held)) => held.is_expired() || stored.expires > held.expires,
+        (None, None) => false,
+        _ => true,
     }
-    Ok(fresh)
 }
 
 #[derive(Clone)]
@@ -137,6 +183,9 @@ pub struct ResolvedAuth {
     /// the provider sets afterwards, so a key rotation cannot drop a gateway
     /// credential that replaced the built-in auth header.
     config_headers: Vec<String>,
+    /// `[<slug>] top_p`, carried with the auth so whoever the slug's
+    /// credentials reach (aperture routes, catalog sub-providers) sends it.
+    pub top_p: Option<f64>,
 }
 
 impl ResolvedAuth {
@@ -149,9 +198,11 @@ impl ResolvedAuth {
             base_url: None,
             headers,
             config_headers: Vec::new(),
+            top_p: None,
         };
         if let Some(def) = maki_config::providers::ProvidersConfig::load().get(slug) {
             auth.apply_config_headers(slug, &def.headers)?;
+            auth.top_p = def.top_p;
         }
         Ok(auth)
     }
@@ -187,6 +238,18 @@ impl ResolvedAuth {
             .and_then(|(_, value)| value.strip_prefix(BEARER_PREFIX))
     }
 
+    /// No credentials, not even `[<slug>.headers]`: what an auth cell holds
+    /// until its declaration's credentials resolve. Never sent, since
+    /// `plugin::create` resolves the headers again first.
+    pub(crate) fn withheld() -> Self {
+        Self {
+            base_url: None,
+            headers: Vec::new(),
+            config_headers: Vec::new(),
+            top_p: None,
+        }
+    }
+
     pub fn bearer(slug: &str, api_key: &str) -> Result<Self, AgentError> {
         Self::new(
             slug,
@@ -213,8 +276,8 @@ impl ResolvedAuth {
     }
 
     /// Replace a same-name header (case-insensitive) instead of appending a
-    /// second one: `Builder::header` appends, so a configured `Authorization`
-    /// next to the built-in bearer would send two credentials.
+    /// second one: `RequestBuilder::header` appends, so a configured
+    /// `Authorization` next to the built-in bearer would send two credentials.
     pub(crate) fn set_header(&mut self, name: &str, value: String) {
         match self
             .headers
@@ -226,8 +289,8 @@ impl ResolvedAuth {
         }
     }
 
-    /// Apply all auth headers to an HTTP request builder.
-    pub fn configure_request(&self, builder: Builder) -> Builder {
+    /// Apply all auth headers to a request builder.
+    pub fn configure_request(&self, builder: RequestBuilder) -> RequestBuilder {
         self.headers.iter().fold(builder, |b, (key, value)| {
             b.header(key.as_str(), value.as_str())
         })
@@ -239,6 +302,7 @@ impl ResolvedAuth {
             base_url,
             headers,
             config_headers: Vec::new(),
+            top_p: None,
         }
     }
 }
@@ -349,37 +413,141 @@ impl SseErrorPayload {
 }
 
 pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
-    lines: &mut futures_lite::io::Lines<R>,
+    lines: &mut Lines<R>,
     deadline: &mut Instant,
     stream_timeout: Duration,
 ) -> Result<Option<String>, AgentError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let result = futures_lite::future::or(
-        async { lines.next().await.transpose().map_err(AgentError::from) },
-        async {
-            smol::Timer::after(remaining).await;
-            Err(AgentError::Timeout {
-                secs: stream_timeout.as_secs(),
-            })
-        },
-    )
-    .await;
+    let result = match timeout(remaining, lines.next_line()).await {
+        Ok(line) => line.map_err(AgentError::from),
+        Err(_) => Err(AgentError::Timeout {
+            secs: stream_timeout.as_secs(),
+        }),
+    };
     if let Ok(Some(_)) = &result {
         *deadline = Instant::now() + stream_timeout;
     }
     result
 }
 
-pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
-    isahc::HttpClient::builder()
-        .connect_timeout(timeouts.connect)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
-        // The workspace enables curl's http2 feature for OTLP over gRPC, which
-        // would otherwise flip provider streaming to h2 over TLS. Streaming is
-        // tuned for HTTP/1.1, so pin it.
-        .version_negotiation(VersionNegotiation::http11())
+impl Timeouts {
+    /// The connect and stall bounds every request to a provider runs under.
+    /// No total cap: a slow but moving download is not a dead one. The read
+    /// timeout is one window from the send to the response head, so sending
+    /// the request body counts against it where curl counted those bytes as
+    /// progress, and is then re-armed by every frame of the body, which
+    /// stands in for curl's window of under a byte per second.
+    pub fn bound(&self, builder: ClientBuilder) -> ClientBuilder {
+        builder
+            .connect_timeout(self.connect)
+            .read_timeout(self.low_speed)
+    }
+}
+
+/// Where every client in the crate starts, so a side request (OAuth, the
+/// catalogs) shares the providers' redirect, proxy,
+/// DNS and trust rules. Redirects stay off: a 3xx reaches
+/// [`AgentError::from_response`] and a key header is never replayed
+/// cross-origin. HTTP/1.1 stays pinned in case a dependency turns on reqwest's
+/// http2 feature.
+pub fn client_builder() -> ClientBuilder {
+    Client::builder()
+        .redirect(Policy::none())
+        .http1_only()
+        .user_agent(user_agent())
+        .proxy(Proxy::custom(|url| proxy_env().proxy_for(url.as_str())))
+        .dns_resolver(Arc::new(Lookup))
+}
+
+/// Trust comes from the platform verifier, which on Linux reads
+/// `SSL_CERT_FILE` the way curl did. A store it cannot load (a stale
+/// `SSL_CERT_FILE`, a container without CA roots) must not take maki down at
+/// startup, so the client is built without roots instead and every TLS connect
+/// fails with the reason, as under curl.
+pub(crate) fn http_client(timeouts: Timeouts) -> Client {
+    timeouts
+        .bound(client_builder())
         .build()
-        .expect("failed to build HTTP client")
+        .unwrap_or_else(|error| {
+            warn!(%error, "no trust roots could be loaded, TLS connections will fail");
+            timeouts
+                .bound(client_builder())
+                .tls_certs_only(iter::empty())
+                .build()
+                .expect("an HTTP client without trust roots always builds")
+        })
+}
+
+/// `Client::execute` arms the timeouts as it is called, so the send and the
+/// read of the response sit together here, the one place `execute` appears
+/// (bedrock excepted, which signs and sends its own request).
+pub(crate) async fn send_request<T, F, Fut>(
+    client: &Client,
+    request: Request,
+    read: F,
+) -> Result<T, AgentError>
+where
+    F: FnOnce(Response) -> Fut,
+    Fut: Future<Output = Result<T, AgentError>>,
+{
+    let response = client.execute(request).await?;
+    read(response).await
+}
+
+/// For the flows that decide per status themselves.
+pub(crate) async fn status_and_text(
+    client: &Client,
+    request: Request,
+) -> Result<(u16, String), AgentError> {
+    send_request(client, request, |response| async move {
+        let status = response.status().as_u16();
+        Ok((status, response.text().await?))
+    })
+    .await
+}
+
+/// The body of a 200, or the response read as an API error.
+pub(crate) async fn ok_text(client: &Client, request: Request) -> Result<String, AgentError> {
+    send_request(client, request, |response| async move {
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        Ok(response.text().await?)
+    })
+    .await
+}
+
+/// A 200 handed to the SSE parser, anything else read as an API error.
+pub(crate) async fn ok_sse<T, F, Fut>(
+    client: &Client,
+    request: Request,
+    parse: F,
+) -> Result<T, AgentError>
+where
+    F: FnOnce(SseBody) -> Fut,
+    Fut: Future<Output = Result<T, AgentError>>,
+{
+    send_request(client, request, |response| async move {
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        parse(Box::pin(body_reader(response))).await
+    })
+    .await
+}
+
+/// The body as the line reader the SSE parsers take. A stall is an io timeout,
+/// so it retries as transient and never as the stream deadline, and the URL is
+/// left out before the error is worded.
+pub(crate) fn body_reader(response: Response) -> impl AsyncBufRead + Unpin {
+    StreamReader::new(response.bytes_stream().map_err(|e| {
+        let kind = if e.is_timeout() {
+            io::ErrorKind::TimedOut
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, error_chain(&e.without_url()))
+    }))
 }
 
 #[derive(Clone, Debug)]
@@ -424,9 +592,14 @@ impl KeyPool {
         }
         Err(AgentError::Config {
             message: format!(
-                "{env_var} not set and no saved credentials for '{slug}' — run `maki auth login {slug}`"
+                "{env_var} not set and no saved credentials for '{slug}': run `maki auth login {slug}`"
             ),
         })
+    }
+
+    /// Whether both pools hold the same keys, whatever position each is at.
+    pub(crate) fn same_keys(&self, other: &Self) -> bool {
+        self.keys == other.keys
     }
 
     fn key_from_file(slug: &str) -> Option<String> {
@@ -492,6 +665,10 @@ impl KeyHeader {
             Self::Raw(_) => key.to_string(),
         }
     }
+
+    pub fn auth(self, slug: &str, key: &str) -> Result<ResolvedAuth, AgentError> {
+        ResolvedAuth::new(slug, vec![(self.name().into(), self.value(key))])
+    }
 }
 
 /// A provider's keys and the auth they are written into.
@@ -504,6 +681,16 @@ pub struct KeyRotation<'a> {
 impl<'a> KeyRotation<'a> {
     pub fn new(pool: &'a KeyPool, auth: &'a Mutex<ResolvedAuth>, header: KeyHeader) -> Self {
         Self { pool, auth, header }
+    }
+
+    /// The rotation for a provider whose pool is only there when it resolved
+    /// its own keys.
+    pub(crate) fn over(
+        pool: &'a Option<KeyPool>,
+        auth: &'a Mutex<ResolvedAuth>,
+        header: KeyHeader,
+    ) -> Option<Self> {
+        Some(Self::new(pool.as_ref()?, auth, header))
     }
 
     /// How many keys a walk can try before it is back where it started.
@@ -527,22 +714,53 @@ impl<'a> KeyRotation<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
     use maki_storage::auth::save_tokens;
     use tempfile::TempDir;
 
     use super::*;
-    use futures_lite::io::AsyncBufReadExt;
+    use crate::retry::RetryKind;
     use test_case::test_case;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, ReadBuf};
+    use tokio::time::sleep;
+
+    use crate::test_support::{Canned, serve, transport::LOOPBACK_HOST};
 
     const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const PARSE_FAILED: &str = "SSE error payload should deserialize";
     const UNAVAILABLE_STATUS: u16 = 502;
     const UNAVAILABLE_TAG: &str = "provider_unavailable";
     const TEST_PROVIDER: &str = "openai";
+    const PROXY_LOGIN_PAGE: &str = "<html><body>Sign in to continue</body></html>";
     const ON_DISK: &str = "on-disk-access";
     const FRESH: &str = "fresh-access";
     const REFRESHED: &str = "refresh should have run";
     const NOT_REFRESHED: &str = "refresh should not have run";
+    const EXPIRED: u64 = 0;
+    const SOONER: u64 = u64::MAX - 1;
+    const LATER: u64 = u64::MAX;
+    const SSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+    const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+    /// Wide enough for a loaded machine to answer the response head within
+    /// it, since the read timeout covers the head as well as the body.
+    const SHORT: Duration = Duration::from_millis(500);
+    const LONG: Duration = Duration::from_secs(10);
+    /// Long enough for a caller polling the file lock to get in if the lock
+    /// ever stops covering the request. Correct code never lets it in, so a
+    /// slow machine can't fail the test, only make it miss a regression.
+    const REFRESH_OVERLAP: Duration = Duration::from_millis(200);
+    const REDIRECT_STATUS: u16 = 302;
+    const REDIRECT_TARGET: &str = "http://127.0.0.1:9/";
+    const REDIRECT_SCRIPT: &[Canned] = &[Canned {
+        status: REDIRECT_STATUS,
+        headers: &[("location", REDIRECT_TARGET)],
+        body: "",
+        path: None,
+    }];
 
     fn state_with_tokens(access: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");
@@ -561,7 +779,7 @@ mod tests {
         dir
     }
 
-    fn fresh_tokens(_: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
+    async fn fresh_tokens(_: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
         Ok(OAuthTokens {
             access: FRESH.into(),
             refresh: "refresh".into(),
@@ -573,15 +791,80 @@ mod tests {
     #[test_case(Some(ON_DISK), FRESH,  REFRESHED     ; "the rejected token is the one on disk")]
     #[test_case(Some("older"), ON_DISK, NOT_REFRESHED ; "a peer already rotated it")]
     #[test_case(None,          ON_DISK, NOT_REFRESHED ; "not expired and nothing was rejected")]
-    fn refreshed_tokens_forces_a_refresh_only_for_the_rejected_token(
+    #[tokio::test]
+    async fn refreshed_tokens_forces_a_refresh_only_for_the_rejected_token(
         rejected: Option<&str>,
         expected: &str,
         reason: &str,
     ) {
         let dir = state_with_tokens(ON_DISK);
         let state = StateDir::from_path(dir.path().to_path_buf());
-        let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens).expect("refresh");
+        let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens)
+            .await
+            .expect("refresh");
         assert_eq!(got.access, expected, "{reason}");
+    }
+
+    #[test_case(AgentError::api(503, ERROR_MESSAGE), true  ; "server_error_keeps_tokens")]
+    #[test_case(AgentError::api(429, ERROR_MESSAGE), true  ; "rate_limit_keeps_tokens")]
+    #[test_case(AgentError::api(403, ERROR_MESSAGE), true  ; "firewall_block_keeps_tokens")]
+    #[test_case(AgentError::from(serde_json::from_str::<Value>(PROXY_LOGIN_PAGE).unwrap_err()), true ; "proxy_login_page_keeps_tokens")]
+    #[test_case(AgentError::api(400, ERROR_MESSAGE), false ; "invalid_grant_clears_tokens")]
+    #[test_case(AgentError::api(401, ERROR_MESSAGE), false ; "unauthorized_clears_tokens")]
+    #[tokio::test]
+    async fn refreshed_tokens_clears_only_a_dead_token(error: AgentError, kept: bool) {
+        let dir = state_with_tokens(ON_DISK);
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), async |_| Err(error))
+            .await
+            .expect_err("refresh should fail");
+        assert_eq!(load_tokens(&state, TEST_PROVIDER).is_some(), kept);
+    }
+
+    #[tokio::test]
+    async fn refreshed_tokens_spends_a_token_once_between_concurrent_callers() {
+        let dir = state_with_tokens(ON_DISK);
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let refreshes = AtomicUsize::new(0);
+        let refresh = async |tokens: &OAuthTokens| {
+            refreshes.fetch_add(1, Ordering::Relaxed);
+            sleep(REFRESH_OVERLAP).await;
+            fresh_tokens(tokens).await
+        };
+        let (first, second) = tokio::join!(
+            refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), refresh),
+            refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), refresh),
+        );
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(first.expect("first caller").access, FRESH);
+        assert_eq!(second.expect("second caller").access, FRESH);
+    }
+
+    #[test_case(Some(EXPIRED), Some(EXPIRED), true  ; "held_expired")]
+    #[test_case(Some(LATER),   Some(SOONER),  true  ; "peer_rotated")]
+    #[test_case(None,          Some(LATER),   true  ; "peer_cleared_the_tokens")]
+    #[test_case(Some(SOONER),  Some(LATER),   false ; "older_copy_after_failed_save")]
+    fn needs_refresh_tracks_peers_but_not_a_failed_save(
+        stored: Option<u64>,
+        held: Option<u64>,
+        expected: bool,
+    ) {
+        let dir = TempDir::new().expect("temp dir");
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        let tokens = |access: &str, expires| OAuthTokens {
+            access: access.into(),
+            refresh: "refresh".into(),
+            expires,
+            account_id: None,
+        };
+        if let Some(expires) = stored {
+            save_tokens(&state, TEST_PROVIDER, &tokens(ON_DISK, expires)).expect("save tokens");
+        }
+        let held = held.map(|expires| tokens(FRESH, expires));
+        assert_eq!(
+            needs_refresh(&state, TEST_PROVIDER, held.as_ref()),
+            expected
+        );
     }
 
     // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
@@ -645,17 +928,17 @@ mod tests {
 
     struct NeverReader;
 
-    impl futures_lite::io::AsyncRead for NeverReader {
+    impl AsyncRead for NeverReader {
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
-            _buf: &mut [u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
+            _buf: &mut ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Pending
         }
     }
 
-    impl futures_lite::io::AsyncBufRead for NeverReader {
+    impl AsyncBufRead for NeverReader {
         fn poll_fill_buf(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -666,17 +949,120 @@ mod tests {
         fn consume(self: std::pin::Pin<&mut Self>, _amt: usize) {}
     }
 
-    #[test]
-    fn next_sse_line_expired_deadline_returns_timeout() {
-        smol::block_on(async {
-            let mut lines = NeverReader.lines();
-            let mut past = Instant::now() - Duration::from_secs(1);
-            let stream_timeout = Duration::from_secs(300);
-            let err = next_sse_line(&mut lines, &mut past, stream_timeout)
-                .await
-                .unwrap_err();
-            assert!(matches!(err, AgentError::Timeout { .. }));
+    #[tokio::test]
+    async fn next_sse_line_expired_deadline_returns_timeout() {
+        let mut lines = NeverReader.lines();
+        let mut past = Instant::now() - Duration::from_secs(1);
+        let stream_timeout = Duration::from_secs(300);
+        let err = next_sse_line(&mut lines, &mut past, stream_timeout)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Timeout { .. }));
+    }
+
+    /// Reads the request head, answers `head` and then sends nothing until
+    /// the returned sender is dropped. hyper drops a response that arrives
+    /// before the request went out, so the server must not answer on accept.
+    fn stalled_sse_server(head: &'static [u8]) -> (String, mpsc::Sender<()>) {
+        let listener = TcpListener::bind((LOOPBACK_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (hold, held) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let request_head = BufReader::new(&conn)
+                .lines()
+                .map_while(Result::ok)
+                .take_while(|line| !line.is_empty());
+            request_head.for_each(drop);
+            conn.write_all(head).unwrap();
+            let _ = held.recv();
+        });
+        (format!("http://{LOOPBACK_HOST}:{port}/"), hold)
+    }
+
+    /// The provider client without the shell's proxy, so a request goes where
+    /// the test points it.
+    fn direct_client(timeouts: Timeouts) -> Client {
+        let builder = client_builder().no_proxy();
+        timeouts.bound(builder).build().unwrap()
+    }
+
+    async fn first_sse_line(
+        client: &Client,
+        url: &str,
+        stream: Duration,
+    ) -> Result<Option<String>, AgentError> {
+        let request = client.get(url).build()?;
+        send_request(client, request, |response| async move {
+            let mut lines = body_reader(response).lines();
+            let mut deadline = Instant::now() + stream;
+            next_sse_line(&mut lines, &mut deadline, stream).await
         })
+        .await
+    }
+
+    fn is_io_timeout(error: &AgentError) -> bool {
+        matches!(error, AgentError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
+    }
+
+    fn is_stream_timeout(error: &AgentError) -> bool {
+        matches!(error, AgentError::Timeout { .. })
+    }
+
+    #[test_case(SHORT, LONG, is_io_timeout, RetryKind::Transient  ; "a_stalled_body_is_an_io_timeout")]
+    #[test_case(LONG, SHORT, is_stream_timeout, RetryKind::Timeout ; "the_stream_deadline_is_its_own_kind")]
+    #[tokio::test]
+    async fn the_shorter_bound_fires_first(
+        low_speed: Duration,
+        stream: Duration,
+        expected: fn(&AgentError) -> bool,
+        kind: RetryKind,
+    ) {
+        let (url, _hold) = stalled_sse_server(SSE_HEAD);
+        let client = direct_client(Timeouts {
+            low_speed,
+            stream,
+            ..Timeouts::default()
+        });
+        let error = first_sse_line(&client, &url, stream).await.unwrap_err();
+        assert!(expected(&error), "{error}");
+        assert_eq!(error.retry_kind(), Some(kind));
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_mid_stream_retries_as_transient() {
+        let (url, hold) = stalled_sse_server(CHUNKED_HEAD);
+        drop(hold);
+        let client = direct_client(Timeouts::default());
+        let error = first_sse_line(&client, &url, LONG).await.unwrap_err();
+        assert!(
+            matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::Other),
+            "{error}"
+        );
+        assert_eq!(error.retry_kind(), Some(RetryKind::Transient));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_read_as_the_api_error_it_is() {
+        let (base_url, requests) = serve(REDIRECT_SCRIPT);
+        let client = direct_client(Timeouts::default());
+        let error = async {
+            let request = client.get(base_url.as_str()).build()?;
+            ok_text(&client, request).await
+        }
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AgentError::Api {
+                    status: REDIRECT_STATUS,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[test]

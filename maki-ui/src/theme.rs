@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
@@ -253,6 +253,10 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/solarized_light.toml"),
     },
     ThemeEntry {
+        name: "system",
+        toml: include_str!("themes/system.toml"),
+    },
+    ThemeEntry {
         name: "tokyonight",
         toml: include_str!("themes/tokyonight.toml"),
     },
@@ -271,6 +275,8 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+static CURSOR_FOCUSED: AtomicBool = AtomicBool::new(true);
+
 static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
@@ -285,14 +291,39 @@ pub fn set(theme: Theme) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// Tracks terminal focus so the input caret can recolor itself when the user
+/// switches away. Terminals that never report focus keep the focused look.
+pub fn set_cursor_focused(focused: bool) {
+    CURSOR_FOCUSED.store(focused, Ordering::Relaxed);
+}
+
+/// The `[ui] cursor` style while focused, `[ui] cursor_unfocused` otherwise.
+pub fn cursor_style() -> Style {
+    let t = current();
+    if CURSOR_FOCUSED.load(Ordering::Relaxed) {
+        t.cursor
+    } else {
+        t.cursor_unfocused
+    }
+}
+
+/// True for a buffer cell that carries the `cursor_style()` paint, so tests
+/// assert against the theme instead of one theme's hardcoded colors.
+#[cfg(test)]
+pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
+    let cursor = cursor_style();
+    cursor.fg.is_none_or(|fg| cell.fg == fg)
+        && cursor.bg.is_none_or(|bg| cell.bg == bg)
+        && cell.modifier.contains(cursor.add_modifier)
+}
+
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
-    if let Some(path) = user_themes_dirs()
-        .map(|dir| dir.join(format!("{name}.toml")))
-        .find(|path| path.is_file())
+    if let Some(path) = user_themes_dir().map(|dir| dir.join(format!("{name}.toml")))
+        && path.is_file()
         && let Ok(toml) = std::fs::read_to_string(&path)
     {
         return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
@@ -304,14 +335,15 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
 }
 
-fn user_themes_dirs() -> impl Iterator<Item = PathBuf> {
-    maki_storage::paths::config_search_dirs()
-        .into_iter()
+fn user_themes_dir() -> Option<PathBuf> {
+    maki_storage::paths::config_dir()
+        .ok()
         .map(|dir| dir.join(THEMES_DIR))
 }
 
 pub fn all_theme_names() -> Vec<String> {
-    let user_names = user_themes_dirs()
+    let user_names = user_themes_dir()
+        .into_iter()
         .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .flatten()
@@ -409,9 +441,11 @@ named_styles!(t => {
     "item_match" | "match" => t.item_match,
     "item_match_selected" | "match_selected" => t.item_match_selected,
     "cursor" => t.cursor,
+    "cursor_unfocused" => t.cursor_unfocused,
     "background" => Style::new().bg(t.background),
     "foreground" => Style::new().fg(t.foreground),
     "accent" => t.accent,
+    "shell_prefix" => t.shell_prefix,
     "active" => t.active,
     "keybind_key" => t.keybind_key,
     "keybind_desc" => t.keybind_desc,
@@ -474,6 +508,7 @@ pub struct Theme {
     pub panel_border: Style,
     pub panel_title: Style,
     pub cursor: Style,
+    pub cursor_unfocused: Style,
     pub input_border: Style,
     pub accent: Style,
     pub active: Style,
@@ -497,6 +532,7 @@ pub struct Theme {
     pub index_keyword: Style,
     pub shell_prefix: Style,
     pub progress_bar: Style,
+    pub scrollbar_thumb: Style,
 
     pub syntax: syntect::highlighting::Theme,
 }
@@ -815,6 +851,17 @@ impl Theme {
             Modifier::BOLD,
         );
 
+        // Themes that leave `cursor` unset get a visible caret everywhere,
+        // including pickers that paint `t.cursor` directly.
+        let cursor = match style("cursor") {
+            s if s == Style::default() => Style::new().reversed(),
+            s => s,
+        };
+        let cursor_unfocused = match style("cursor_unfocused") {
+            s if s == Style::default() => cursor,
+            s => s,
+        };
+
         Ok(Self {
             background: color("background"),
             foreground: color("foreground"),
@@ -910,7 +957,8 @@ impl Theme {
             },
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
-            cursor: style("cursor"),
+            cursor,
+            cursor_unfocused,
             input_border: style("input_border"),
             accent: style("accent"),
             active: {
@@ -951,6 +999,14 @@ impl Theme {
                 } else {
                     s
                 }
+            },
+            scrollbar_thumb: {
+                // ListPicker paints highlighted rows over the scrollbar track,
+                // so the thumb carries its own bg instead of inheriting row
+                // backgrounds. Defaults to the window's own fg/bg colors.
+                let s = style("scrollbar_thumb");
+                s.fg(s.fg.unwrap_or(color("foreground")))
+                    .bg(s.bg.unwrap_or(color("background")))
             },
             syntax,
         })
@@ -1056,6 +1112,18 @@ mod tests {
     }
 
     #[test]
+    fn system_theme_keeps_colors_symbolic() {
+        let t = load_by_name("system").expect("system theme must exist");
+        assert_eq!(t.background, Color::Reset);
+        assert_eq!(t.foreground, Color::Reset);
+        assert_eq!(t.user.fg, Some(Color::Cyan));
+        assert_eq!(
+            t.syntax.settings.background,
+            Some(SegmentColor::Default.to_syntect())
+        );
+    }
+
+    #[test]
     fn dracula_syntax_scopes() {
         let t = dracula();
         assert!(!t.syntax.scopes.is_empty());
@@ -1134,6 +1202,39 @@ mod tests {
                 "scope {scope} should resolve correctly"
             );
         }
+    }
+
+    #[test]
+    fn a_theme_without_colors_keeps_the_terminal_default_thumb() {
+        let theme = Theme::from_toml("[palette]\n[ui]\n").unwrap();
+        assert_eq!(
+            theme.scrollbar_thumb,
+            Style::new().fg(Color::Reset).bg(Color::Reset)
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_defaults_to_the_theme_window_colors() {
+        let t = dracula();
+        assert_eq!(
+            t.scrollbar_thumb,
+            Style::new()
+                .fg(Color::Rgb(0xf8, 0xf8, 0xf2))
+                .bg(Color::Rgb(0x28, 0x2a, 0x36))
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_keeps_its_own_explicit_colors() {
+        let toml = r##"
+[palette]
+magenta = "#ff00ff"
+[ui]
+scrollbar_thumb = { fg = "magenta", bg = "default" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.scrollbar_thumb.fg, Some(Color::Rgb(0xff, 0x00, 0xff)));
+        assert_eq!(t.scrollbar_thumb.bg, Some(Color::Reset));
     }
 
     #[test]
@@ -1372,6 +1473,7 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
+        assert_eq!(style_by_name("cursor_unfocused"), t.cursor_unfocused);
         assert_eq!(style_by_name("accent"), t.accent);
         assert_eq!(style_by_name("active"), t.active);
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
@@ -1553,6 +1655,28 @@ magenta    = "magenta"
 
         let ty = scope("type");
         assert_eq!((ty.r, ty.g, ty.b, ty.a), (0xfd, 0xa3, 0x31, 0xFF));
+    }
+
+    #[test]
+    fn cursor_unfocused_falls_back_to_cursor() {
+        let t = Theme::from_toml(
+            r##"
+[ui]
+"cursor" = { fg = "#ff0000" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(t.cursor_unfocused, t.cursor);
+
+        let t = Theme::from_toml(
+            r##"
+[ui]
+"cursor"          = { fg = "#ff0000" }
+"cursor_unfocused" = { fg = "#00ff00" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(t.cursor_unfocused.fg, Some(Color::Rgb(0, 255, 0)));
     }
 
     #[test]

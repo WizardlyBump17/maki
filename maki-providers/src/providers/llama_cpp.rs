@@ -7,8 +7,8 @@ use crate::model::ModelFamily;
 use crate::provider::Provider;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
-    ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS,
+    Native, ProviderSpec,
 };
 
 use super::local::{LLAMACPP, LocalEndpoint};
@@ -26,17 +26,21 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: LLAMACPP.api_key_env,
     family: ModelFamily::Generic,
     supports_thinking: true,
+    supports_deferred_tools: false,
+    sends_thinking: |model, choice| LLAMACPP.sends_thinking(model, choice),
+    thinking_fields_fallback: |_| LLAMACPP.fields_fallback(),
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: DEFAULT_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: DEFAULT_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
@@ -49,7 +53,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     docs: GeneratedDocs {
         // Docs quote the codec url, which carries the `/v1` segment the login
         // default leaves off.
-        api_urls: &[LLAMACPP.compat.base_url],
+        api_urls: &[super::local::LLAMACPP_BASE_URL],
         features: Some(FEATURES),
         auth: AuthDoc::EnvVar,
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),

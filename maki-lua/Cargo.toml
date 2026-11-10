@@ -9,9 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
-async-lock = { workspace = true }
 base64 = { workspace = true }
-image = { workspace = true, features = ["jpeg", "gif", "webp"] }
+image = { workspace = true, features = ["jpeg", "gif", "webp", "bmp"] }
 crossterm = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
@@ -23,19 +22,20 @@ maki-pack = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
 nucleo-matcher = { workspace = true }
+open = { workspace = true }
 serde = { workspace = true }
 shell-words = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true, features = ["deserialize", "serialize"] }
+serde-value = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 strum = { workspace = true }
-event-listener = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-futures-lite = { workspace = true }
 pin-project-lite = { workspace = true }
 tree-sitter = { workspace = true }
 unicode-width = { workspace = true }
@@ -43,8 +43,8 @@ url = { workspace = true }
 regex = { workspace = true }
 include_dir = { workspace = true }
 maki-storage = { workspace = true }
-humantime = { workspace = true }
-isahc = { workspace = true }
+reqwest = { workspace = true, features = ["socks", "gzip", "deflate"] }
+socket2 = { workspace = true }
 htmd = { workspace = true }
 jsonschema = { workspace = true }
 toml = { workspace = true }
@@ -89,7 +89,9 @@ rustix = { workspace = true }
 [dev-dependencies]
 base64 = { workspace = true }
 criterion = { workspace = true }
+fastrand = { workspace = true }
 image = { workspace = true }
+jiff = { workspace = true }
 maki-agent = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
@@ -97,3 +99,6 @@ test-case = { workspace = true }
 [[bench]]
 name = "luau_perf"
 harness = false
+
+[lints]
+workspace = true

@@ -6,12 +6,15 @@ use std::time::Duration;
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
 use maki_config::{GatedFile, ProjectConfig, expand_env, is_valid_server_name};
+use maki_storage::paths::expand_tilde;
 use serde::Deserialize;
 use toml_edit::DocumentMut;
 
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
+const SECRET_NEEDS_CLIENT_ID: &str = "oauth.client_secret needs client_id";
+const HTTPS_CALLBACK_NEEDS_PORT: &str = "oauth.callback_scheme \"https\" needs callback_port to match the redirect URI registered with the provider";
 
 #[derive(Debug, Clone)]
 pub enum McpConfigError {
@@ -121,6 +124,7 @@ pub struct McpServerInfo {
     pub config_path: PathBuf,
     pub url: Option<String>,
     pub oauth: Option<OauthClientConfig>,
+    pub ca_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Default)]
@@ -181,6 +185,9 @@ pub struct RawHttpFields {
     pub headers: HashMap<String, String>,
     #[serde(default)]
     pub oauth: Option<OauthClientConfig>,
+    /// A PEM bundle that replaces the default CAs, for OAuth too, like curl's `--cacert`.
+    #[serde(default)]
+    pub ca_file: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,10 +200,12 @@ pub struct ServerConfig {
     pub transport: Transport,
 }
 
-/// Static OAuth client used when the server has no registration endpoint.
-#[derive(Deserialize, Clone, Debug)]
+/// Without `client_id` the client is registered dynamically, so the
+/// `callback_*` fields still shape the redirect URI.
+#[derive(Deserialize, Clone, Debug, Default)]
 pub struct OauthClientConfig {
-    pub client_id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
     /// Fixed loopback port so the redirect URI can be pre-registered.
@@ -208,6 +217,18 @@ pub struct OauthClientConfig {
     /// Loopback hostname of the redirect URI (defaults to `127.0.0.1`).
     #[serde(default)]
     pub callback_hostname: Option<String>,
+    /// `https` is for providers that refuse http redirect URIs. Maki has no TLS
+    /// listener, so the user pastes the redirect URL from the browser instead.
+    #[serde(default)]
+    pub callback_scheme: CallbackScheme,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CallbackScheme {
+    #[default]
+    Http,
+    Https,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +242,7 @@ pub enum Transport {
         url: String,
         headers: HashMap<String, String>,
         oauth: Option<OauthClientConfig>,
+        ca_file: Option<PathBuf>,
     },
 }
 
@@ -255,10 +277,18 @@ impl McpConfig {
                         RawTransport::Http(h) => h.oauth.clone(),
                         _ => None,
                     },
+                    // The raw path is not resolved yet, and OAuth only starts from published infos.
+                    ca_file: None,
                 }
             })
             .collect()
     }
+}
+
+fn unset_var(server: &str, field: &str, var: &str) -> McpError {
+    McpError::Config(format!(
+        "server '{server}' {field}: environment variable '{var}' is unset or empty"
+    ))
 }
 
 /// Erroring (not dropping) surfaces the variable name in the server's status
@@ -270,17 +300,27 @@ fn expand_map(
 ) -> Result<HashMap<String, String>, McpError> {
     map.into_iter()
         .map(|(key, value)| {
-            let expanded = expand_env(&value).map_err(|var| {
-                McpError::Config(format!(
-                    "server '{server}' {kind} '{key}': environment variable '{var}' is unset or empty"
-                ))
-            })?;
+            let expanded = expand_env(&value)
+                .map_err(|var| unset_var(server, &format!("{kind} '{key}'"), &var))?;
             Ok((key, expanded))
         })
         .collect()
 }
 
-pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfig, McpError> {
+/// `${VAR}` goes first, so a variable can hold `~` or an absolute path. A relative
+/// path starts from the folder of the `mcp.toml` that sets it, so a global config
+/// works from any cwd.
+fn resolve_ca_file(server: &str, ca_file: &str, config_path: &Path) -> Result<PathBuf, McpError> {
+    let expanded = expand_env(ca_file).map_err(|var| unset_var(server, "ca_file", &var))?;
+    let base = config_path.parent().unwrap_or(Path::new(""));
+    Ok(base.join(expand_tilde(Path::new(&expanded))))
+}
+
+pub fn parse_server(
+    name: String,
+    server: RawServerConfig,
+    config_path: &Path,
+) -> Result<ServerConfig, McpError> {
     if !is_valid_server_name(&name) {
         return Err(McpError::Config(format!(
             "server name '{name}' must be ASCII alphanumeric + hyphens"
@@ -314,17 +354,35 @@ pub fn parse_server(name: String, server: RawServerConfig) -> Result<ServerConfi
                     "server '{name}' url must start with http:// or https://"
                 )));
             }
-            if let Some(path) = &cfg.oauth.as_ref().and_then(|o| o.callback_path.as_ref())
-                && (path.is_empty() || !path.starts_with('/'))
-            {
-                return Err(McpError::Config(format!(
-                    "server '{name}' oauth.callback_path must start with '/'"
-                )));
+            if let Some(oauth) = &cfg.oauth {
+                if oauth
+                    .callback_path
+                    .as_ref()
+                    .is_some_and(|p| p.is_empty() || !p.starts_with('/'))
+                {
+                    return Err(McpError::Config(format!(
+                        "server '{name}' oauth.callback_path must start with '/'"
+                    )));
+                }
+                if oauth.client_secret.is_some() && oauth.client_id.is_none() {
+                    return Err(McpError::Config(format!(
+                        "server '{name}' {SECRET_NEEDS_CLIENT_ID}"
+                    )));
+                }
+                if oauth.callback_scheme == CallbackScheme::Https && oauth.callback_port.is_none() {
+                    return Err(McpError::Config(format!(
+                        "server '{name}' {HTTPS_CALLBACK_NEEDS_PORT}"
+                    )));
+                }
             }
             Transport::Http {
                 url: cfg.url,
                 headers: expand_map(&name, "header", cfg.headers)?,
                 oauth: cfg.oauth,
+                ca_file: cfg
+                    .ca_file
+                    .map(|path| resolve_ca_file(&name, &path, config_path))
+                    .transpose()?,
             }
         }
     };
@@ -460,7 +518,11 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_config::project::{self, TrustMode};
+    use maki_storage::paths::home;
     use test_case::test_case;
+
+    const CONFIG_PATH: &str = "/etc/maki/mcp.toml";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -474,6 +536,10 @@ mod tests {
         }
     }
 
+    fn parse(name: &str, raw: RawServerConfig) -> Result<ServerConfig, McpError> {
+        parse_server(name.into(), raw, Path::new(CONFIG_PATH))
+    }
+
     fn http_raw(url: &str) -> RawServerConfig {
         RawServerConfig {
             enabled: true,
@@ -483,16 +549,26 @@ mod tests {
                 url: url.to_string(),
                 headers: HashMap::new(),
                 oauth: None,
+                ca_file: None,
             }),
         }
+    }
+
+    fn http_raw_with_ca(ca_file: &str) -> RawServerConfig {
+        let mut cfg = http_raw("https://mcp.example.com/mcp");
+        if let RawTransport::Http(http) = &mut cfg.transport {
+            http.ca_file = Some(ca_file.into());
+        }
+        cfg
     }
 
     #[test_case("srv",       stdio_raw(&[]),            "empty command"        ; "empty_command")]
     #[test_case("bash",      stdio_raw(&["echo"]),      "conflicts with built-in" ; "builtin_name_collision")]
     #[test_case("bad name!", stdio_raw(&["echo"]),      "ASCII alphanumeric"   ; "invalid_server_name")]
     #[test_case("srv",       http_raw("ftp://bad.com"), "http://"              ; "invalid_http_url")]
+    #[test_case("srv",       http_raw_with_ca("${MAKI_TEST_MCP_UNSET_84421}/ca.pem"), "MAKI_TEST_MCP_UNSET_84421" ; "ca_file_unset_var")]
     fn parse_server_rejects(name: &str, cfg: RawServerConfig, expected_msg: &str) {
-        let err = parse_server(name.into(), cfg).unwrap_err();
+        let err = parse(name, cfg).unwrap_err();
         assert!(err.to_string().contains(expected_msg), "got: {err}");
     }
 
@@ -506,7 +582,7 @@ headers = { Authorization = "Bearer ${MAKI_TEST_MCP_UNSET_84421}" }
 "#,
         )
         .unwrap();
-        let err = parse_server("remote".into(), config.mcp["remote"].clone()).unwrap_err();
+        let err = parse("remote", config.mcp["remote"].clone()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("MAKI_TEST_MCP_UNSET_84421"), "got: {msg}");
         assert!(msg.contains("Authorization"), "got: {msg}");
@@ -523,7 +599,7 @@ headers = { Authorization = "Bearer ${MAKI_TEST_MCP_EMPTY_84421}" }
 "#,
         )
         .unwrap();
-        let err = parse_server("remote".into(), config.mcp["remote"].clone()).unwrap_err();
+        let err = parse("remote", config.mcp["remote"].clone()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("MAKI_TEST_MCP_EMPTY_84421"), "got: {msg}");
     }
@@ -539,7 +615,7 @@ environment = { GITHUB_TOKEN = "${MAKI_TEST_MCP_ENV_84421}" }
 "#,
         )
         .unwrap();
-        let parsed = parse_server("local".into(), config.mcp["local"].clone()).unwrap();
+        let parsed = parse("local", config.mcp["local"].clone()).unwrap();
         match parsed.transport {
             Transport::Stdio { environment, .. } => {
                 assert_eq!(environment["GITHUB_TOKEN"], "tok");
@@ -553,7 +629,7 @@ environment = { GITHUB_TOKEN = "${MAKI_TEST_MCP_ENV_84421}" }
     fn invalid_timeout_rejected(timeout: u64) {
         let mut cfg = stdio_raw(&["echo"]);
         cfg.timeout = timeout;
-        let err = parse_server("srv".into(), cfg).unwrap_err();
+        let err = parse("srv", cfg).unwrap_err();
         assert!(err.to_string().contains("timeout"));
     }
 
@@ -575,7 +651,7 @@ command = ["other"]
         assert_eq!(config.defer_tools, Some(30));
         assert!(config.mcp["github"].always_load);
         assert!(!config.mcp["other"].always_load);
-        let parsed = parse_server("github".into(), config.mcp["github"].clone()).unwrap();
+        let parsed = parse("github", config.mcp["github"].clone()).unwrap();
         assert!(parsed.always_load);
 
         let bare: McpConfig = toml::from_str("[mcp.srv]\ncommand = [\"x\"]").unwrap();
@@ -584,7 +660,7 @@ command = ["other"]
 
     #[test]
     fn parse_splits_command_into_program_and_args() {
-        let result = parse_server("srv".into(), stdio_raw(&["npx", "-y", "server"])).unwrap();
+        let result = parse("srv", stdio_raw(&["npx", "-y", "server"])).unwrap();
         match &result.transport {
             Transport::Stdio { program, args, .. } => {
                 assert_eq!(program, "npx");
@@ -643,12 +719,12 @@ url = "https://mcp.acme.example.com/mcp"
 oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3118, callback_path = "/callback" }
 "#;
         let config: McpConfig = toml::from_str(toml_str).unwrap();
-        let parsed = parse_server("acme".into(), config.mcp["acme"].clone()).unwrap();
+        let parsed = parse("acme", config.mcp["acme"].clone()).unwrap();
         match parsed.transport {
             Transport::Http { url, oauth, .. } => {
                 assert_eq!(url, "https://mcp.acme.example.com/mcp");
                 let oauth = oauth.unwrap();
-                assert_eq!(oauth.client_id, "acme-client");
+                assert_eq!(oauth.client_id.as_deref(), Some("acme-client"));
                 assert_eq!(oauth.client_secret.as_deref(), Some("s3cret"));
                 assert_eq!(oauth.callback_port, Some(3118));
                 assert_eq!(oauth.callback_path.as_deref(), Some("/callback"));
@@ -663,13 +739,14 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
             "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = { client_id = \"acme-client\" }\n",
         )
         .unwrap();
-        let parsed = parse_server("acme".into(), config.mcp["acme"].clone()).unwrap();
+        let parsed = parse("acme", config.mcp["acme"].clone()).unwrap();
         match parsed.transport {
             Transport::Http { oauth, .. } => {
                 let oauth = oauth.unwrap();
                 assert_eq!(oauth.client_secret, None);
                 assert_eq!(oauth.callback_port, None);
                 assert_eq!(oauth.callback_path, None);
+                assert_eq!(oauth.callback_scheme, CallbackScheme::Http);
             }
             _ => panic!("expected Http"),
         }
@@ -681,8 +758,53 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
             "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = { client_id = \"acme-client\", callback_path = \"callback\" }\n",
         )
         .unwrap();
-        let err = parse_server("acme".into(), config.mcp["acme"].clone()).unwrap_err();
+        let err = parse("acme", config.mcp["acme"].clone()).unwrap_err();
         assert!(err.to_string().contains("callback_path"));
+    }
+
+    #[test]
+    fn oauth_https_without_client_id_parses() {
+        let config: McpConfig = toml::from_str(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = { callback_scheme = \"https\", callback_port = 3119 }\n",
+        )
+        .unwrap();
+        match parse("acme", config.mcp["acme"].clone()).unwrap().transport {
+            Transport::Http { oauth, .. } => {
+                let oauth = oauth.unwrap();
+                assert_eq!(oauth.client_id, None);
+                assert_eq!(oauth.callback_scheme, CallbackScheme::Https);
+            }
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test_case("client_id = \"acme-client\", callback_scheme = \"https\"", HTTPS_CALLBACK_NEEDS_PORT ; "https_without_port")]
+    #[test_case("client_secret = \"s3cret\"",                                  SECRET_NEEDS_CLIENT_ID    ; "secret_without_client_id")]
+    fn oauth_invalid_rejected(fields: &str, expected: &str) {
+        let config: McpConfig = toml::from_str(&format!(
+            "[mcp.acme]\nurl = \"https://mcp.acme.example.com/mcp\"\noauth = {{ {fields} }}\n"
+        ))
+        .unwrap();
+        let err = parse("acme", config.mcp["acme"].clone()).unwrap_err();
+        assert!(err.to_string().contains(expected));
+    }
+
+    #[test_case("certs/ca.pem",                         "/etc/maki/certs/ca.pem" ; "relative_to_config_dir")]
+    #[test_case("/certs/ca.pem",                        "/certs/ca.pem"          ; "absolute")]
+    #[test_case("~/ca.pem",                             "~/ca.pem"               ; "tilde")]
+    #[test_case("${MAKI_TEST_MCP_CA_DIR_84421}/ca.pem", "/opt/certs/ca.pem"      ; "env_var")]
+    fn ca_file_resolves_to_an_absolute_path(ca_file: &str, expected: &str) {
+        if expected.starts_with('~') && home().is_none() {
+            return;
+        }
+        unsafe { std::env::set_var("MAKI_TEST_MCP_CA_DIR_84421", "/opt/certs") };
+        let parsed = parse("srv", http_raw_with_ca(ca_file)).unwrap();
+        match parsed.transport {
+            Transport::Http { ca_file: got, .. } => {
+                assert_eq!(got, Some(expand_tilde(Path::new(expected))))
+            }
+            _ => panic!("expected Http"),
+        }
     }
 
     #[test]
@@ -717,7 +839,7 @@ command = ["project"]
             ProjectConfig::discover(&project_dir),
         );
         assert!(errors.is_empty());
-        let global = parse_server("srv".to_owned(), global_only.mcp["srv"].clone()).unwrap();
+        let global = parse("srv", global_only.mcp["srv"].clone()).unwrap();
         match global.transport {
             Transport::Stdio { program, .. } => assert_eq!(program, "global"),
             _ => panic!("expected Stdio"),
@@ -726,14 +848,14 @@ command = ["project"]
         let (merged, errors) = load_config_inner(
             &project_dir,
             Some(&global_dir.join(MCP_CONFIG_FILE)),
-            ProjectConfig::for_project(&project_dir),
+            project::resolve_noninteractive(&project_dir, TrustMode::Session).project_config,
         );
         assert!(errors.is_empty());
         let all: Vec<_> = merged
             .mcp
             .into_iter()
             .filter(|(_, v)| v.enabled)
-            .map(|(name, cfg)| parse_server(name, cfg))
+            .map(|(name, cfg)| parse(&name, cfg))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(all.len(), 1);

@@ -56,6 +56,12 @@ assert(sp_row == 0, "start row should be 0")
 local ep_row, ep_col, ep_byte = root:end_()
 assert(ep_row > 0, "end row should be > 0")
 
+local sr, sc, er, ec = root:range()
+assert(sr == sp_row and sc == sp_col and er == ep_row and ec == ep_col)
+local sr, sc, sb, er, ec, eb = root:range(true)
+assert(sr == sp_row and sc == sp_col and sb == sp_byte)
+assert(er == ep_row and ec == ep_col and eb == ep_byte)
+
 assert(root:named() == true)
 assert(root:has_error() == false)
 assert(root:sexpr():sub(1, 12) == "(source_file")
@@ -280,7 +286,9 @@ fn language_module() {
         &host,
         "language_mod",
         r#"
-maki.treesitter.language.add("rust")
+assert(maki.treesitter.language.add("rust") == true)
+local ok, err = maki.treesitter.language.add("unknown_lang_xyz")
+assert(ok == nil and err ~= nil)
 
 maki.treesitter.language.register("rust", "rs")
 assert(maki.treesitter.language.get_lang("rs") == "rust")

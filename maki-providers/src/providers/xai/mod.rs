@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::providers::Protocol;
 
-use crate::AgentError;
 use crate::model::ModelFamily;
 use crate::provider::Provider;
 use crate::providers::{ResolvedAuth, Timeouts};
-use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
+use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
+use crate::{AgentError, dialect};
 
 const GROK_MAX_OUTPUT_TOKENS: u32 = 131_072;
 
@@ -36,16 +36,20 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: auth::API_KEY_ENV,
     family: ModelFamily::Generic,
     supports_thinking: true,
+    supports_deferred_tools: false,
+    sends_thinking: |_, choice| dialect::GROK.sends(choice),
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(GROK_MAX_OUTPUT_TOKENS),
     fallback_context_window: 500_000,
     models_toml: include_str!("../../../models/xai.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: None,
     }),
+    aperture: None,
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
         default_base_url: BASE_URL,

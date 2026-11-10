@@ -16,8 +16,7 @@ reference is at the end of this document.
 
 Plugins live in the maki config dir. There are two of them, same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one first)
+- `~/.config/maki/` - global, every project
 - `<project>/.maki/` - this project only
 
 ```
@@ -94,6 +93,7 @@ with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
+- Describe parameters as separate fields, never as usage lines like `` `write path content` ``: models copy them into the string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example
@@ -111,16 +111,17 @@ local output_limits = require("maki.output_limits")
 local NO_FILES_FOUND = "No files found"
 
 local opts = maki.api.register_options(output_limits.extend({
-  search_result_limit = { default = 100, min = 10, desc = "Max files returned per search." },
+  search_result_limit = { default = 100, min = 10, desc = "Max files the model sees per search." },
 }))
 
 local function glob_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.other) or 3, keep = "head" }
+  return { max_lines = (tol and tol.grep) or 3, keep = "head" }
 end
 
 maki.api.register_tool({
   name = "glob",
+  permission = "fs_read",
   kind = "search",
   description = [[Find files by glob pattern.
 
@@ -157,14 +158,13 @@ maki.api.register_tool({
       return { llm_output = "error: pattern is required", is_error = true }
     end
 
-    local limit = opts.search_result_limit
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local files, err = maki.fs.glob(pattern, {
       path = input.path,
       gitignore = true,
       sort = "mtime",
-      limit = limit,
+      limit = ctx:output_mode() == "compact" and opts.search_result_limit or nil,
     })
 
     if not files then

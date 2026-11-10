@@ -3,6 +3,7 @@ mod gen_config;
 mod gen_folder_trust;
 mod gen_keybindings;
 mod gen_lua_api;
+mod gen_luau;
 mod gen_plugins;
 mod gen_providers;
 mod gen_tools;
@@ -13,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
+use tokio::runtime::Runtime;
+
 const CONTENT_DIR: &str = "site/docs/content";
+const DEFINITIONS_PATH: &str = "plugins/maki.d.luau";
 
 type Page = (&'static str, fn() -> String);
 
@@ -62,11 +66,22 @@ fn check_file(path: &Path, expected: &str) -> bool {
 
 fn main() -> ExitCode {
     let check = std::env::args().any(|a| a == "--check");
+    // The plugin hosts the pages load run on it, one per generator thread.
+    let runtime = Runtime::new().expect("failed to start the async runtime");
+    let _guard = runtime.enter();
 
-    let outputs = thread::scope(|scope| {
-        let running = PAGES.map(|(section, generate)| (page_path(section), scope.spawn(generate)));
+    let mut outputs = Vec::from(thread::scope(|scope| {
+        let running = PAGES.map(|(section, generate)| {
+            let runtime = &runtime;
+            let page = scope.spawn(move || {
+                let _guard = runtime.enter();
+                generate()
+            });
+            (page_path(section), page)
+        });
         running.map(|(path, page)| (path, page.join().unwrap()))
-    });
+    }));
+    outputs.push((DEFINITIONS_PATH.into(), gen_luau::generate()));
 
     if check {
         let mismatches = outputs

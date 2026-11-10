@@ -1,18 +1,29 @@
-use std::fmt::Display;
+use std::collections::HashSet;
+use std::fmt::{self, Display};
 use std::io::{self, Write};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use color_eyre::Result;
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::{Context, bail, eyre};
 
+use maki_config::{ModelPolicy, ProviderConfig, SessionDefaults};
 use maki_providers::model::{Model, ModelError, ModelTier};
+use maki_providers::provider::provider_for_slug;
 use maki_providers::spec::ProviderRegistry;
+use maki_providers::{AgentError, Timeouts, custom, plugin};
 use maki_storage::StateDir;
 use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use maki_storage::model::{read_model, read_thinking};
+use serde_json::Value;
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
+use tracing_subscriber::registry::LookupSpan;
+
+use crate::provider_scripts;
 
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
@@ -28,12 +39,15 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "deepseek",
     "regolo",
 ];
+const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
 
-pub fn resolve_model(
+/// The model to start on, plus a warning when the saved one had to be skipped.
+/// Logging is not up this early, so the caller has to show the warning.
+pub async fn resolve_model(
     explicit: Option<&str>,
-    provider_config: &maki_config::ProviderConfig,
+    provider_config: &ProviderConfig,
     storage: &StateDir,
-) -> Result<Model> {
+) -> Result<(Model, Option<String>)> {
     let policy = &provider_config.model_policy;
     if let Some(spec) = explicit {
         if !policy.allows(spec) {
@@ -41,26 +55,47 @@ pub fn resolve_model(
                 "model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid --model spec");
+        let model = from_spec_or_warm_catalog(spec)
+            .await
+            .context("invalid --model spec")?;
+        return Ok((model, None));
     }
-    if let Some(spec) = read_model(storage) {
-        if policy.allows(&spec)
-            && let Ok(m) = from_spec_or_warm_catalog(&spec)
-        {
-            return Ok(m);
+    let Some(spec) = read_model(storage) else {
+        return Ok((fallback_model(provider_config).await?, None));
+    };
+    let skipped = match saved_model(&spec, policy).await {
+        Ok(model) => return Ok((model, None)),
+        Err(reason) => format!("saved model {spec} unavailable ({reason:#})"),
+    };
+    match fallback_model(provider_config).await {
+        Ok(model) => {
+            let warning = format!("{skipped}, using {}", model.spec());
+            Ok((model, Some(warning)))
         }
-        tracing::warn!(
-            spec,
-            "saved model unavailable or disallowed, falling back to default"
-        );
+        Err(error) => Err(error.wrap_err(skipped)),
     }
+}
+
+async fn saved_model(spec: &str, policy: &ModelPolicy) -> Result<Model> {
+    if !policy.allows(spec) {
+        bail!("not allowed by provider model policy");
+    }
+    let model = from_spec_or_warm_catalog(spec).await?;
+    provider_ready(&model.provider)?;
+    Ok(model)
+}
+
+async fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
+    let policy = &provider_config.model_policy;
     if let Some(spec) = provider_config.default_model.as_deref() {
         if !policy.allows(spec) {
             return Err(eyre!(
                 "default model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid default_model in config");
+        return from_spec_or_warm_catalog(spec)
+            .await
+            .context("invalid default_model in config");
     }
     auto_detect_model(policy).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
@@ -68,29 +103,42 @@ pub fn resolve_model(
         } else {
             ""
         };
-        color_eyre::eyre::eyre!(
+        eyre!(
             "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `maki auth login`, or use -m to specify a model{policy_note}\n\nSee https://maki.sh/docs/providers/ for setup instructions"
         )
     })
 }
 
-/// An unknown slug may just mean the models.dev catalog has not been loaded
-/// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
-/// non-blocking: the UI draws with it.
-fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
-    match Model::from_spec(spec) {
-        Err(ModelError::UnsupportedProvider(_)) => {
-            maki_providers::warm_catalog();
-            Model::from_spec(spec)
-        }
-        result => result,
+/// A plugin provider that gets credentials from a hook resolves them on its
+/// first request, so being registered is enough here: broken credentials fail
+/// that request instead of quietly switching providers.
+fn provider_ready(slug: &str) -> Result<(), AgentError> {
+    provider_for_slug(slug, Timeouts::default()).map(drop)
+}
+
+/// `always_thinking` pins the level. Without it, a fresh session starts at
+/// whatever `/thinking` last set, the way the model comes back too; a model
+/// that cannot run that level clamps it when the session loads.
+pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
+    if defaults.thinking.is_none() {
+        defaults.thinking = read_thinking(storage);
     }
 }
 
-fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
-    for tier in [ModelTier::Strong, ModelTier::Medium] {
+async fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
+    let result = Model::from_spec_or_warm_catalog(spec).await;
+    if let Err(ModelError::UnsupportedProvider(slug)) = &result
+        && let Some(hint) = provider_scripts::unknown_provider_hint(slug)
+    {
+        bail!(hint);
+    }
+    Ok(result?)
+}
+
+fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
+    for tier in STARTUP_TIERS {
         for &slug in PROVIDER_PRIORITY {
-            if maki_providers::provider::provider_available(slug)
+            if provider_ready(slug).is_ok()
                 && let Ok(model) = Model::from_tier(slug, tier)
                 && policy.allows(&model.spec())
             {
@@ -98,16 +146,36 @@ fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
             }
         }
     }
-    None
+    let mut checked = HashSet::new();
+    user_provider_models()
+        .filter(|model| policy.allows(&model.spec()))
+        .find(|model| {
+            checked.insert(Arc::clone(&model.provider)) && provider_ready(&model.provider).is_ok()
+        })
+}
+
+/// Lua plugin providers, then `providers.toml` entries. They come after the
+/// prioritised slugs so a key in the environment still wins. Plugins come
+/// sorted by slug, so startup picks the same provider every run.
+fn user_provider_models() -> impl Iterator<Item = Model> {
+    let plugins = plugin::specs()
+        .into_iter()
+        .flat_map(|spec| STARTUP_TIERS.map(|tier| Model::from_tier_dynamic(spec.slug, tier)));
+    let custom = custom::startup_specs(&STARTUP_TIERS)
+        .into_iter()
+        .map(|spec| Model::from_spec(&spec));
+    plugins.chain(custom).filter_map(Result::ok)
 }
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
 /// so a `providers.toml` entry setting those fields is only partly honored
-/// (#597). Call this after `init_logging`, otherwise the warning has no
-/// subscriber to reach.
+/// (#597). Local endpoints read some of them, see `ignored_builtin_fields`. A bundled plugin's slug counts once its declaration registered,
+/// since it keeps the slug over a `protocol` the same way. Call this after
+/// `init_logging` and the bundled load, or the warning has nowhere to go and
+/// no declaration to check.
 pub fn warn_ignored_provider_fields() {
     for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
-        if ProviderRegistry::get(slug).is_none() {
+        if !ProviderRegistry::is_shipped(slug) || ProviderRegistry::get(slug).is_none() {
             continue;
         }
         let ignored = maki_config::providers::ignored_builtin_fields(slug, def);
@@ -230,10 +298,37 @@ fn sets_a_level(value: &str) -> bool {
         .any(|part| !part.is_empty() && part.parse::<LevelFilter>().is_ok())
 }
 
+struct ProjectJson<E> {
+    inner: E,
+    project: Value,
+}
+
+impl<S, N, E> FormatEvent<S, N> for ProjectJson<E>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    E: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut line = String::new();
+        self.inner
+            .format_event(ctx, Writer::new(&mut line), event)?;
+        // Keep the JSON formatter's fields and spans verbatim instead of
+        // parsing and serializing every event a second time.
+        let fields = line.strip_prefix('{').ok_or(fmt::Error)?;
+        write!(writer, "{{\"project\":{},{}", self.project, fields)
+    }
+}
+
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(storage_config: &maki_config::StorageConfig, project: &Path) {
     let writer =
         match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
             Ok(writer) => writer,
@@ -244,6 +339,12 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
         };
     tracing_subscriber::fmt()
         .json()
+        // The config belongs to the launch project even after `/cd`. Binding
+        // it here also covers worker threads without carrying a span to each.
+        .map_event_format(|inner| ProjectJson {
+            inner,
+            project: project.to_string_lossy().into_owned().into(),
+        })
         .with_env_filter(log_filter())
         .with_writer(SharedWriter(Mutex::new(writer)))
         .init();
@@ -251,13 +352,74 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Seek};
+    use std::sync::Arc;
+    use std::thread;
+
+    use serde_json::Value;
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use super::{DEFAULT_LOG_LEVEL, ProjectJson, build_log_filter};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
     const BROKEN: &str = "not a directive=!!";
+    const PROJECT: &str = "/workspace/项目 \"quoted\"\\path";
+    const SPAN: &str = "turn";
+    const MESSAGE: &str = "tool finished\nwith output";
+    const SESSION: u64 = 7;
+    const BYTES: u64 = 42;
+    const WORKER_PLUGIN: &str = "background";
+
+    #[test]
+    fn project_tags_span_scoped_and_unscoped_worker_logs() {
+        let output = Arc::new(tempfile::tempfile().unwrap());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .map_event_format(|inner| ProjectJson {
+                inner,
+                project: PROJECT.into(),
+            })
+            .with_writer(Arc::clone(&output))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _span = tracing::info_span!(SPAN, session = SESSION).entered();
+            tracing::info!(success = true, bytes = BYTES, "{MESSAGE}");
+        });
+        thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::warn!(plugin = WORKER_PLUGIN, "{MESSAGE}");
+            });
+        })
+        .join()
+        .unwrap();
+
+        let mut reader = output.try_clone().unwrap();
+        reader.rewind().unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        let records: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record["project"], PROJECT);
+            assert_eq!(record["fields"]["message"], MESSAGE);
+            assert!(record["timestamp"].is_string());
+            assert_eq!(record["target"], module_path!());
+        }
+        assert_eq!(records[0]["level"], "INFO");
+        assert_eq!(records[0]["fields"]["success"], true);
+        assert_eq!(records[0]["fields"]["bytes"], BYTES);
+        assert_eq!(records[0]["span"]["name"], SPAN);
+        assert_eq!(records[0]["spans"][0]["session"], SESSION);
+        assert_eq!(records[1]["level"], "WARN");
+        assert_eq!(records[1]["fields"]["plugin"], WORKER_PLUGIN);
+        assert!(records[1].get("span").is_none());
+    }
 
     #[test_case(None, None, "info" ; "nothing_set_logs_at_info")]
     #[test_case(Some("warn"), None, "warn" ; "our_variable_wins")]

@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::agent::QueuedMessage;
-use crate::components::Status;
 use crate::theme;
-use maki_agent::{AgentInput, AgentMode};
+use maki_agent::{AgentInput, AgentMode, InputSource};
+use maki_lua::agent_autocmd::HostEvent;
+use maki_providers::RequestOptions;
 use maki_storage::StateDir;
 use maki_storage::plans;
 use ratatui::style::{Color, Modifier, Style};
@@ -88,7 +89,7 @@ impl App {
                 // The path is the whole point here, so with no path we stay
                 // quiet instead of handing a plugin an empty one to open.
                 if let Some(path) = path {
-                    self.fire_session_autocmd("PlanReady", serde_json::json!({ "path": path }));
+                    self.fire_session_event(HostEvent::PlanReady { path: &path });
                 }
             }
             PlanTrigger::InteractivePrompt => {
@@ -123,7 +124,7 @@ impl App {
         vec![]
     }
 
-    pub(super) fn agent_mode(&self) -> AgentMode {
+    pub(crate) fn agent_mode(&self) -> AgentMode {
         match self.state.mode {
             Mode::Plan => match self.state.plan.path() {
                 Some(p) => AgentMode::Plan(p.to_path_buf()),
@@ -136,16 +137,28 @@ impl App {
         }
     }
 
+    /// Background subagents are capped by this same value, so they can never
+    /// disagree with the chat's next prompt.
+    pub(crate) fn request_options(&self) -> RequestOptions {
+        RequestOptions {
+            thinking: self.state.thinking,
+            fast: self.state.fast,
+        }
+    }
+
     pub(crate) fn build_agent_input(&self, msg: &QueuedMessage) -> AgentInput {
+        let RequestOptions { thinking, fast } = self.request_options();
         AgentInput {
             message: msg.text.clone(),
             mode: self.agent_mode(),
             images: msg.images.clone(),
             preamble: Vec::new(),
-            thinking: self.state.thinking,
-            fast: self.state.fast,
+            earlier: Vec::new(),
+            thinking,
+            fast,
             workflow: self.state.workflow,
             prompt: None,
+            source: InputSource::Tui,
         }
     }
 
@@ -165,11 +178,7 @@ impl App {
     }
 
     pub(crate) fn is_bash_input(&self) -> bool {
-        self.input_box
-            .buffer
-            .lines()
-            .first()
-            .is_some_and(|l| l.starts_with('!'))
+        self.input_box.buffer.value().starts_with('!')
     }
 
     pub(super) fn effective_mode_color(&self) -> Color {
@@ -180,8 +189,10 @@ impl App {
         }
     }
 
+    /// Dim while the agent in front works, so a running task's tab reads
+    /// busy like a streaming main chat.
     pub(super) fn separator_style(&self) -> Style {
-        if self.status == Status::Streaming {
+        if self.active_chat_working() {
             theme::current().input_border
         } else {
             Style::new().fg(self.effective_mode_color())

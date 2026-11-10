@@ -7,10 +7,12 @@
 
 use std::{io, time::Duration};
 
-use isahc::{AsyncReadResponseExt, error::ErrorKind as HttpErrorKind};
+use reqwest::Response;
 use serde_json::Value;
+use tokio::task::JoinError;
 
 use crate::{
+    http::{error_chain, is_connect_failure},
     providers::opencode::{self, NonLoginError},
     retry::RetryKind,
 };
@@ -26,10 +28,16 @@ const OPENAI_LIMIT: &str = "maximum context length is ";
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
 const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
+const THINKING_UNBOUND: &str = "bound to a different conversation";
+const UNREADABLE_BODY_MESSAGE: &str = "unable to read error body";
+const RETRY_AFTER_HEADER: &str = "retry-after";
 /// The request field a server names when it refuses reasoning summaries. Every
 /// Responses implementation spells the rejection with a different `code`, so
 /// the field is the only stable part of the answer.
 const REASONING_SUMMARY_PARAM: &str = "reasoning.summary";
+/// OpenAI, Azure and LiteLLM refuse a field with a 400. Servers that validate
+/// with pydantic, like vLLM, answer 422 instead.
+const REJECTED_PARAM_STATUSES: [u16; 2] = [400, 422];
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,10 +121,8 @@ pub enum AgentError {
     Tool { tool: String, message: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("http: {0}")]
-    Http(#[from] isahc::Error),
-    #[error("http request: {0}")]
-    HttpRequest(#[from] isahc::http::Error),
+    #[error("http: {}", error_chain(.0))]
+    Http(reqwest::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("channel send failed")]
@@ -129,7 +135,67 @@ pub enum AgentError {
     EmptySummary,
 }
 
+/// Everything the retry loop and the compaction path can tell about an error,
+/// and nothing else. Two errors that project the same behave the same, which
+/// is the comparison replay goldens need out of a type that cannot be
+/// `PartialEq` itself. The test at the bottom of this file is the proof, and it
+/// is what lets each provider go without its own retry fixtures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorProjection {
+    Api {
+        status: u16,
+        retry_after: Option<Duration>,
+        /// The body is read only through these answers, so two wordings that
+        /// classify alike are the same error here.
+        overflow: Option<Overflow>,
+        quota_exhausted: bool,
+        auth_error: bool,
+        thinking_unbound: bool,
+    },
+    Config,
+    Tool,
+    /// The kind is all anyone reads off an io error.
+    Io(io::ErrorKind),
+    /// Transports split on whether a connection was ever made.
+    Http {
+        connect_failure: bool,
+    },
+    Json,
+    Channel,
+    Cancelled,
+    Timeout,
+    EmptySummary,
+}
+
 impl AgentError {
+    pub fn projection(&self) -> ErrorProjection {
+        match self {
+            Self::Api {
+                status,
+                retry_after,
+                ..
+            } => ErrorProjection::Api {
+                status: *status,
+                retry_after: *retry_after,
+                overflow: self.overflow(),
+                quota_exhausted: self.is_quota_exhausted(),
+                auth_error: self.is_auth_error(),
+                thinking_unbound: self.is_thinking_unbound(),
+            },
+            Self::Config { .. } => ErrorProjection::Config,
+            Self::Tool { .. } => ErrorProjection::Tool,
+            Self::Io(e) => ErrorProjection::Io(e.kind()),
+            Self::Http(e) => ErrorProjection::Http {
+                connect_failure: is_connect_failure(e),
+            },
+            Self::Json(_) => ErrorProjection::Json,
+            Self::Channel => ErrorProjection::Channel,
+            Self::Cancelled => ErrorProjection::Cancelled,
+            Self::Timeout { .. } => ErrorProjection::Timeout,
+            Self::EmptySummary => ErrorProjection::EmptySummary,
+        }
+    }
+
     /// An API error with no `Retry-After` behind it. Everything that is not a
     /// response we read the headers of lands here, SSE error frames included.
     pub fn api(status: u16, message: impl Into<String>) -> Self {
@@ -160,8 +226,7 @@ impl AgentError {
             | Self::Channel
             | Self::Json(_)
             | Self::Cancelled
-            | Self::EmptySummary
-            | Self::HttpRequest(_) => None,
+            | Self::EmptySummary => None,
         }
     }
 
@@ -232,6 +297,15 @@ impl AgentError {
         (is_scope && is_overflow).then_some(Overflow::Prompt)
     }
 
+    /// A thinking block was sent back under a prefix other than the one it
+    /// was written under, and the account enforces that. The same body fails
+    /// the same way every time, so only dropping the thinking gets past it.
+    /// Anthropic, Bedrock and gateways in front of either all word it so:
+    /// <https://platform.claude.com/docs/en/build-with-claude/preserved-thinking>
+    pub fn is_thinking_unbound(&self) -> bool {
+        matches!(self, Self::Api { status: 400, message, .. } if message.contains(THINKING_UNBOUND))
+    }
+
     pub fn is_auth_error(&self) -> bool {
         matches!(self, Self::Api { status: 401, .. }) && self.non_login_error().is_none()
     }
@@ -252,6 +326,23 @@ impl AgentError {
     /// reprints the same message until the user cancels.
     fn is_quota_exhausted(&self) -> bool {
         self.non_login_error().is_some_and(|error| error.is_quota)
+    }
+
+    /// Every server words the refusal its own way (`parameters: ['thinking']`,
+    /// `argument supplied: thinking`, `["body","thinking"]`), so we look for
+    /// the name as a whole word. `-` and `_` count as part of a word, or the
+    /// `kimi-k2-thinking` model id that servers echo back would match too.
+    pub fn rejects_param(&self, param: &str) -> bool {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
+            return false;
+        };
+        REJECTED_PARAM_STATUSES.contains(status)
+            && message
+                .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+                .any(|word| word == param)
     }
 
     pub fn is_unsupported_reasoning_summary(&self) -> bool {
@@ -302,7 +393,6 @@ impl AgentError {
             Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
             Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
             Self::Timeout { .. } => "stream timed out, retrying".into(),
-            Self::HttpRequest(e) => format!("request error: {e}"),
             Self::Json(_) => "received an invalid response from the API".into(),
             Self::Channel => "internal error, try again".into(),
             Self::Cancelled => "cancelled".into(),
@@ -310,27 +400,40 @@ impl AgentError {
         }
     }
 
-    pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
+    pub async fn from_response(response: Response) -> Self {
         let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        let message = response
+        let headers = response.headers().clone();
+        let body = response
             .text()
             .await
-            .unwrap_or_else(|_| "unable to read error body".into());
+            .unwrap_or_else(|_| UNREADABLE_BODY_MESSAGE.into());
+        Self::from_parts(
+            status,
+            |name| headers.get(name).and_then(|v| v.to_str().ok()),
+            body,
+        )
+    }
+
+    /// The one classifier for a failed HTTP exchange, built from what any
+    /// client can hand over: the status, a header lookup by lowercase name,
+    /// and the body text. [`Self::from_response`] is this over reqwest, and a
+    /// plugin's `maki.net` response reaches it through the same parts, so a
+    /// failure reads the same whichever side made the request.
+    pub fn from_parts<'a>(
+        status: u16,
+        header: impl Fn(&str) -> Option<&'a str>,
+        body: String,
+    ) -> Self {
         Self::Api {
             status,
-            message,
-            retry_after,
+            message: body,
+            retry_after: header(RETRY_AFTER_HEADER).and_then(parse_retry_after),
         }
     }
 
     /// How long the server asked us to wait, when it bothered to say. Always a
-    /// positive duration: only [`Self::from_response`] ever reads headers, and
-    /// an error built any other way answers `None` and the caller falls back on
+    /// positive duration: only [`Self::from_parts`] ever reads headers, and an
+    /// error built any other way answers `None` and the caller falls back on
     /// its own backoff.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -370,22 +473,29 @@ impl From<maki_storage::StorageError> for AgentError {
     }
 }
 
-/// Nothing answered at the other end, either because no socket is listening or
-/// because the host name does not resolve. isahc folds a refused connection and
-/// a dead provider edge into the same `ConnectionFailed`, and telling them
-/// apart is not possible from here.
-///
-/// `ErrorKind::Timeout` stays out: it covers both an expired connect timeout
-/// and a stall on a stream that was already flowing, which want opposite
-/// budgets, and the error alone cannot say which happened. So it retries as
-/// [`RetryKind::Transient`], unbounded, and a blackholed SYN keeps trying where
-/// a refused port gives up in seconds. Splitting the two means tracking whether
-/// any byte ever arrived.
-fn is_connect_failure(e: &isahc::Error) -> bool {
-    matches!(
-        e.kind(),
-        HttpErrorKind::ConnectionFailed | HttpErrorKind::NameResolution
-    )
+/// The only way a reqwest error enters the type. The URL goes first: a key in
+/// the query (Gemini's model listing) would otherwise reach maki.log through
+/// `error = %e`. A request that cannot be built, from a malformed URL or a
+/// header value the wire cannot carry, is a config mistake that no retry fixes.
+/// A panicked or aborted blocking task is a bug, not a transient failure, so
+/// it is never retried.
+impl From<JoinError> for AgentError {
+    fn from(e: JoinError) -> Self {
+        Self::Config {
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<reqwest::Error> for AgentError {
+    fn from(e: reqwest::Error) -> Self {
+        if e.is_builder() {
+            return Self::Config {
+                message: format!("request error: {}", error_chain(&e)),
+            };
+        }
+        Self::Http(e.without_url())
+    }
 }
 
 /// Only the delta-seconds form ("30", "60"). The HTTP-date form is legal but
@@ -403,14 +513,28 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, mem::discriminant, sync::Arc};
+
     use maki_config::DEFAULT_MAX_RETRIES;
+    use reqwest::{
+        Client, ClientBuilder,
+        dns::{Name, Resolve, Resolving},
+    };
     use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
     use crate::{
-        providers::opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
+        http::{NO_ADDRESSES, Unresolved},
+        providers::{
+            client_builder,
+            opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
+        },
         retry::{RetryPolicy, RetryState},
+    };
+
+    use crate::test_support::transport::{
+        LOOPBACK_HOST, QUERY_SECRET, UNRESOLVABLE_HOST, URL_MARKER, closed_port, plain_http_port,
     };
 
     const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
@@ -422,6 +546,76 @@ mod tests {
     /// Retry budgets are what these tests measure, so the key walk must not add
     /// attempts of its own.
     const ONE_KEY: usize = 1;
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+    const REQUEST_ERROR_PREFIX: &str = "request error: ";
+
+    /// Answers for `UNRESOLVABLE_HOST` without a lookup; with `NeverResolves`
+    /// below, no test here needs DNS.
+    struct Unresolvable;
+
+    impl Resolve for Unresolvable {
+        fn resolve(&self, name: Name) -> Resolving {
+            Box::pin(async move {
+                Err(Unresolved {
+                    host: name.as_str().to_owned(),
+                    source: io::Error::other(NO_ADDRESSES),
+                }
+                .into())
+            })
+        }
+    }
+
+    struct NeverResolves;
+
+    impl Resolve for NeverResolves {
+        fn resolve(&self, _: Name) -> Resolving {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The shell's proxy is left out, so the request goes where the test points it.
+    async fn failed_request(url: &str, builder: ClientBuilder) -> reqwest::Error {
+        let client = builder.no_proxy().build().unwrap();
+        client.get(url).send().await.unwrap_err()
+    }
+
+    async fn refused() -> reqwest::Error {
+        failed_request(
+            &format!("http://{LOOPBACK_HOST}:{}/", closed_port()),
+            client_builder(),
+        )
+        .await
+    }
+
+    async fn unresolved() -> reqwest::Error {
+        failed_request(
+            &format!("https://{UNRESOLVABLE_HOST}/"),
+            client_builder().dns_resolver(Arc::new(Unresolvable)),
+        )
+        .await
+    }
+
+    async fn connect_timeout() -> reqwest::Error {
+        failed_request(
+            &format!("https://{UNRESOLVABLE_HOST}/"),
+            client_builder()
+                .dns_resolver(Arc::new(NeverResolves))
+                .connect_timeout(CONNECT_TIMEOUT),
+        )
+        .await
+    }
+
+    async fn tls_failure() -> reqwest::Error {
+        failed_request(
+            &format!("https://{LOOPBACK_HOST}:{}/", plain_http_port()),
+            client_builder(),
+        )
+        .await
+    }
+
+    fn builder() -> reqwest::Error {
+        Client::new().get(INVALID_URI).build().unwrap_err()
+    }
 
     fn api(status: u16) -> AgentError {
         AgentError::api(status, "")
@@ -452,6 +646,21 @@ mod tests {
             expected
         );
         assert!(!api(400).is_unsupported_reasoning_summary());
+    }
+
+    const THINKING_PARAM: &str = "thinking";
+
+    #[test_case(400, r#"{"error":{"message":"litellm.UnsupportedParamsError: azure does not support parameters: ['thinking'], for model=gpt-5.6-terra."}}"#, true ; "litellm")]
+    #[test_case(400, r#"{"error":{"message":"Unrecognized request argument supplied: thinking","param":null}}"#, true ; "azure_openai")]
+    #[test_case(422, r#"{"detail":[{"type":"extra_forbidden","loc":["body","thinking"]}]}"#, true ; "pydantic_extra_forbidden")]
+    #[test_case(400, r#"{"error":{"message":"model kimi-k2-thinking does not exist"}}"#, false ; "model_id_containing_the_name")]
+    #[test_case(400, r#"{"error":{"message":"unknown field reasoning_thinking_budget"}}"#, false ; "longer_field_name")]
+    #[test_case(500, r#"{"error":{"message":"unsupported parameter: thinking"}}"#, false ; "server_error")]
+    fn rejects_param_finds_the_name_as_a_token(status: u16, body: &str, expected: bool) {
+        assert_eq!(
+            api_msg(status, body).rejects_param(THINKING_PARAM),
+            expected
+        );
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {
@@ -579,16 +788,21 @@ mod tests {
             .count() as u32
     }
 
-    /// A dead provider edge and a local server nobody started both land in
-    /// `ConnectionFailed`, so the run has to give up on it, while a failure on
+    /// A dead provider edge and a local server nobody started both read as
+    /// nothing answering, so the run has to give up on it, while a failure on
     /// a connection that was made is the network being the network and is
-    /// waited out.
-    #[test_case(HttpErrorKind::ConnectionFailed, DEFAULT_MAX_RETRIES ; "a_refused_connection_gives_up")]
-    #[test_case(HttpErrorKind::NameResolution, DEFAULT_MAX_RETRIES   ; "an_unresolvable_host_gives_up")]
-    #[test_case(HttpErrorKind::Io, ROUNDS                            ; "a_read_error_keeps_retrying")]
-    #[test_case(HttpErrorKind::TlsEngine, ROUNDS                     ; "a_tls_failure_keeps_retrying")]
-    fn a_transport_failure_is_waited_out_only_once_connected(kind: HttpErrorKind, expected: u32) {
-        assert_eq!(retries_granted(&AgentError::Http(kind.into())), expected);
+    /// waited out. A connect timeout reads the same as a stall, so it is
+    /// waited out too.
+    #[test_case(refused, DEFAULT_MAX_RETRIES    ; "a_refused_connection_gives_up")]
+    #[test_case(unresolved, DEFAULT_MAX_RETRIES ; "an_unresolvable_host_gives_up")]
+    #[test_case(tls_failure, ROUNDS             ; "a_tls_failure_keeps_retrying")]
+    #[test_case(connect_timeout, ROUNDS         ; "a_connect_timeout_keeps_retrying")]
+    #[tokio::test]
+    async fn a_transport_failure_is_waited_out_only_once_connected(
+        error: impl AsyncFn() -> reqwest::Error,
+        expected: u32,
+    ) {
+        assert_eq!(retries_granted(&AgentError::from(error().await)), expected);
     }
 
     #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
@@ -597,10 +811,38 @@ mod tests {
         assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
     }
 
-    #[test_case(HttpErrorKind::ConnectionFailed, CONNECT_FAILED_MESSAGE ; "connect_failure_names_the_server")]
-    #[test_case(HttpErrorKind::TlsEngine, NETWORK_ERROR_MESSAGE         ; "other_transport_blames_the_network")]
-    fn user_message_transport(kind: HttpErrorKind, expected: &str) {
-        assert_eq!(AgentError::Http(kind.into()).user_message(), expected);
+    #[test_case(refused, CONNECT_FAILED_MESSAGE    ; "connect_failure_names_the_server")]
+    #[test_case(tls_failure, NETWORK_ERROR_MESSAGE ; "other_transport_blames_the_network")]
+    #[tokio::test]
+    async fn user_message_transport(error: impl AsyncFn() -> reqwest::Error, expected: &str) {
+        assert_eq!(AgentError::from(error().await).user_message(), expected);
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_built_is_a_config_error() {
+        let error = AgentError::from(builder());
+        assert_eq!(error.projection(), ErrorProjection::Config);
+        assert_eq!(error.retry_kind(), None);
+        assert!(
+            error.user_message().starts_with(REQUEST_ERROR_PREFIX),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_leaves_out_the_url() {
+        let transport = failed_request(
+            &format!("https://{UNRESOLVABLE_HOST}/?key={QUERY_SECRET}"),
+            client_builder().dns_resolver(Arc::new(Unresolvable)),
+        )
+        .await;
+        let error = AgentError::from(transport);
+        let message = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(message.contains(UNRESOLVABLE_HOST), "{message}");
+        assert!(!message.contains(QUERY_SECRET), "{message}");
+        assert!(!message.contains(URL_MARKER), "{message}");
+        assert!(!debug.contains(QUERY_SECRET), "{debug}");
     }
 
     #[test_case("30", Some(Duration::from_secs(30)) ; "delta_seconds")]
@@ -612,6 +854,25 @@ mod tests {
     #[test_case("0", None                            ; "zero")]
     fn retry_after_header_is_read_as_seconds(value: &str, expected: Option<Duration>) {
         assert_eq!(parse_retry_after(value), expected);
+    }
+
+    #[test_case(Some("7"), Some(Duration::from_secs(7)) ; "retry_after_read")]
+    #[test_case(None, None                              ; "no_retry_after")]
+    fn from_parts_reads_status_retry_after_and_body(
+        retry_after: Option<&str>,
+        expected: Option<Duration>,
+    ) {
+        const BODY: &str = r#"{"error":"slow down"}"#;
+        let error = AgentError::from_parts(
+            429,
+            |name| retry_after.filter(|_| name == RETRY_AFTER_HEADER),
+            BODY.into(),
+        );
+        assert!(matches!(
+            &error,
+            AgentError::Api { status: 429, message, .. } if message == BODY
+        ));
+        assert_eq!(error.retry_after(), expected);
     }
 
     // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp
@@ -655,6 +916,17 @@ mod tests {
         assert_eq!(api_msg(status, message).is_context_overflow(), expected);
     }
 
+    /// A tampered signature is a different 400 that dropping thinking under
+    /// a fresh prefix would only hide.
+    #[test_case(400, THINKING_UNBOUND_MESSAGE, true ; "prefix_mismatch")]
+    #[test_case(400, "messages.1.content.0: Invalid `signature` in `thinking` block", false ; "tampered_signature")]
+    #[test_case(500, THINKING_UNBOUND_MESSAGE, false ; "server_error")]
+    fn is_thinking_unbound(status: u16, message: &str, expected: bool) {
+        let err = api_msg(status, message);
+        assert_eq!(err.is_thinking_unbound(), expected);
+        assert!(!err.is_retryable() || status >= 500);
+    }
+
     #[test]
     fn context_overflow_is_not_retryable() {
         let err = api_msg(400, "request exceeds the available context size");
@@ -662,6 +934,7 @@ mod tests {
         assert!(!err.is_retryable());
     }
 
+    const THINKING_UNBOUND_MESSAGE: &str = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". The `tools` list differs from when the block was created.";
     const ANTHROPIC_BUDGET: &str = "input length and `max_tokens` exceed context limit: 199773 + 8192 > 200000, decrease input length or max_tokens and try again";
     const VLLM_BUDGET: &str = "This model's maximum context length is 1048576 tokens. However, you requested 1051000 tokens (100000 in the messages, 951000 in the completion). Please reduce the length of the messages or completion.";
     const VLLM_PROMPT_ONLY: &str = "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens (9000 in the messages, 0 in the completion).";
@@ -684,5 +957,145 @@ mod tests {
     #[test_case("prompt is too long: 250000 tokens > 200000 maximum", Overflow::Prompt ; "anthropic_prompt_alone")]
     fn overflow_kind_is_read_off_the_message(message: &str, expected: Overflow) {
         assert_eq!(api_msg(400, message).overflow(), Some(expected));
+    }
+
+    /// One sample per `AgentError` variant. A new variant means a new sample
+    /// in [`corpus`] and a bump here, or the corpus quietly stops covering it.
+    const VARIANT_COUNT: usize = 10;
+    /// One status per branch the answers below split on: refused for size
+    /// (400, 413), stale token (401), dead key but live account (403), rate
+    /// limit (429), server trouble (500). The rest behave like one of these.
+    const CORPUS_STATUSES: [u16; 6] = [400, 401, 403, 413, 429, 500];
+    const CORPUS_RETRY_AFTER: Option<Duration> = Some(Duration::from_secs(30));
+    const PLAIN_MESSAGE: &str = "bad input";
+    const OVERFLOW_MESSAGE: &str = "Input exceeds context limit";
+    /// A second wording of the same refusal: different body, same answers.
+    const OVERFLOW_ALIAS: &str = "context length exceeded";
+    const TOOL_NAME: &str = "bash";
+    const CONFIG_MESSAGE: &str = "no model configured";
+    const TIMEOUT_SECS: u64 = 30;
+    const INVALID_URI: &str = "http://[";
+    const INVALID_JSON: &str = "{";
+
+    /// Every variant, and for `Api` every wording and status the answers are
+    /// known to turn on, crossed with both `Retry-After` shapes.
+    async fn corpus() -> Vec<AgentError> {
+        let quota = opencode_body("GoUsageLimitError", QUOTA_MESSAGE);
+        let model = opencode_body("ModelError", MODEL_MESSAGE);
+        let messages = [
+            "",
+            PLAIN_MESSAGE,
+            OVERFLOW_MESSAGE,
+            OVERFLOW_ALIAS,
+            ANTHROPIC_BUDGET,
+            THINKING_UNBOUND_MESSAGE,
+            quota.as_str(),
+            model.as_str(),
+        ];
+        let mut corpus = Vec::new();
+        for status in CORPUS_STATUSES {
+            for message in messages {
+                for retry_after in [None, CORPUS_RETRY_AFTER] {
+                    corpus.push(AgentError::Api {
+                        status,
+                        message: message.into(),
+                        retry_after,
+                    });
+                }
+            }
+        }
+        // One kind on each side of the connect/transient split, plus the second
+        // connect failure so the two that share a projection have to agree.
+        corpus.extend(
+            [
+                io::ErrorKind::ConnectionRefused,
+                io::ErrorKind::UnexpectedEof,
+            ]
+            .map(|kind| AgentError::Io(kind.into())),
+        );
+        corpus.extend(
+            [refused().await, unresolved().await, tls_failure().await].map(AgentError::Http),
+        );
+        corpus.extend([
+            AgentError::Config {
+                message: CONFIG_MESSAGE.into(),
+            },
+            AgentError::Tool {
+                tool: TOOL_NAME.into(),
+                message: PLAIN_MESSAGE.into(),
+            },
+            AgentError::Json(
+                serde_json::from_str::<Value>(INVALID_JSON).expect_err("truncated json"),
+            ),
+            AgentError::Channel,
+            AgentError::Cancelled,
+            AgentError::Timeout { secs: TIMEOUT_SECS },
+            AgentError::EmptySummary,
+        ]);
+        corpus
+    }
+
+    /// Every answer the retry loop and the compaction path ever ask an error
+    /// for. Named fields rather than a tuple so a failure says which one moved.
+    #[derive(Debug, PartialEq)]
+    struct Observables {
+        retry_kind: Option<RetryKind>,
+        retry_after: Option<Duration>,
+        overflow: Option<Overflow>,
+        quota_exhausted: bool,
+        auth_error: bool,
+        thinking_unbound: bool,
+        rotate_key: bool,
+    }
+
+    impl Observables {
+        fn of(error: &AgentError) -> Self {
+            Self {
+                retry_kind: error.retry_kind(),
+                retry_after: error.retry_after(),
+                overflow: error.overflow(),
+                quota_exhausted: error.is_quota_exhausted(),
+                auth_error: error.is_auth_error(),
+                thinking_unbound: error.is_thinking_unbound(),
+                rotate_key: error.should_rotate_key(),
+            }
+        }
+    }
+
+    /// Why [`AgentError::projection`] earns its keep: the answers above are a
+    /// function of the projection, so a replay golden that pins the projection
+    /// pins the behaviour, and no provider needs retry fixtures of its own.
+    #[tokio::test]
+    async fn equal_projections_agree_on_every_observable() {
+        let mut seen: Vec<(ErrorProjection, Observables)> = Vec::new();
+        let mut variants = HashSet::new();
+        let mut shared_projections = false;
+
+        for error in corpus().await {
+            variants.insert(discriminant(&error));
+            let projection = error.projection();
+            let observed = Observables::of(&error);
+            match seen.iter().position(|(p, _)| *p == projection) {
+                Some(twin) => {
+                    shared_projections = true;
+                    assert_eq!(
+                        seen[twin].1, observed,
+                        "{error:?} projects to {projection:?}"
+                    );
+                }
+                None => seen.push((projection, observed)),
+            }
+        }
+
+        assert_eq!(
+            variants.len(),
+            VARIANT_COUNT,
+            "the corpus skipped a variant"
+        );
+        // All-distinct projections would pass without proving a thing.
+        assert!(
+            shared_projections,
+            "the corpus needs errors that differ below the projection"
+        );
     }
 }

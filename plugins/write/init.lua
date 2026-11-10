@@ -10,7 +10,7 @@ local DESCRIPTION = [[Write content to a file, replacing existing content.
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.write) or 10, keep = "head" }
+  return { max_lines = (tol and tol.write) or 5, keep = "head" }
 end
 
 local function build_view(content, path, ctx)
@@ -47,6 +47,10 @@ maki.api.register_tool({
         description = "The complete file content to write",
         required = true,
       },
+      append = {
+        type = "boolean",
+        description = "Add content to the end of the file instead of replacing it",
+      },
     },
   },
 
@@ -81,7 +85,8 @@ maki.api.register_tool({
       maki.fs.mkdir(parent, { parents = true })
     end
 
-    local _, write_err = maki.fs.write(path, content)
+    local write = input.append and maki.fs.append or maki.fs.write
+    local _, write_err = write(path, content)
     if write_err then
       return { llm_output = "write error: " .. tostring(write_err), is_error = true }
     end

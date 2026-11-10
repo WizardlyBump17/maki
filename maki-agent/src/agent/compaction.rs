@@ -1,20 +1,25 @@
+use std::collections::HashMap;
 use std::env;
+use std::time::{Duration, Instant};
 
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
-    StreamResponse, TokenUsage,
+    StreamResponse,
 };
-use maki_storage::id::SessionRef;
-use serde_json::Value;
-use tracing::info;
+use serde_json::{Value, json};
+use tracing::{info, warn};
 
-use super::history::{History, remove_orphaned_tool_results};
+use super::frame::{RunContext, fit_frame};
+use super::history::{History, remove_orphaned_tool_results, strip_thinking};
+use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
-use crate::cancel::CancelToken;
+use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
+use crate::tools::hook::Verdict;
+use crate::tools::truncate_bytes;
+use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
@@ -36,6 +41,106 @@ const SUMMARY_OUTPUT_BUDGET: u32 = 16_384;
 /// llama.cpp server started with `n_ctx 4096` summarized itself before every
 /// single turn.
 const MAX_RESERVED_PERCENT: u32 = 50;
+/// A layer only needs a taste of each result to judge it. Shipping a 40 KB
+/// build log to Lua for every result of a long session would cost more than
+/// the layer saves. `bytes` still tells the full size.
+const PREPARE_TEXT_MAX: usize = 4 * 1024;
+/// Overflow pruning and the empty summary retry share this budget.
+const MAX_SUMMARY_ATTEMPTS: u32 = 3;
+
+pub(super) const FIELD_SKIP: &str = "skip";
+const FIELD_INSTRUCTIONS: &str = "instructions";
+pub(super) const FIELD_CONTINUE: &str = "continue";
+const FIELD_COLLAPSE: &str = "collapse";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CompactReason {
+    Auto,
+    /// The provider already refused the prompt as too long. Compaction is the
+    /// only way out, so a layer cannot skip this one.
+    Overflow,
+    Manual,
+}
+
+impl CompactReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Overflow => "overflow",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// Both strings go on top of the configured ones and never replace them, so a
+/// plugin cannot quietly drop what the user put in config.
+#[derive(Default)]
+pub(super) struct CompactSteer {
+    /// Already holds the `/compact` request's own words, with the layer's
+    /// after them.
+    pub instructions: Option<String>,
+    pub continue_text: Option<String>,
+}
+
+fn join_lines<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let joined = parts
+        .into_iter()
+        .filter_map(normalize)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// `agent.stop` and `agent.compact.before` both resume the run with it.
+pub(super) fn continue_text(value: &Value) -> Option<&str> {
+    normalize(value.get(FIELD_CONTINUE).and_then(Value::as_str))
+}
+
+/// `None` when a layer skipped it. The gauge stays where it was, so an
+/// automatic compaction simply asks again before the next turn.
+pub(super) async fn steer_compaction(
+    hooks: &AgentHooks<'_>,
+    config: &AgentConfig,
+    reason: CompactReason,
+    request: Option<&str>,
+) -> Option<CompactSteer> {
+    let verdict = hooks
+        .fire(AgentSlot::CompactBefore, || {
+            json!({
+                "reason": reason.as_str(),
+                "context_size": hooks.context_size,
+                "usable": usable(hooks.model, config),
+                "request_instructions": request,
+            })
+        })
+        .await;
+    let (skip, added, continue_with) = match &verdict {
+        Verdict::Replaced(value) => (
+            value
+                .get(FIELD_SKIP)
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            value.get(FIELD_INSTRUCTIONS).and_then(Value::as_str),
+            continue_text(value),
+        ),
+        Verdict::Denied(why) => {
+            info!(reason = %why, "agent.compact.before asked to skip");
+            (true, None, None)
+        }
+        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None),
+    };
+    if skip && reason != CompactReason::Overflow {
+        info!(
+            reason = reason.as_str(),
+            "agent.compact.before skipped the compaction"
+        );
+        return None;
+    }
+    Some(CompactSteer {
+        instructions: join_lines([request, added]),
+        continue_text: continue_with.map(str::to_owned),
+    })
+}
 
 fn percent_of(tokens: u32, percent: u32) -> u32 {
     (u64::from(tokens) * u64::from(percent) / 100) as u32
@@ -62,15 +167,23 @@ fn summary_prompt(config: &AgentConfig, request: Option<&str>) -> String {
     format!("{COMPACTION_USER}\n\nAdditional instructions:\n{extras}")
 }
 
-pub(super) fn continue_message(config: &AgentConfig) -> String {
-    match normalize(config.post_compaction_instructions.as_deref()) {
+pub(super) fn continue_message(added: Option<&str>) -> String {
+    match added {
         Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
         None => CONTINUE_AFTER_COMPACT.to_string(),
     }
 }
 
+pub(super) struct Compacted {
+    pub summary: String,
+    pub duration: Duration,
+    /// How many unanswered messages follow the summary. Context updates are
+    /// never among them, see [`History::restart`].
+    pub carried: usize,
+}
+
 /// Replaces `history` with a summary of itself, retrying on overflow by
-/// pruning what it sends.
+/// pruning what it sends, and once on an empty summary.
 ///
 /// The last `carry_len` messages are held out of the summary and re-appended
 /// after it, so input no turn has answered yet survives verbatim without ever
@@ -82,27 +195,29 @@ pub(super) async fn compact_history(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
-    cancel: &CancelToken,
+    hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
     carry_len: usize,
-    session_id: Option<&SessionRef>,
     retry: RetryPolicy,
-) -> Result<TokenUsage, AgentError> {
-    let compact_start = std::time::Instant::now();
+    ledger: &RunLedger,
+) -> Result<Compacted, AgentError> {
+    let compact_start = Instant::now();
+    event_tx.send(AgentEvent::CompactionStarted)?;
     let summarized = history.len().saturating_sub(carry_len);
     let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
-    collapse_tool_results(&mut compaction_history, RECENT_TOOL_RESULT_BUDGET);
+    prepare_collapse(hooks, &mut compaction_history, RECENT_TOOL_RESULT_BUDGET).await;
     compaction_history.push(Message::user(summary_prompt(config, instructions)));
 
     let empty_tools = serde_json::json!([]);
-    let max_attempts = 3;
-    let mut last_error = None;
+    let mut retried_empty = false;
+    let mut attempt = 0;
 
-    for attempt in 0..max_attempts {
+    loop {
+        let can_retry = attempt + 1 < MAX_SUMMARY_ATTEMPTS;
         match stream_with_retry(
             StreamRequest {
                 provider,
@@ -112,7 +227,7 @@ pub(super) async fn compact_history(
                 tools: &empty_tools,
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
-                session_id,
+                session_id: hooks.session_id,
                 retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
@@ -121,25 +236,53 @@ pub(super) async fn compact_history(
             // and its measurement describes a prompt the session never had.
             None,
             event_tx,
-            cancel,
+            hooks.cancel,
         )
         .await
         {
             Ok(response) => {
-                if attempt > 0 {
-                    info!(attempt, "compaction succeeded after pruning history");
-                }
-                return finish_compact(
-                    response,
-                    history,
-                    summarized,
-                    event_tx,
-                    compact_start,
-                    model,
+                // The summary request never asks for fast mode, so it costs the
+                // standard rate. It is banked before the text is checked,
+                // because an unusable summary was still paid for.
+                ledger.add(
+                    response.usage,
+                    model.billed_cost(&response.usage, false),
+                    model.list_cost(&response.usage, false),
                 );
+                let stop_reason = response.stop_reason;
+                match finish_compact(
+                    response, history, summarized, event_tx, model, hooks, config,
+                ) {
+                    // Just once. This is the biggest request a session sends,
+                    // and a model that comes back empty twice, say because its
+                    // thinking eats the whole budget, will keep doing it.
+                    Err(AgentError::EmptySummary) if can_retry && !retried_empty => {
+                        retried_empty = true;
+                        warn!(
+                            attempt,
+                            model = %model.id,
+                            ?stop_reason,
+                            "compaction returned no summary text, retrying"
+                        );
+                    }
+                    result => {
+                        let (summary, carried) = result?;
+                        let duration = compact_start.elapsed();
+                        info!(
+                            model = %model.id,
+                            duration_ms = duration.as_millis() as u64,
+                            attempt,
+                            "compaction completed"
+                        );
+                        return Ok(Compacted {
+                            summary,
+                            duration,
+                            carried,
+                        });
+                    }
+                }
             }
-            Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
-                last_error = Some(e);
+            Err(StreamError::Other(e)) if can_retry && e.is_context_overflow() => {
                 // Truncation eats from the front, so it can never shrink an
                 // oversized result sitting in the protected tail. Collapse that
                 // first, and once there is nothing left to collapse, drop the
@@ -150,9 +293,8 @@ pub(super) async fn compact_history(
             }
             Err(e) => return Err(e.into()),
         }
+        attempt += 1;
     }
-
-    Err(last_error.unwrap())
 }
 
 fn finish_compact(
@@ -160,43 +302,54 @@ fn finish_compact(
     history: &mut History,
     summarized: usize,
     event_tx: &EventSender,
-    compact_start: std::time::Instant,
     model: &Model,
-) -> Result<TokenUsage, AgentError> {
+    hooks: &AgentHooks<'_>,
+    config: &AgentConfig,
+) -> Result<(String, usize), AgentError> {
+    let summary = response.message.first_text_content().map(str::to_owned);
+    // An unusable summary leaves the session as it was, so it keeps its size.
+    let context_size = if summary.is_some() {
+        response.usage.output.min(u32::MAX as u64) as u32
+    } else {
+        hooks.context_size
+    };
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
         subsidised_list_cost: model.subsidised_list_cost(&response.usage, false),
-        context_size: Some(response.usage.output),
-        context_window: model.context_window,
+        context_size: Some(context_size),
+        context_window: hooks.model.context_window,
     })));
 
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
-    if response.message.first_text_content().is_none() {
+    let Some(summary) = summary else {
         return Err(AgentError::EmptySummary);
-    }
+    };
 
     let mut new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
     ];
-    new_history.extend_from_slice(&history.as_slice()[summarized..]);
-    history.replace(new_history);
-    info!(
-        model = %model.id,
-        duration_ms = compact_start.elapsed().as_millis() as u64,
-        "compaction completed"
+    // Part of the summary block and not the carried input, so the next
+    // compaction summarizes this copy away instead of carrying a duplicate.
+    new_history.extend(
+        normalize(config.post_compaction_instructions.as_deref())
+            .map(|text| Message::synthetic(text.to_owned())),
     );
+    let summary_len = new_history.len();
+    new_history.extend_from_slice(&history.as_slice()[summarized..]);
+    history.restart(new_history);
 
-    Ok(response.usage)
+    Ok((summary, history.len() - summary_len))
 }
 
-/// `system` and `tools` are the ones the next request will carry: compaction
-/// replaces the transcript and leaves that baseline untouched, so the gauge
-/// cannot be resized without them.
+/// `next` is what the session would start with now. The summary goes out under
+/// a fresh frame built from it, for the session's own model in `hooks`, so the
+/// gauge measures the prompt the next request really sends and the frame never
+/// goes missing between runs. `model` is the one writing the summary.
 ///
 /// A retry in here can honour a server `Retry-After` that parks the request for
 /// an hour, so esc has to reach it. The cancel comes back as
@@ -208,63 +361,79 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     gauge: &mut ContextGauge,
-    system: &str,
-    tools: &Value,
+    next: RunContext,
+    mcp: Option<&McpSession>,
     event_tx: &EventSender,
-    cancel: &CancelToken,
+    hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
-    session_id: Option<&SessionRef>,
     retry: RetryPolicy,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
-    let usage = match compact_history(
+    let ledger = RunLedger::default();
+    let finished = |context_size| {
+        let totals = ledger.totals();
+        AgentEvent::Done {
+            usage: totals.usage,
+            cost: totals.cost,
+            list_cost: totals.list_cost,
+            context_size,
+            context_window: hooks.model.context_window,
+            num_turns: 1,
+            // `Compact` and not `EndTurn`, so a goal loop reading this sees
+            // housekeeping and does not treat it as a turn boundary.
+            reason: DoneReason::Compact,
+        }
+    };
+    let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
+    else {
+        event_tx.send(finished(size_before))?;
+        return Ok(DoneReason::Compact);
+    };
+    let Compacted {
+        summary, duration, ..
+    } = match compact_history(
         provider,
         model,
         history,
         event_tx,
-        cancel,
+        hooks,
         config,
-        instructions,
+        steer.instructions.as_deref(),
         0,
-        session_id,
         retry,
+        &ledger,
     )
     .await
     {
-        Ok(usage) => usage,
+        Ok(done) => done,
         // `finish_compact` is the only writer in here, so a cancel leaves the
         // transcript and the gauge untouched and the session carries on.
         Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
         Err(e) => return Err(e),
     };
-    if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
-        history.push(Message::synthetic(post.to_string()));
+    if let Some(text) = steer.continue_text {
+        history.push(Message::synthetic(text));
     }
-    gauge.reset(history.as_slice(), system, tools);
+    fit_frame(history, next, mcp, hooks.model);
+    if let Some((system, tools)) = history.request_prefix() {
+        gauge.reset(history.as_slice(), system, tools);
+    }
 
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
     // a turn yet can offer.
-    let context_size_before = size_before.max(usage.total_input());
+    let context_size_before =
+        size_before.max(ledger.totals().usage.total_input().min(u32::MAX as u64) as u32);
     let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
         context_size_after,
-        context_window: model.context_window,
+        context_window: hooks.model.context_window,
+        summary,
+        duration_ms: duration.as_millis() as u64,
     })?;
-
-    // `Compact` and not `EndTurn`, so a goal loop reading this sees
-    // housekeeping and does not treat it as a turn boundary.
-    event_tx.send(AgentEvent::Done {
-        usage,
-        cost: model.billed_cost(&usage, false),
-        list_cost: model.list_cost(&usage, false),
-        context_size: context_size_after,
-        context_window: model.context_window,
-        num_turns: 1,
-        reason: DoneReason::Compact,
-    })?;
+    event_tx.send(finished(context_size_after))?;
 
     Ok(DoneReason::Compact)
 }
@@ -298,8 +467,8 @@ pub(super) fn usable(model: &Model, config: &AgentConfig) -> u32 {
     model.context_window - reserved(model, config)
 }
 
-pub(super) fn is_overflow(context_tokens: u32, model: &Model, config: &AgentConfig) -> bool {
-    context_tokens >= usable(model, config)
+pub(super) fn is_overflow(context_tokens: u64, model: &Model, config: &AgentConfig) -> bool {
+    context_tokens >= u64::from(usable(model, config))
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -314,36 +483,139 @@ fn strip_images(messages: &mut [Message]) {
     }
 }
 
-fn strip_thinking(messages: &mut [Message]) {
-    for msg in messages {
-        msg.content.retain(|block| !block.is_thinking());
+/// Where every tool result sits, oldest first, as `(message, block)`.
+fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .flat_map(|(m, msg)| {
+            msg.content
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| matches!(block, ContentBlock::ToolResult { .. }))
+                .map(move |(b, _)| (m, b))
+        })
+        .collect()
+}
+
+fn tool_result(messages: &[Message], (m, b): (usize, usize)) -> (&str, &str) {
+    match &messages[m].content[b] {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } => (tool_use_id, content),
+        _ => ("", ""),
     }
 }
 
-/// Walks newest first and collapses every tool result that does not fit in
-/// what is left of `budget`. One oversized result is collapsed on its own and
-/// leaves the budget to the older ones, which is the whole point: charging it
-/// would spend the tail on a block that is no longer there. Returns whether
-/// anything actually shrank, so a caller retrying on overflow can tell
-/// progress from a no-op.
-fn collapse_tool_results(messages: &mut [Message], mut budget: usize) -> bool {
+/// Walks newest first and marks every result that does not fit in what is left
+/// of `budget`. One oversized result gets marked on its own and leaves the
+/// budget to the older ones. That is the whole point: charging it would spend
+/// the tail on a block that is no longer there.
+fn default_collapse(
+    messages: &[Message],
+    positions: &[(usize, usize)],
+    mut budget: usize,
+) -> Vec<bool> {
+    let mut collapse = vec![false; positions.len()];
+    for (i, &pos) in positions.iter().enumerate().rev() {
+        match budget.checked_sub(tool_result(messages, pos).1.len()) {
+            Some(rest) => budget = rest,
+            None => collapse[i] = true,
+        }
+    }
+    collapse
+}
+
+/// Returns whether anything actually shrank, so a caller retrying on overflow
+/// can tell progress from a no-op.
+fn apply_collapse(
+    messages: &mut [Message],
+    positions: &[(usize, usize)],
+    collapse: &[bool],
+) -> bool {
     let mut collapsed = false;
-    for block in messages
-        .iter_mut()
-        .rev()
-        .flat_map(|m| m.content.iter_mut().rev())
-    {
-        if let ContentBlock::ToolResult { content, .. } = block {
-            match budget.checked_sub(content.len()) {
-                Some(rest) => budget = rest,
-                None => {
-                    collapsed |= content != TOOL_RESULT_PLACEHOLDER;
-                    *content = TOOL_RESULT_PLACEHOLDER.into();
-                }
-            }
+    for (&(m, b), _) in positions.iter().zip(collapse).filter(|(_, c)| **c) {
+        if let ContentBlock::ToolResult { content, .. } = &mut messages[m].content[b] {
+            collapsed |= content != TOOL_RESULT_PLACEHOLDER;
+            *content = TOOL_RESULT_PLACEHOLDER.into();
         }
     }
     collapsed
+}
+
+fn collapse_tool_results(messages: &mut [Message], budget: usize) -> bool {
+    let positions = tool_result_positions(messages);
+    let collapse = default_collapse(messages, &positions, budget);
+    apply_collapse(messages, &positions, &collapse)
+}
+
+/// The host's own pick rides along in `collapse`, so a layer that only wants
+/// to spare one result edits that list and hands it back, instead of redoing
+/// the budget math. Indices start at 1 because a Lua list does.
+fn prepare_value(
+    messages: &[Message],
+    positions: &[(usize, usize)],
+    collapse: &[bool],
+    budget: usize,
+) -> Value {
+    let calls: HashMap<&str, (&str, &Value)> = messages
+        .iter()
+        .flat_map(Message::tool_uses)
+        .map(|(id, name, input)| (id, (name, input)))
+        .collect();
+    let results: Vec<Value> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| {
+            let (tool_use_id, text) = tool_result(messages, pos);
+            let (tool, input) = calls
+                .get(tool_use_id)
+                .map_or((None, None), |(name, input)| (Some(*name), Some(*input)));
+            json!({
+                "index": i + 1,
+                "tool": tool,
+                "input": input,
+                "bytes": text.len(),
+                "text": truncate_bytes(text, PREPARE_TEXT_MAX),
+            })
+        })
+        .collect();
+    let picked: Vec<usize> = collapse
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c)
+        .map(|(i, _)| i + 1)
+        .collect();
+    json!({ "results": results, "budget": budget, FIELD_COLLAPSE: picked })
+}
+
+/// The layer only picks. The host still makes the edit, so no layer can
+/// orphan a tool call or lose the user's message along the way.
+async fn prepare_collapse(hooks: &AgentHooks<'_>, messages: &mut [Message], budget: usize) {
+    let positions = tool_result_positions(messages);
+    if positions.is_empty() {
+        return;
+    }
+    let mut collapse = default_collapse(messages, &positions, budget);
+    let verdict = hooks
+        .fire(AgentSlot::CompactPrepare, || {
+            prepare_value(messages, &positions, &collapse, budget)
+        })
+        .await;
+    if let Verdict::Replaced(value) = verdict
+        && let Some(picked) = value.get(FIELD_COLLAPSE).and_then(Value::as_array)
+    {
+        collapse.fill(false);
+        let indices = picked.iter().filter_map(Value::as_u64);
+        for i in indices.filter_map(|index| (index as usize).checked_sub(1)) {
+            if let Some(slot) = collapse.get_mut(i) {
+                *slot = true;
+            }
+        }
+    }
+    apply_collapse(messages, &positions, &collapse);
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -395,6 +667,9 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
+    use crate::agent::hook::testing::script;
+    use crate::cancel::CancelToken;
+    use crate::tools::{RequestTools, ToolRegistry};
     use maki_config::CompactionBuffer;
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
@@ -402,6 +677,8 @@ mod tests {
     const POST: &str = "Re-read plan.md and agent.md";
     const OVERFLOW_MESSAGE: &str = "prompt is too long";
     const OVERFLOW_STATUS: u16 = 413;
+    /// Differs from the session window, so a report that mixes them up shows.
+    const SUMMARY_CONTEXT_WINDOW: u32 = 128_000;
     /// Shorter than [`NEW_RESULT`], so the budget-burn case below is the only
     /// reason it collapses.
     const OLD_RESULT: &str = "old";
@@ -411,8 +688,11 @@ mod tests {
     /// other, so the baseline would only add noise.
     const NO_SYSTEM: &str = "";
 
-    fn no_tools() -> Value {
-        Value::Array(Vec::new())
+    fn bare_context(model: &Model) -> RunContext {
+        RunContext::fixed(
+            NO_SYSTEM.into(),
+            RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model),
+        )
     }
 
     struct MockProvider {
@@ -484,6 +764,23 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            ..Default::default()
+        }
+    }
+
+    fn test_hooks<'a>(
+        registry: &'a ToolRegistry,
+        session_id: Option<&'a SessionRef>,
+        model: &'a Model,
+        cancel: &'a CancelToken,
+    ) -> AgentHooks<'a> {
+        AgentHooks {
+            registry,
+            session_id,
+            task_id: None,
+            model,
+            cancel,
+            context_size: 0,
         }
     }
 
@@ -496,18 +793,19 @@ mod tests {
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
         let (raw_tx, _rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
         compact(
             provider,
-            &default_model(),
+            &model,
             history,
             gauge,
-            NO_SYSTEM,
-            &no_tools(),
+            bare_context(&model),
+            None,
             &EventSender::new(raw_tx, 0),
-            cancel,
+            &test_hooks(&registry, None, &model, cancel),
             config,
             instructions,
-            None,
             RetryPolicy::default(),
         )
         .await
@@ -520,232 +818,486 @@ mod tests {
         session_id: Option<&SessionRef>,
     ) {
         let (raw_tx, _rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
         compact_history(
             provider,
-            &default_model(),
+            &model,
             history,
             &EventSender::new(raw_tx, 0),
-            &CancelToken::none(),
+            &test_hooks(&registry, session_id, &model, &cancel),
             &AgentConfig::default(),
             None,
             carry_len,
-            session_id,
             RetryPolicy::default(),
+            &RunLedger::default(),
         )
         .await
         .unwrap();
     }
 
-    #[test]
-    fn compact_replaces_history_with_summary() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let mut history = History::new(vec![
-                Message::user("first".into()),
-                Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: "reply".into(),
-                    }],
-                    ..Default::default()
-                },
-            ]);
+    #[tokio::test]
+    async fn compact_replaces_history_with_summary() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![
+            Message::user("first".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "reply".into(),
+                }],
+                ..Default::default()
+            },
+        ]);
 
-            summarize(
-                &provider,
-                &mut history,
-                &mut ContextGauge::default(),
-                &AgentConfig::default(),
-                None,
-                &CancelToken::none(),
-            )
-            .await
-            .unwrap();
+        summarize(
+            &provider,
+            &mut history,
+            &mut ContextGauge::default(),
+            &AgentConfig::default(),
+            None,
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
 
-            let msgs = history.as_slice();
-            assert_eq!(msgs.len(), 2);
-            assert!(matches!(msgs[0].role, Role::User));
-            assert!(matches!(msgs[1].role, Role::Assistant));
-        });
+        let msgs = history.as_slice();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0].role, Role::User));
+        assert!(matches!(msgs[1].role, Role::Assistant));
+        assert!(
+            history.request_prefix().is_some(),
+            "a standalone compaction leaves the session a frame, or `/btw` and the gauge have no prompt to read"
+        );
     }
 
     const SUMMARISED_PROMPT: u32 = 150_000;
+    const SUMMARISED_INPUT: u64 = 150_000;
 
     /// The measurement the gauge holds is of the transcript compaction just
     /// deleted, so left in place it sizes every later turn against a session
     /// that no longer exists.
-    #[test]
-    fn compact_leaves_the_gauge_describing_the_summary() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(StreamResponse {
-                usage: TokenUsage {
-                    input: SUMMARISED_PROMPT,
-                    ..Default::default()
-                },
-                ..text_response(StopReason::EndTurn)
-            })]);
-            let mut history = History::new(vec![Message::user("first".into())]);
-            let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+    #[tokio::test]
+    async fn compact_leaves_the_gauge_describing_the_summary() {
+        let provider = MockProvider::new(vec![Ok(StreamResponse {
+            usage: TokenUsage {
+                input: SUMMARISED_INPUT,
+                ..Default::default()
+            },
+            ..text_response(StopReason::EndTurn)
+        })]);
+        let mut history = History::new(vec![Message::user("first".into())]);
+        let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
 
-            summarize(
-                &provider,
-                &mut history,
-                &mut gauge,
-                &AgentConfig::default(),
-                None,
-                &CancelToken::none(),
-            )
-            .await
-            .unwrap();
+        summarize(
+            &provider,
+            &mut history,
+            &mut gauge,
+            &AgentConfig::default(),
+            None,
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
 
-            assert!(
-                gauge.size() < SUMMARISED_PROMPT,
-                "the gauge still sizes the session by the transcript it summarized away"
-            );
-        });
-    }
-
-    /// The summariser reads a stripped, collapsed subset of the transcript, so
-    /// its count is well under the session's real prompt. Left in the gauge by
-    /// a compaction that then failed, it reads as a session with room to spare
-    /// and silences the threshold that would have tried again.
-    #[test]
-    fn a_failed_compaction_leaves_the_gauge_alone() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(StreamResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: Vec::new(),
-                    ..Default::default()
-                },
-                usage: TokenUsage {
-                    input: SUMMARISED_PROMPT / 2,
-                    ..Default::default()
-                },
-                stop_reason: Some(StopReason::EndTurn),
-            })]);
-            let mut history = History::new(vec![Message::user("first".into())]);
-            let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
-
-            summarize(
-                &provider,
-                &mut history,
-                &mut gauge,
-                &AgentConfig::default(),
-                None,
-                &CancelToken::none(),
-            )
-            .await
-            .expect_err("empty summary must fail");
-
-            assert_eq!(
-                gauge.size(),
-                SUMMARISED_PROMPT,
-                "the summariser's own prompt was written over the session's size"
-            );
-        });
+        assert!(
+            gauge.size() < SUMMARISED_PROMPT,
+            "the gauge still sizes the session by the transcript it summarized away"
+        );
     }
 
     #[test_case(vec![] ; "no_content")]
     #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
-    fn compact_keeps_history_when_summary_has_no_text(content: Vec<ContentBlock>) {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(StreamResponse {
+    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None }] ; "thinking_only")]
+    #[tokio::test]
+    async fn a_failed_compaction_leaves_the_context_alone(content: Vec<ContentBlock>) {
+        let empty = || {
+            Ok(StreamResponse {
                 message: Message {
                     role: Role::Assistant,
-                    content,
+                    content: content.clone(),
                     ..Default::default()
                 },
-                usage: TokenUsage::default(),
+                usage: TokenUsage {
+                    input: SUMMARISED_INPUT / 2,
+                    output: SUMMARISED_INPUT / 10,
+                    ..Default::default()
+                },
                 stop_reason: Some(StopReason::EndTurn),
-            })]);
-            const KEPT: &str = "first";
-            let mut history = History::new(vec![Message::user(KEPT.into())]);
+                ..Default::default()
+            })
+        };
+        let provider = MockProvider::new(vec![empty(), empty()]);
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+        let (raw_tx, rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
+        let mut hooks = test_hooks(&registry, None, &model, &cancel);
+        hooks.context_size = gauge.size();
 
-            let err = summarize(
-                &provider,
-                &mut history,
-                &mut ContextGauge::default(),
-                &AgentConfig::default(),
-                None,
-                &CancelToken::none(),
-            )
-            .await
-            .expect_err("empty summary must fail");
+        let result = compact(
+            &provider,
+            &small_context_model(SUMMARY_CONTEXT_WINDOW),
+            &mut history,
+            &mut gauge,
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &hooks,
+            &AgentConfig::default(),
+            None,
+            RetryPolicy::default(),
+        )
+        .await;
 
-            assert!(matches!(err, AgentError::EmptySummary));
-            assert_eq!(history.len(), 1);
-            assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
-        });
+        assert!(matches!(result, Err(AgentError::EmptySummary)));
+        assert_eq!(gauge.size(), SUMMARISED_PROMPT);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
+        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let [
+            AgentEvent::CompactionStarted,
+            AgentEvent::TurnComplete(first),
+            AgentEvent::TurnComplete(retry),
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        for turn in [first, retry] {
+            assert_eq!(turn.context_size, Some(SUMMARISED_PROMPT));
+            assert_eq!(turn.context_window, model.context_window);
+        }
     }
 
-    #[test]
-    fn compact_reports_a_cancel_as_an_ending_not_a_failure() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
-            let (trigger, cancel) = CancelToken::new();
-            trigger.cancel();
+    const ATTEMPT_INPUT: u64 = 1_000;
 
-            let reason = summarize(
-                &provider,
-                &mut history,
-                &mut ContextGauge::default(),
-                &AgentConfig::default(),
-                None,
-                &cancel,
-            )
-            .await
-            .expect("a cancel is an ending, not a failure");
+    enum Reply {
+        Overflow,
+        Empty,
+        Summary,
+    }
 
-            assert_eq!(reason, DoneReason::Cancelled);
-            assert!(
-                provider.requests.lock().unwrap().is_empty(),
-                "the cancel should have landed before the request went out"
-            );
-            assert_eq!(
-                history.as_slice()[0].user_text(),
-                Some(KEPT_TEXT),
-                "a cancelled compaction must leave the transcript alone"
-            );
-        });
+    fn scripted(reply: &Reply) -> Result<StreamResponse, AgentError> {
+        let usage = TokenUsage {
+            input: ATTEMPT_INPUT,
+            ..Default::default()
+        };
+        match reply {
+            Reply::Overflow => Err(overflow_error()),
+            Reply::Empty => Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    ..Default::default()
+                },
+                usage,
+                stop_reason: Some(StopReason::MaxTokens),
+                ..Default::default()
+            }),
+            Reply::Summary => Ok(StreamResponse {
+                usage,
+                ..text_response(StopReason::EndTurn)
+            }),
+        }
+    }
+
+    /// Every attempt that came back is a paid request, so each reports its own
+    /// turn and the `Done` usage sums them all.
+    #[test_case(&[Reply::Empty, Reply::Summary], true ; "empty_then_summary")]
+    #[test_case(&[Reply::Overflow, Reply::Empty, Reply::Summary], true ; "overflow_then_empty_then_summary")]
+    #[test_case(&[Reply::Overflow, Reply::Overflow, Reply::Empty], false ; "no_retry_past_the_attempt_budget")]
+    #[tokio::test]
+    async fn empty_summary_retry(replies: &[Reply], summarised: bool) {
+        let provider = MockProvider::new(replies.iter().map(scripted).collect());
+        let mut history = History::new(vec![
+            Message::user(KEPT_TEXT.into()),
+            Message::user("second".into()),
+        ]);
+        let (raw_tx, rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let cancel = CancelToken::none();
+
+        let result = compact(
+            &provider,
+            &model,
+            &mut history,
+            &mut ContextGauge::default(),
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, &cancel),
+            &AgentConfig::default(),
+            None,
+            RetryPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(provider.requests.lock().unwrap().len(), replies.len());
+        let answered = replies
+            .iter()
+            .filter(|reply| !matches!(reply, Reply::Overflow))
+            .count();
+        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionDone { .. }))
+                .count(),
+            usize::from(summarised)
+        );
+        let turns = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnComplete(_)))
+            .count();
+        assert_eq!(turns, answered);
+        let kept = history
+            .as_slice()
+            .iter()
+            .any(|message| message.user_text() == Some(KEPT_TEXT));
+        assert_eq!(kept, !summarised);
+        if summarised {
+            assert_eq!(result.unwrap(), DoneReason::Compact);
+            let Some(AgentEvent::Done { usage, .. }) = events.last() else {
+                panic!("{events:?}");
+            };
+            assert_eq!(usage.input, ATTEMPT_INPUT * answered as u64);
+        } else {
+            assert!(matches!(result, Err(AgentError::EmptySummary)));
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_reports_a_cancel_as_an_ending_not_a_failure() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+
+        let reason = summarize(
+            &provider,
+            &mut history,
+            &mut ContextGauge::default(),
+            &AgentConfig::default(),
+            None,
+            &cancel,
+        )
+        .await
+        .expect("a cancel is an ending, not a failure");
+
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(
+            provider.requests.lock().unwrap().is_empty(),
+            "the cancel should have landed before the request went out"
+        );
+        assert_eq!(
+            history.as_slice()[0].user_text(),
+            Some(KEPT_TEXT),
+            "a cancelled compaction must leave the transcript alone"
+        );
     }
 
     /// `summary_prompt_merges_instructions` covers the merge, this one the
     /// wiring around it.
-    #[test]
-    fn compact_sends_instructions_and_appends_post() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let mut history = History::new(vec![Message::user("work".into())]);
-            let config = AgentConfig {
-                compaction_instructions: Some(CONFIG_EXTRA.into()),
-                post_compaction_instructions: Some(POST.into()),
+    #[tokio::test]
+    async fn compact_sends_instructions_and_appends_post() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+        let config = AgentConfig {
+            compaction_instructions: Some(CONFIG_EXTRA.into()),
+            post_compaction_instructions: Some(POST.into()),
+            ..Default::default()
+        };
+
+        summarize(
+            &provider,
+            &mut history,
+            &mut ContextGauge::default(),
+            &config,
+            Some(REQUEST_EXTRA),
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+
+        let requests = provider.requests.lock().unwrap();
+        assert!(matches!(
+            &requests[0].last().unwrap().content[0],
+            ContentBlock::Text { text }
+                if text.contains(CONFIG_EXTRA) && text.contains(REQUEST_EXTRA)
+        ));
+        assert!(matches!(
+            &history.as_slice().last().unwrap().content[0],
+            ContentBlock::Text { text } if text == POST
+        ));
+    }
+
+    const LAYER_EXTRA: &str = "Name every file you touched";
+    const SUMMARY: &str = "We fixed the flaky test in run.rs";
+
+    fn before_answers(value: Value) -> impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync {
+        move |slot, _| match slot {
+            AgentSlot::CompactBefore => Verdict::Replaced(value.clone()),
+            _ => Verdict::Unchanged,
+        }
+    }
+
+    /// Runs the `/compact` path with a gauge at [`SUMMARISED_PROMPT`] and
+    /// hands back every event it sent.
+    async fn summarize_steered(
+        provider: &MockProvider,
+        history: &mut History,
+        instructions: Option<&str>,
+        answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
+    ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
+        let (raw_tx, rx) = flume::unbounded();
+        let registry = ToolRegistry::new();
+        script(&registry, answer);
+        let model = default_model();
+        let cancel = CancelToken::none();
+        let result = compact(
+            provider,
+            &small_context_model(SUMMARY_CONTEXT_WINDOW),
+            history,
+            &mut ContextGauge::restored(SUMMARISED_PROMPT),
+            bare_context(&model),
+            None,
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, &cancel),
+            &AgentConfig::default(),
+            instructions,
+            RetryPolicy::default(),
+        )
+        .await;
+        (result, rx.try_iter().map(|e| e.event).collect())
+    }
+
+    /// The mock holds no responses, so any request would panic.
+    #[tokio::test]
+    async fn manual_compact_skipped_by_layer_ends_without_a_request() {
+        let provider = MockProvider::new(Vec::new());
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            before_answers(json!({ FIELD_SKIP: true })),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), DoneReason::Compact);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::CompactionStarted | AgentEvent::CompactionDone { .. }
+        )));
+        let done: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Done {
+                    usage,
+                    context_size,
+                    context_window,
+                    reason,
+                    ..
+                } => Some((*usage, *context_size, *context_window, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            done,
+            [(
+                TokenUsage::default(),
+                SUMMARISED_PROMPT,
+                default_model().context_window,
+                DoneReason::Compact
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn layer_instructions_follow_the_requests_own() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+
+        let (result, _) = summarize_steered(
+            &provider,
+            &mut history,
+            Some(REQUEST_EXTRA),
+            before_answers(json!({ FIELD_INSTRUCTIONS: LAYER_EXTRA })),
+        )
+        .await;
+        result.unwrap();
+
+        let requests = provider.requests.lock().unwrap();
+        let prompt = requests[0].last().unwrap().first_text_content().unwrap();
+        let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
+        let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
+        assert!(request_at < layer_at, "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn manual_compact_reports_the_summary() {
+        let usage = TokenUsage {
+            input: SUMMARISED_INPUT / 2,
+            output: SUMMARY.len() as u64,
+            ..Default::default()
+        };
+        let provider = MockProvider::new(vec![Ok(StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: SUMMARY.into(),
+                }],
                 ..Default::default()
-            };
+            },
+            usage,
+            ..text_response(StopReason::EndTurn)
+        })]);
+        let mut history = History::new(vec![Message::user("work".into())]);
 
-            summarize(
-                &provider,
-                &mut history,
-                &mut ContextGauge::default(),
-                &config,
-                Some(REQUEST_EXTRA),
-                &CancelToken::none(),
-            )
-            .await
-            .unwrap();
+        let (result, events) =
+            summarize_steered(&provider, &mut history, None, |_, _| Verdict::Unchanged).await;
+        assert_eq!(result.unwrap(), DoneReason::Compact);
 
-            let requests = provider.requests.lock().unwrap();
-            assert!(matches!(
-                &requests[0].last().unwrap().content[0],
-                ContentBlock::Text { text }
-                    if text.contains(CONFIG_EXTRA) && text.contains(REQUEST_EXTRA)
-            ));
-            assert!(matches!(
-                &history.as_slice().last().unwrap().content[0],
-                ContentBlock::Text { text } if text == POST
-            ));
-        });
+        let [
+            AgentEvent::CompactionStarted,
+            AgentEvent::TurnComplete(turn),
+            AgentEvent::CompactionDone {
+                context_size_after,
+                context_window,
+                summary,
+                ..
+            },
+            AgentEvent::Done {
+                usage: done_usage,
+                context_size,
+                context_window: done_window,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(summary, SUMMARY);
+        assert_eq!(*done_usage, usage);
+        assert_eq!(context_size, context_size_after);
+        let session_window = default_model().context_window;
+        assert_eq!(
+            [turn.context_window, *context_window, *done_window],
+            [session_window; 3]
+        );
     }
 
     #[test_case(None, None, false, false ; "no_instructions")]
@@ -775,53 +1327,52 @@ mod tests {
         assert_eq!(prompt.contains(REQUEST_EXTRA), has_request);
     }
 
-    #[test]
-    fn compact_preparation_removes_orphan_result_and_tool_image() {
+    #[tokio::test]
+    async fn compact_preparation_removes_orphan_result_and_tool_image() {
         use std::sync::Arc;
 
         use maki_providers::{ImageMediaType, ImageSource};
 
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let image = ContentBlock::Image {
-                source: ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8=")),
-            };
-            let mut orphan = Message {
-                role: Role::User,
-                content: vec![tool_result("orphan"), image.clone()],
-                ..Default::default()
-            };
-            orphan.content.push(ContentBlock::Text {
-                text: "keep text".into(),
-            });
-            let chat_image = Message {
-                role: Role::User,
-                content: vec![image],
-                ..Default::default()
-            };
-            let mut history = History::new(vec![orphan, chat_image]);
-            summarize_history(&provider, &mut history, 0, None).await;
-
-            let requests = provider.requests.lock().unwrap();
-            let request = &requests[0];
-            assert!(
-                !request
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .any(|block| matches!(
-                        block,
-                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }
-                    ))
-            );
-            assert!(
-                request.iter().flat_map(|message| &message.content).any(
-                    |block| matches!(block, ContentBlock::Text { text } if text == "keep text")
-                )
-            );
-            assert!(request.iter().flat_map(|message| &message.content).any(
-                |block| matches!(block, ContentBlock::Text { text } if text == IMAGE_PLACEHOLDER)
-            ));
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let image = ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8=")),
+        };
+        let mut orphan = Message {
+            role: Role::User,
+            content: vec![tool_result("orphan"), image.clone()],
+            ..Default::default()
+        };
+        orphan.content.push(ContentBlock::Text {
+            text: "keep text".into(),
         });
+        let chat_image = Message {
+            role: Role::User,
+            content: vec![image],
+            ..Default::default()
+        };
+        let mut history = History::new(vec![orphan, chat_image]);
+        summarize_history(&provider, &mut history, 0, None).await;
+
+        let requests = provider.requests.lock().unwrap();
+        let request = &requests[0];
+        assert!(
+            !request
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }
+                ))
+        );
+        assert!(
+            request
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == "keep text"))
+        );
+        assert!(request.iter().flat_map(|message| &message.content).any(
+            |block| matches!(block, ContentBlock::Text { text } if text == IMAGE_PLACEHOLDER)
+        ));
     }
 
     #[test_case(159_999, 0,       0,       0,      200_000, false ; "below_threshold")]
@@ -838,10 +1389,10 @@ mod tests {
     #[test_case(2_048,   0,       0,       0,      4_096,   true  ; "llama_cpp_default_window_still_compacts")]
     #[test_case(0,       0,       0,       0,      1_024,   false ; "an_empty_transcript_never_overflows")]
     fn overflow_detection(
-        input: u32,
-        cache_read: u32,
-        cache_creation: u32,
-        output: u32,
+        input: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        output: u64,
         ctx_window: u32,
         expected: bool,
     ) {
@@ -864,7 +1415,7 @@ mod tests {
     #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
     // A buffer under the output floor cannot leave a turn room to answer.
     #[test_case(CompactionBuffer::Tokens(1_000),  60_000, true  ; "buffer_below_the_output_floor_is_raised")]
-    fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
+    fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u64, expected: bool) {
         let model = small_context_model(64_000);
         let config = AgentConfig {
             compaction_buffer: buffer,
@@ -917,16 +1468,8 @@ mod tests {
         let mut messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: OLD_RESULT.into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t2".into(),
-                    content: NEW_RESULT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", OLD_RESULT, false),
+                ContentBlock::tool_result("t2", NEW_RESULT, false),
                 ContentBlock::Text {
                     text: KEPT_TEXT.into(),
                 },
@@ -945,6 +1488,59 @@ mod tests {
         );
     }
 
+    /// The layer flips the host's pick, and its index past the end is dropped
+    /// rather than trusted.
+    #[tokio::test]
+    async fn prepare_layer_picks_what_collapses() {
+        const TOOL: &str = "read";
+        const OUT_OF_RANGE: usize = 99;
+        let mut messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::tool_use("t1", TOOL, json!({})),
+                    ContentBlock::tool_use("t2", TOOL, json!({})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::tool_result("t1", OLD_RESULT, false),
+                    ContentBlock::tool_result("t2", NEW_RESULT, false),
+                ],
+                ..Default::default()
+            },
+        ];
+        let registry = ToolRegistry::new();
+        let seen = script(&registry, |_, _| {
+            Verdict::Replaced(json!({ FIELD_COLLAPSE: [2, OUT_OF_RANGE] }))
+        });
+        let model = default_model();
+        let cancel = CancelToken::none();
+
+        prepare_collapse(
+            &test_hooks(&registry, None, &model, &cancel),
+            &mut messages,
+            NEW_RESULT.len(),
+        )
+        .await;
+
+        let (slot, value) = seen.lock().unwrap()[0].clone();
+        assert_eq!(slot, AgentSlot::CompactPrepare);
+        assert_eq!(value[FIELD_COLLAPSE], json!([1]));
+        assert_eq!(value["results"][0]["tool"], TOOL);
+        let contents: Vec<&str> = messages[1]
+            .content
+            .iter()
+            .map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => content.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(contents, [OLD_RESULT, TOOL_RESULT_PLACEHOLDER]);
+    }
+
     fn tool_use(id: &str) -> Message {
         Message {
             role: Role::Assistant,
@@ -954,11 +1550,7 @@ mod tests {
     }
 
     fn tool_result(id: &str) -> ContentBlock {
-        ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: "output".into(),
-            is_error: false,
-        }
+        ContentBlock::tool_result(id, "output", false)
     }
 
     #[track_caller]
@@ -979,132 +1571,122 @@ mod tests {
         }
     }
 
-    #[test]
-    fn compact_history_retries_without_reproduced_orphan() {
-        smol::block_on(async {
-            const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
+    #[tokio::test]
+    async fn compact_history_retries_without_reproduced_orphan() {
+        const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
-            let provider = MockProvider::new(vec![
-                Err(overflow_error()),
-                Err(overflow_error()),
-                Ok(text_response(StopReason::EndTurn)),
-            ]);
-            let mut history = History::new(vec![
-                Message::user("request".into()),
-                tool_use(TOOL_USE_ID),
-                Message {
-                    role: Role::User,
-                    content: vec![tool_result(TOOL_USE_ID)],
-                    ..Default::default()
-                },
-                Message::user("prompt".into()),
-            ]);
-            summarize_history(&provider, &mut history, 0, None).await;
+        let provider = MockProvider::new(vec![
+            Err(overflow_error()),
+            Err(overflow_error()),
+            Ok(text_response(StopReason::EndTurn)),
+        ]);
+        let mut history = History::new(vec![
+            Message::user("request".into()),
+            tool_use(TOOL_USE_ID),
+            Message {
+                role: Role::User,
+                content: vec![tool_result(TOOL_USE_ID)],
+                ..Default::default()
+            },
+            Message::user("prompt".into()),
+        ]);
+        summarize_history(&provider, &mut history, 0, None).await;
 
-            let requests = provider.requests.lock().unwrap();
-            assert_eq!(requests.len(), 3);
-            assert!(requests[0]
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0]
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
+        // Attempt 1 only collapses the result, attempt 2 drops the round.
+        assert!(requests[1]
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, ContentBlock::ToolResult { content, .. } if content == TOOL_RESULT_PLACEHOLDER)));
+        assert!(
+            !requests[2]
                 .iter()
                 .flat_map(|message| &message.content)
-                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
-            // Attempt 1 only collapses the result, attempt 2 drops the round.
-            assert!(requests[1]
-                .iter()
-                .flat_map(|message| &message.content)
-                .any(|block| matches!(block, ContentBlock::ToolResult { content, .. } if content == TOOL_RESULT_PLACEHOLDER)));
-            assert!(
-                !requests[2]
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-            );
-        });
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        );
     }
 
     const NO_COLLAPSE_MSG: &str =
         "with no tool result to collapse the retry must prune instead of resending";
 
-    #[test]
-    fn compact_history_prunes_when_there_is_nothing_to_collapse() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![
-                Err(overflow_error()),
-                Ok(text_response(StopReason::EndTurn)),
-            ]);
-            let mut history = History::new(vec![
-                Message::user("first".into()),
-                Message::user("second".into()),
-            ]);
-            summarize_history(&provider, &mut history, 0, None).await;
+    #[tokio::test]
+    async fn compact_history_prunes_when_there_is_nothing_to_collapse() {
+        let provider = MockProvider::new(vec![
+            Err(overflow_error()),
+            Ok(text_response(StopReason::EndTurn)),
+        ]);
+        let mut history = History::new(vec![
+            Message::user("first".into()),
+            Message::user("second".into()),
+        ]);
+        summarize_history(&provider, &mut history, 0, None).await;
 
-            let requests = provider.requests.lock().unwrap();
-            assert!(requests[1].len() < requests[0].len(), "{NO_COLLAPSE_MSG}");
-        });
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[1].len() < requests[0].len(), "{NO_COLLAPSE_MSG}");
     }
 
     /// OpenCode Go rejects requests without `x-opencode-session`, so the
     /// summariser must ride the conversation's id like every other turn.
-    #[test]
-    fn compact_history_sends_the_conversations_session_id() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let mut history = History::new(vec![Message::user("work".into())]);
-            let session = SessionRef::generate();
-            summarize_history(&provider, &mut history, 0, Some(&session)).await;
+    #[tokio::test]
+    async fn compact_history_sends_the_conversations_session_id() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+        let session = SessionRef::generate();
+        summarize_history(&provider, &mut history, 0, Some(&session)).await;
 
-            let sessions = provider.sessions.lock().unwrap();
-            assert_eq!(sessions[0].as_deref(), Some(session.as_str()));
-        });
+        let sessions = provider.sessions.lock().unwrap();
+        assert_eq!(sessions[0].as_deref(), Some(session.as_str()));
     }
 
     const CARRIED: &str = "answer this next";
     const CARRY_UNSENT_MSG: &str = "carried input is not the summariser's to read";
     const CARRY_KEPT_MSG: &str = "carried input must outlive the summary verbatim";
 
-    #[test]
-    fn compact_history_carries_the_tail_past_the_summary() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let mut history = History::new(vec![
-                Message::user("first".into()),
-                Message::user(CARRIED.into()),
-            ]);
-            summarize_history(&provider, &mut history, 1, None).await;
+    #[tokio::test]
+    async fn compact_history_carries_the_tail_past_the_summary() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![
+            Message::user("first".into()),
+            Message::user(CARRIED.into()),
+        ]);
+        summarize_history(&provider, &mut history, 1, None).await;
 
-            let carried = |messages: &[Message]| {
-                messages
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .any(|block| matches!(block, ContentBlock::Text { text } if text == CARRIED))
-            };
-            assert!(
-                !carried(&provider.requests.lock().unwrap()[0]),
-                "{CARRY_UNSENT_MSG}"
-            );
-            assert!(carried(history.as_slice()), "{CARRY_KEPT_MSG}");
-        });
+        let carried = |messages: &[Message]| {
+            messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == CARRIED))
+        };
+        assert!(
+            !carried(&provider.requests.lock().unwrap()[0]),
+            "{CARRY_UNSENT_MSG}"
+        );
+        assert!(carried(history.as_slice()), "{CARRY_KEPT_MSG}");
     }
 
-    #[test]
-    fn compaction_keeps_observation_before_dependent_reply() {
-        smol::block_on(async {
-            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
-            let mut history = History::new(vec![
-                Message::observation("[monitor] build failed".into()),
-                Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: "I will fix it".into(),
-                    }],
-                    ..Default::default()
-                },
-            ]);
-            summarize_history(&provider, &mut history, 0, None).await;
+    #[tokio::test]
+    async fn compaction_keeps_observation_before_dependent_reply() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![
+            Message::observation("[monitor] build failed".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "I will fix it".into(),
+                }],
+                ..Default::default()
+            },
+        ]);
+        summarize_history(&provider, &mut history, 0, None).await;
 
-            let requests = provider.requests.lock().unwrap();
-            assert!(requests[0][0].is_observation());
-            assert!(matches!(requests[0][1].role, Role::Assistant));
-        });
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0][0].is_observation());
+        assert!(matches!(requests[0][1].role, Role::Assistant));
     }
 
     #[test]
@@ -1157,11 +1739,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "output".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "output", false)],
                 ..Default::default()
             },
             Message::user("keep me".into()),
@@ -1239,11 +1817,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "output".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "output", false)],
                 ..Default::default()
             },
             Message::user("keep me".into()),

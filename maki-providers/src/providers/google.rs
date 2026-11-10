@@ -2,11 +2,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
-use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::{MakiId, SessionRef};
+use reqwest::{Client, Method, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tracing::warn;
 
 use maki_config::providers::Protocol;
@@ -15,15 +15,19 @@ use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
+use crate::providers::openai_compat::assistant_response;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    sends_as_chosen,
 };
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line, ok_sse, ok_text,
+};
 
 pub(crate) const SLUG: &str = "google";
 const DISPLAY_NAME: &str = "Google";
@@ -32,7 +36,7 @@ const ENV_VAR: &str = "GEMINI_API_KEY";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
 const LOGIN_URL: &str = "https://aistudio.google.com/apikey";
 const FEATURES: &str = "Native Gemini API with thinking support";
-const API_KEY_HEADER: &str = "x-goog-api-key";
+pub(crate) const API_KEY_HEADER: &str = "x-goog-api-key";
 const FLASH_MAX_THINKING: u32 = 24_576;
 const PRO_MAX_THINKING: u32 = 32_768;
 
@@ -53,17 +57,21 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Gemini,
     supports_thinking: true,
+    supports_deferred_tools: false,
+    sends_thinking: sends_as_chosen,
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models_toml: include_str!("../../models/google.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: GEMINI_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: GEMINI_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Google,
@@ -111,12 +119,15 @@ fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> Result<Resolved
 }
 
 pub struct Google {
-    client: HttpClient,
+    client: Client,
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     resolved_base_url: Option<String>,
+    /// Where a codec caller sends requests when its auth carries no origin.
+    /// Kept out of the auth cell, because an origin there outranks the user's.
+    fallback_base_url: Option<String>,
 }
 
 impl Google {
@@ -130,6 +141,7 @@ impl Google {
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         })
     }
 
@@ -144,15 +156,29 @@ impl Google {
             key_pool: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         }
     }
 
-    fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
+    pub(crate) fn with_fallback_base_url(mut self, base_url: Option<String>) -> Self {
+        self.fallback_base_url = base_url;
+        self
+    }
+
+    fn base_url(&self) -> String {
+        let auth = self.auth.lock().unwrap();
+        auth.base_url
+            .as_deref()
+            .or(self.fallback_base_url.as_deref())
+            .unwrap_or(BASE_URL)
+            .to_string()
+    }
+
+    fn build_request(&self, method: Method, url: &str) -> RequestBuilder {
         let auth = self.auth.lock().unwrap();
         auth.configure_request(
-            Request::builder()
-                .method(method)
-                .uri(url)
+            self.client
+                .request(method, url)
                 .header("user-agent", super::user_agent()),
         )
     }
@@ -167,19 +193,13 @@ impl Google {
     }
 
     fn stream_url(&self, model_id: &str) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let encoded = super::urlenc(model_id);
         format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
     }
 
     fn models_url(&self) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let key = self.api_key();
         format!("{base}/models?key={key}&pageSize=1000")
     }
@@ -191,6 +211,7 @@ impl Google {
         system: &str,
         tools: &Value,
         thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let mut body = json!({
             "contents": convert_messages(messages),
@@ -204,6 +225,12 @@ impl Google {
 
         if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        // Gemini ignores `topP` on models that dropped sampling params (3.6+)
+        // instead of erroring, and 2.5 thinking models accept it, so unlike
+        // Anthropic and OpenAI it rides along even when thinking is on.
+        if let Some(top_p) = top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
         }
 
         let tool_decls = convert_tools(tools);
@@ -223,23 +250,21 @@ impl Google {
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let body = self.build_body(model, messages, system, tools, thinking);
+        let top_p = self.auth.lock().unwrap().top_p;
+        let body = self.build_body(model, messages, system, tools, thinking, top_p);
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
         let request = self
-            .build_request("POST", &url)
+            .build_request(Method::POST, &url)
             .header("content-type", "application/json")
-            .body(json_body)?;
+            .body(json_body)
+            .build()?;
 
-        let response = self.client.send_async(request).await?;
-        let status = response.status().as_u16();
-
-        if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
-        } else {
-            Err(AgentError::from_response(response).await)
-        }
+        ok_sse(&self.client, request, |body| {
+            parse_sse(body, event_tx, self.stream_timeout)
+        })
+        .await
     }
 }
 
@@ -259,14 +284,10 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request("GET", &url).body(()).unwrap();
+        let request = self.build_request(Method::GET, &url).build();
         let client = self.client.clone();
         Box::pin(async move {
-            let mut response = client.send_async(request).await?;
-            if response.status().as_u16() != 200 {
-                return Err(AgentError::from_response(response).await);
-            }
-            let body_text = response.text().await?;
+            let body_text = ok_text(&client, request?).await?;
             let models_response: ModelsListResponse = serde_json::from_str(&body_text)?;
             let mut infos: Vec<crate::model::ModelInfo> = models_response
                 .models
@@ -292,6 +313,11 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
+            // Credentials handed in through `with_auth` belong to the caller,
+            // and our vendor key must never follow them to a third-party origin.
+            if self.key_pool.is_none() {
+                return Ok(());
+            }
             let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
@@ -300,11 +326,7 @@ impl Provider for Google {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 }
 
@@ -351,7 +373,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     }
                     parts.push(part);
                 }
-                ContentBlock::RedactedThinking { .. } => {}
+                ContentBlock::RedactedThinking { .. } | ContentBlock::Unknown(_) => {}
                 ContentBlock::ToolUse {
                     id: _,
                     name,
@@ -373,6 +395,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     let parsed = serde_json::from_str::<Value>(content);
                     let mut response_val = match parsed {
@@ -435,38 +458,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
                 "description": description,
             });
             if let Some(parameters) = tool_parameters(t) {
-                decl["parameters"] = parameters;
+                decl["parametersJsonSchema"] = parameters;
             }
             Some(decl)
         })
         .collect()
 }
 
+/// The schema goes out as `parametersJsonSchema`, which takes JSON Schema as
+/// is. The older `parameters` field knows only Gemini's OpenAPI subset and 400s
+/// on every other key (`additionalProperties`, `$schema`, MCP's `x-mcp-header`),
+/// so MCP servers kept tripping it one key at a time.
+///
 /// Gemini turns down an object schema that lists no properties, while MiniMax
 /// turns down a bare `{}`, so no single payload pleases both. A tool that takes
-/// no arguments simply travels here without `parameters`.
+/// no arguments simply travels here without a schema.
 fn tool_parameters(tool: &Value) -> Option<Value> {
     let schema = tool.get("input_schema")?;
     let has_properties = schema
         .get("properties")
         .and_then(Value::as_object)
         .is_some_and(|props| !props.is_empty());
-    has_properties.then(|| strip_additional_properties(schema.clone()))
-}
-
-fn strip_additional_properties(value: Value) -> Value {
-    match value {
-        Value::Object(mut map) => {
-            map.remove("additionalProperties");
-            map.values_mut()
-                .for_each(|v| *v = strip_additional_properties(std::mem::take(v)));
-            Value::Object(map)
-        }
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(strip_additional_properties).collect())
-        }
-        other => other,
-    }
+    has_properties.then(|| schema.clone())
 }
 
 fn tool_defs_empty(tool_decls: &[Value]) -> bool {
@@ -510,11 +523,13 @@ struct SseFunctionCall {
 #[serde(rename_all = "camelCase")]
 struct SseUsageMetadata {
     #[serde(default)]
-    prompt_token_count: u32,
+    prompt_token_count: u64,
     #[serde(default)]
-    candidates_token_count: u32,
+    candidates_token_count: u64,
     #[serde(default)]
-    cached_content_token_count: Option<u32>,
+    thoughts_token_count: u64,
+    #[serde(default)]
+    cached_content_token_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -576,11 +591,10 @@ fn push_or_extend_thinking(
 }
 
 async fn parse_sse(
-    response: isahc::Response<isahc::AsyncBody>,
+    reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(response.into_body());
     let mut lines = reader.lines();
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -603,11 +617,14 @@ async fn parse_sse(
         };
 
         if let Some(meta) = chunk.usage_metadata {
-            usage.input = meta.prompt_token_count;
-            usage.output = meta.candidates_token_count;
             if let Some(cached) = meta.cached_content_token_count {
                 usage.cache_read = cached;
             }
+            // Google's prompt count includes cache hits; TokenUsage keeps them separate.
+            usage.input = meta.prompt_token_count.saturating_sub(usage.cache_read);
+            usage.output = meta
+                .candidates_token_count
+                .saturating_add(meta.thoughts_token_count);
         }
 
         let Some(candidates) = chunk.candidates else {
@@ -664,25 +681,21 @@ async fn parse_sse(
         }
     }
 
-    Ok(StreamResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: content_blocks,
-            ..Default::default()
-        },
-        usage,
-        stop_reason,
-    })
+    Ok(assistant_response(content_blocks, usage, stop_reason))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorProjection;
     use crate::model::{ModelPricing, ModelTier};
+    use std::io::Cursor;
     use std::sync::Arc;
     use test_case::test_case;
 
+    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
     const GEMINI_API_KEY: &str = "test-key";
+    const MALFORMED_BASE_URL: &str = "http://[";
     const TOOL_NAME: &str = "word_count";
     const TOOL_DESCRIPTION: &str = "Count words.";
     const PATH_PROP: &str = "path";
@@ -723,6 +736,14 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn list_models_on_a_malformed_base_url_is_a_config_error() {
+        let google = Google::with_auth(test_auth(), test_timeouts())
+            .with_fallback_base_url(Some(MALFORMED_BASE_URL.into()));
+        let error = google.list_models().await.unwrap_err();
+        assert_eq!(error.projection(), ErrorProjection::Config);
+    }
+
     #[test_case(json!({"type": "object", "properties": {}}) ; "empty_properties")]
     #[test_case(json!({"type": "object"}) ; "missing_properties")]
     fn convert_tools_omits_empty_parameters(input_schema: Value) {
@@ -734,27 +755,40 @@ mod tests {
         let decls = convert_tools(&tools);
         assert_eq!(decls[0]["name"], json!(TOOL_NAME));
         assert_eq!(
-            decls[0].get("parameters"),
+            decls[0].get("parametersJsonSchema"),
             None,
             "{EMPTY_PROPERTIES_REJECTED}"
         );
     }
 
     #[test]
-    fn convert_tools_keeps_populated_parameters() {
+    fn convert_tools_sends_input_schema_as_json_schema() {
+        let input_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                PATH_PROP: {"type": "string", "x-mcp-header": "Path"},
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"verbose": {"type": "boolean"}}
+                }
+            },
+            "additionalProperties": false,
+        });
         let tools = json!([{
             "name": TOOL_NAME,
             "description": TOOL_DESCRIPTION,
-            "input_schema": {
-                "type": "object",
-                "properties": { PATH_PROP: {"type": "string"} },
-                "additionalProperties": false,
-            },
+            "input_schema": input_schema,
         }]);
         let decls = convert_tools(&tools);
         assert_eq!(
-            decls[0]["parameters"],
-            json!({"type": "object", "properties": { PATH_PROP: {"type": "string"} }})
+            decls[0],
+            json!({
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parametersJsonSchema": input_schema,
+            })
         );
     }
 
@@ -769,12 +803,30 @@ mod tests {
             "be helpful",
             &json!([]),
             ThinkingConfig::Off,
+            None,
         );
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test_case(ThinkingConfig::Off ; "without_thinking")]
+    #[test_case(ThinkingConfig::Adaptive ; "with_thinking")]
+    fn google_build_body_sends_top_p(thinking: ThinkingConfig) {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
     }
 
     #[test]
@@ -787,6 +839,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Adaptive,
+            None,
         );
 
         assert_eq!(
@@ -805,12 +858,13 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Budget(8192),
+            None,
         );
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).
         assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            4096
+            body["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts": true, "thinkingBudget": 4096})
         );
     }
 
@@ -873,11 +927,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "file contents".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "file contents", false)],
                 ..Default::default()
             },
         ];
@@ -902,11 +952,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: content.into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", content, false)],
                 ..Default::default()
             },
         ];
@@ -927,11 +973,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "boom".into(),
-                    is_error: true,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "boom", true)],
                 ..Default::default()
             },
         ];
@@ -970,11 +1012,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("call_1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
                         crate::ImageMediaType::Png,
@@ -1018,93 +1056,12 @@ mod tests {
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
     }
 
-    #[test]
-    fn convert_tools_basic() {
-        let tools = json!([{
-            "name": "bash",
-            "description": "run a command",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "cmd": {"type": "string", "additionalProperties": false},
-                    "opts": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {"verbose": {"type": "boolean"}}
-                    }
-                },
-                "additionalProperties": false
-            }
-        }]);
-        let result = convert_tools(&tools);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["name"], "bash");
-        assert_eq!(result[0]["description"], "run a command");
-        assert!(result[0]["parameters"]["properties"]["cmd"].is_object());
-        assert!(
-            result[0]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["cmd"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            result[0]["parameters"]["properties"]["opts"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn strip_additional_properties_recursive() {
-        let schema = json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "inner": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"x": {"type": "number", "additionalProperties": false}}
-                },
-                "list": {
-                    "type": "array",
-                    "items": {"type": "string", "additionalProperties": false}
-                }
-            }
-        });
-        let cleaned = strip_additional_properties(schema);
-        assert!(cleaned.get("additionalProperties").is_none());
-        assert!(
-            cleaned["properties"]["inner"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["inner"]["properties"]["x"]
-                .get("additionalProperties")
-                .is_none()
-        );
-        assert!(
-            cleaned["properties"]["list"]["items"]
-                .get("additionalProperties")
-                .is_none()
-        );
-    }
-
-    fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from_bytes_static(data);
-        isahc::Response::builder().status(200).body(body).unwrap()
-    }
-
-    #[test]
-    fn parse_sse_plain_text() {
+    #[tokio::test]
+    async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
-        let response = mock_response(data);
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
         assert_eq!(result.usage.output, 10);
@@ -1114,8 +1071,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_coalesces_text_deltas_into_one_block() {
+    #[tokio::test]
+    async fn parse_sse_coalesces_text_deltas_into_one_block() {
         let event = |text: &str| {
             format!(
                 "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\"}}]}}}}]}}\n\n",
@@ -1125,9 +1082,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("Hello, "));
         data.push_str(&event("world."));
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(
             result.message.content.len(),
             1,
@@ -1139,8 +1096,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
+    #[tokio::test]
+    async fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
         let event = |text: &str, sig: Option<&str>| match sig {
             Some(s) => format!(
                 "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true,\"thoughtSignature\":\"{}\"}}]}}}}]}}\n\n",
@@ -1154,9 +1111,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("reasoning... ", None));
         data.push_str(&event("more.", Some("sig-final")));
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
@@ -1165,14 +1122,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
+    #[tokio::test]
+    async fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
         let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
         let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
         let data = format!("data: {payload}\n\n");
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         let ids: Vec<&str> = result
             .message
             .content
@@ -1186,12 +1143,13 @@ mod tests {
         assert_ne!(ids[0], ids[1], "ids must be unique for parallel calls");
     }
 
-    #[test]
-    fn parse_sse_thinking_part() {
-        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20}}\n\n";
-        let response = mock_response(data);
+    #[tokio::test]
+    async fn parse_sse_thinking_part() {
+        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
@@ -1202,12 +1160,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_tool_call() {
+    #[tokio::test]
+    async fn parse_sse_tool_call() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
-        let response = mock_response(data);
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
             &result.message.content[0],
@@ -1223,29 +1181,70 @@ mod tests {
         r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}}"#
         ; "nested_fallback"
     )]
-    fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
+    #[tokio::test]
+    async fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
         const SIG: &str = "CvcQAdHtim/pKv/c0ClPFkYA==";
         let payload = format!(
             r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
         );
         let data = format!("data: {payload}\n\n");
-        let response = mock_response(data.leak().as_bytes());
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
         ));
     }
 
-    #[test]
-    fn parse_sse_cached_tokens() {
-        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10,\"cachedContentTokenCount\":50}}\n\n";
-        let response = mock_response(data);
+    #[test_case(None, 100 ; "missing_cache")]
+    #[test_case(Some(0), 100 ; "zero_cache")]
+    #[test_case(Some(50), 50 ; "partially_cached")]
+    #[test_case(Some(100), 0 ; "fully_cached")]
+    #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
+    #[tokio::test]
+    async fn parse_sse_cached_tokens(cached: Option<u64>, expected_input: u64) {
+        let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
+        if let Some(cached) = cached {
+            metadata["cachedContentTokenCount"] = json!(cached);
+        }
+        let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
+        let response = Cursor::new(data);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
-        assert_eq!(result.usage.input, 100);
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
-        assert_eq!(result.usage.cache_read, 50);
+        assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
+    }
+
+    #[test_case(None, 50, 50 ; "missing_cache_preserves_previous")]
+    #[test_case(Some(0), 100, 0 ; "zero_cache_clears_previous")]
+    #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
+    #[tokio::test]
+    async fn parse_sse_cached_tokens_across_chunks(
+        cached: Option<u64>,
+        expected_input: u64,
+        expected_cache_read: u64,
+    ) {
+        let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
+        if let Some(cached) = cached {
+            metadata["cachedContentTokenCount"] = json!(cached);
+        }
+        let initial_metadata = json!({
+            "promptTokenCount": 80,
+            "candidatesTokenCount": 1,
+            "cachedContentTokenCount": 50,
+        });
+        let data = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"usageMetadata": initial_metadata}),
+            json!({"usageMetadata": metadata}),
+        );
+        let response = Cursor::new(data);
+        let (tx, _rx) = flume::unbounded();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        assert_eq!(result.usage.input, expected_input);
+        assert_eq!(result.usage.output, 10);
+        assert_eq!(result.usage.cache_read, expected_cache_read);
     }
 }

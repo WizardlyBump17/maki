@@ -12,6 +12,7 @@ name = "maki-docgen"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { workspace = true }
 maki-agent = { workspace = true }
 maki-config = { workspace = true }
 maki-lua = { workspace = true }
@@ -22,3 +23,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
+
+[lints]
+workspace = true

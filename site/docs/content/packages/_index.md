@@ -11,10 +11,15 @@ A Lua package lets you add tools, commands, keybindings, and event handlers
 without copying its code into `init.lua`. Maki can load a package that you put
 on disk, or it can install one from a Git repository and lock it to one commit.
 
+Community packages are listed at [maki.sh/plugins](https://maki.sh/plugins/).
+A repository appears there when it has both the `maki` and `plugin` topics.
+
 A package directory holds sorted `plugin/*.lua` entry files, modules at
 `lua/<module>.lua` or `lua/<module>/init.lua`, and a `plugin.toml` manifest.
 The entry files share one environment and use the API the
-[plugin guide](/docs/plugins/) describes.
+[plugin guide](/docs/plugins/) describes. A global set in one file is visible
+to the others. Built-in globals such as `string` or `print` stay fixed, so
+defining your own `print` in one file does not change it in another.
 
 ## Install from Git
 
@@ -150,6 +155,10 @@ fs_write = true
 net = true
 run = true
 env = true
+agent = true
+session_read = true
+session_write = true
+session_settings = true
 ```
 
 The manifest states what the package wants, and Maki asks about new permissions
@@ -157,6 +166,25 @@ in a separate prompt. A package with no `plugin.toml` asks for nothing, and
 every guarded call it makes fails. The
 [permission list](/docs/lua-api/#plugin-permissions) covers what each name
 gates.
+
+Maki stores a package's [`net_hosts`](/docs/permissions/#plugin-egress-net-hosts)
+with its approval. An update that widens the list or drops it asks again before
+it loads. An approval from before Maki stored hosts counts as every host, so
+adding a list to that package never prompts.
+
+A package that registers provider slugs lists them at the top level of
+`plugin.toml`:
+
+```toml
+providers = ["greenpt"]
+```
+
+Maki stores the names with the approval, and the install prompt says the
+package will receive the saved key for each name models.dev serves. An update
+that adds a name asks again. A load that registers a slug models.dev serves
+and the approval never covered is refused. List every slug the package
+registers, so a name models.dev adds later is already approved and the
+catalog client can never take over a working package's slug.
 
 An approval applies only to the same package name and source. Maki keeps
 approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the
@@ -167,6 +195,14 @@ trust on this machine and must not be committed with `pack-lock.json`.
 Only the interactive UI can ask. `--print`, SDK mode, the ACP server, and the
 other subcommands never prompt, so a package waiting for a decision comes back
 as a startup warning instead of loading.
+
+## Upgrading plugins
+
+A plugin written for an older Maki may need these changes:
+
+- JSON null now decodes to [`maki.NIL`](/docs/lua-api/#maki-NIL), which is truthy. Pass `{ luanil = { object = true, array = true } }` to [`maki.json.decode`](/docs/lua-api/#maki-json-decode) to get nil back.
+- Messages from [`maki.session.messages`](/docs/lua-api/#maki-session-messages) changed shape. `hidden` is gone, and `display_text = ""` now marks a hidden message. A thinking block keeps its text in `thinking` instead of `text`. An image block has a `source`, which is a [`maki.image.Image`](/docs/lua-api/#maki-image-Image), instead of `media_type`.
+- A package that calls session APIs or layers a tool or agent slot must list the `session_read`, `session_write` and `session_settings` keys it uses in its `plugin.toml`. The [session permissions](/docs/permissions/#session-permissions) and the [layer price table](/docs/hooks/#rules) say which. A `plugin.toml` you wrote yourself grants every key it does not list. An `init.lua` without a `plugin.toml` is denied every guarded call, the session APIs included.
 
 ## Install by hand
 

@@ -3,6 +3,8 @@
 //! repo. `maki-docgen` calls [`site_page`] for the website; the plugin
 //! `require()` sandbox serves [`virtual_module`] to the skill plugin.
 
+use std::iter;
+
 use mlua::{Lua, Table};
 
 use crate::docs::{DocKind, FnDoc, ModuleDoc, api_docs};
@@ -30,6 +32,9 @@ fn permissions_section(anchored: bool) -> String {
 Sensitive APIs are gated per plugin file, and every gated function's entry in
 this reference names the permission it needs. A gated call without its
 permission raises `permission denied: '<name>' not granted for this plugin`.
+Inside an action of your plugin, a call also raises when the `capability`
+of the action leaves its permission out, see
+`maki.api.register_action`.
 
 {NAMES}
 
@@ -52,6 +57,10 @@ The rules:
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it
   uses. Only a `plugin.toml` you wrote yourself defaults to granted.
+- `net_hosts` narrows `net = true` to a host allowlist, such as
+  `["api.acme.com", "*.acme.dev"]`. Without it, `net` reaches any public
+  host. A plugin that registers a provider must set it. See
+  [Plugin egress](/docs/permissions/#plugin-egress-net-hosts).
 - `min_maki_version` is optional and takes a plain semantic version as a lower
   bound, so ranges do not work. When the field is invalid or the running
   version is older, Maki skips the Lua in that directory and warns at startup
@@ -89,8 +98,7 @@ reference is at the end of this document.
 
 Plugins live in the maki config dir. There are two of them, same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one first)
+- `~/.config/maki/` - global, every project
 - `<project>/.maki/` - this project only
 
 ```
@@ -162,6 +170,7 @@ with full debug info.
 - Fallible runtime calls return a `(value, err)` pair; check `err` before using `value`.
 - Tool handlers report failures with `{ llm_output = "error: ...", is_error = true }`, not by raising.
 - The model picks tools by reading `description`, so state precisely what the tool does and when to use it.
+- Describe parameters as separate fields, never as usage lines like `` `write path content` ``: models copy them into the string field.
 - Reusable helpers ship with maki; see "Shared helper modules" in the API reference.
 
 ## A complete real example
@@ -183,8 +192,6 @@ const AGENT_NOTES: &str = r#"## Notes for the agent
   of the maki repo holds the plugins that ship with maki, compiled into the
   binary, so a file dropped there does nothing until maki is rebuilt. That
   holds even when the project you have open is a maki checkout.
-- Both global config dirs can exist, and `~/.maki/` wins, so look before you
-  write.
 - The config dir sits outside the project, but it is an ordinary directory:
   create files there with the normal write and edit tools.
 - You cannot run slash commands or restart maki, so ask the user to run
@@ -559,9 +566,10 @@ fn field_item(text: &str) -> Option<String> {
     Some(format!("`{name}` (`{ty}`) {desc}"))
 }
 
-fn push_fields_block(out: &mut String, block: &str) {
+fn push_fields_block<'a>(out: &mut String, block: impl Iterator<Item = &'a str>, depth: usize) {
     let mut levels: Vec<usize> = Vec::new();
-    for raw in block.lines() {
+    let mut after_list = false;
+    for raw in block {
         let line = raw.strip_prefix("  ").unwrap_or(raw);
         let text = line.trim_start();
         if text.is_empty() {
@@ -569,18 +577,45 @@ fn push_fields_block(out: &mut String, block: &str) {
         }
         let indent = line.len() - text.len();
         if let Some(item) = field_item(text) {
+            if after_list {
+                out.push('\n');
+                after_list = false;
+            }
             while levels.last().is_some_and(|&i| i > indent) {
                 levels.pop();
             }
             if levels.last() != Some(&indent) {
                 levels.push(indent);
             }
-            out.push_str(&format!("{}- {item}\n", "  ".repeat(levels.len())));
+            let pad = "  ".repeat(depth + levels.len() - 1);
+            out.push_str(&format!("{pad}- {item}\n"));
         } else if levels.last().is_some_and(|&i| indent > i) {
-            out.push_str(&format!("{}{text}\n", "  ".repeat(levels.len() + 1)));
+            let pad = "  ".repeat(depth + levels.len());
+            out.push_str(&format!("{pad}{text}\n"));
         } else {
-            levels.clear();
-            out.push_str(&format!("\n  {text}\n\n"));
+            let pad = "  ".repeat(depth);
+            if !levels.is_empty() {
+                levels.clear();
+                out.push('\n');
+                after_list = true;
+            }
+            out.push_str(&format!("{pad}{text}\n"));
+        }
+    }
+    if after_list {
+        out.push('\n');
+    }
+}
+
+fn push_desc(out: &mut String, desc: &str) {
+    let mut lines = desc.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with(' ') && field_item(line.trim_start()).is_some() {
+            let block = iter::from_fn(|| lines.next_if(|l| l.starts_with(' ')));
+            push_fields_block(out, iter::once(line).chain(block), 0);
+        } else {
+            out.push_str(line);
+            out.push('\n');
         }
     }
 }
@@ -590,26 +625,41 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
         DocKind::Table => (module.name, '.'),
         DocKind::Class => (instance_name(module), ':'),
     };
-    let sig = format!("{owner}{sep}{}({})", f.name, f.args);
+    let path = format!("{owner}{sep}{}", f.name);
+    let sig = if f.value {
+        path.clone()
+    } else {
+        format!("{path}({})", f.args)
+    };
     if compact {
         out.push_str(&format!("### `{sig}`\n\n"));
     } else {
-        let title = format!("{owner}{sep}{}()", f.name);
+        let title = if f.value { path } else { format!("{path}()") };
         let id = slug(&title);
         out.push_str(&format!(
             "### `{title}` {{#{id}}}\n\n```lua\n{sig}\n```\n\n"
         ));
     }
     if !f.desc.is_empty() {
-        out.push_str(f.desc);
-        out.push_str("\n\n");
+        push_desc(out, f.desc);
+        out.push('\n');
     }
     if let Some(guard) = f.guard {
+        let keys = guard
+            .iter()
+            .map(|perm| format!("`{perm}`"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let noun = if guard.len() == 1 {
+            "permission"
+        } else {
+            "permissions"
+        };
         if compact {
-            out.push_str(&format!("Requires the `{guard}` plugin permission.\n\n"));
+            out.push_str(&format!("Requires the {keys} plugin {noun}.\n\n"));
         } else {
             out.push_str(&format!(
-                "Requires the `{guard}` [plugin permission](#{PERMISSIONS_ANCHOR}).\n\n"
+                "Requires the {keys} [plugin {noun}](#{PERMISSIONS_ANCHOR}).\n\n"
             ));
         }
     }
@@ -622,7 +672,7 @@ fn push_fn(out: &mut String, module: &ModuleDoc, f: &FnDoc, classes: &ClassLinks
                 p.name,
                 link_ty(p.ty, classes)
             ));
-            push_fields_block(out, rest);
+            push_fields_block(out, rest.lines(), 1);
         }
         out.push('\n');
     }
@@ -696,8 +746,8 @@ fn render(compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, reference, reference_index,
-        site_page, skeleton, skill_content,
+        AGENT_NOTES, PERMISSIONS_ANCHOR, REFERENCE_URL, guide_page, push_desc, push_fields_block,
+        reference, reference_index, site_page, skeleton, skill_content,
     };
 
     const AGENT_VOICE: &str = "ask the user";
@@ -708,6 +758,23 @@ mod tests {
     fn skeleton_keeps_public_surface_only() {
         let expected = "-- Header line one.\n-- Header line two.\nM.CONST = \"x\"\n\n-- Doc for pub.\nfunction M.pub(a, b)\nfunction M:method()\n";
         assert_eq!(skeleton(MODULE), expected);
+    }
+
+    #[test]
+    fn desc_field_blocks_render_as_nested_lists() {
+        let desc = "Intro.\n\n{spec} fields:\n  `a` (string) First\n          wraps.\n  `b` (table) Holds:\n    `c` (integer) Inner.\n  `d` (boolean) Last.\n\nOutro.";
+        let expected = "Intro.\n\n{spec} fields:\n- `a` (`string`) First\n  wraps.\n- `b` (`table`) Holds:\n  - `c` (`integer`) Inner.\n- `d` (`boolean`) Last.\n\nOutro.\n";
+        let mut out = String::new();
+        push_desc(&mut out, desc);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn wrapped_param_text_stays_one_paragraph() {
+        let rest = "  ctx, for the model's stop.\n  More words.";
+        let mut out = String::new();
+        push_fields_block(&mut out, rest.lines(), 1);
+        assert_eq!(out, "  ctx, for the model's stop.\n  More words.\n");
     }
 
     #[test]

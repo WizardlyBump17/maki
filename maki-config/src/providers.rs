@@ -1,8 +1,10 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +19,8 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
-const LOCAL_OVERLAY_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+const LOCAL_ENDPOINT_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+pub const BASE_URL_ENV_SUFFIX: &str = "_BASE_URL";
 
 /// Where the last parse came from and what the file looked like then. The
 /// config path follows the project directory, so one process can read more
@@ -27,15 +30,25 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// The parse of `providers.toml`, kept until the file changes.
 /// [`ProvidersConfig::load`] runs on nearly every model resolution, and once
 /// per row while the model picker builds its list, so without this each of
-/// those costs a read plus a full TOML parse.
-static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
+/// those costs a read plus a full TOML parse. A broken file is kept too, so a
+/// caller that polls it parses and reports it once per edit.
+static PARSED: Mutex<Option<(FileStamp, Result<ProvidersConfig, String>)>> = Mutex::new(None);
 
-/// Coarse capability classification used by maki-providers to dispatch tiered
-/// requests. Mirrors `maki_providers::ModelTier` shape but lives here so the
-/// config layer can validate inputs without depending on maki-providers.
+/// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
+const TOP_P_MIN: f64 = 0.0;
+const TOP_P_MAX: f64 = 1.0;
+
+/// The role a model plays, which is what tiered requests dispatch on. Lives
+/// here rather than in maki-providers so `providers.toml` can name it.
+///
+/// Ordering is a cost guarantee (a subagent may never run on a pricier tier
+/// than its parent), so the strength is written down in [`ModelTier::strength`]
+/// instead of being inherited from declaration order, where inserting or moving
+/// a variant would silently redefine "stronger". `Ord` stays because the tier is
+/// also a `BTreeMap` key in `model_registry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Tier {
+pub enum ModelTier {
     Weak,
     #[default]
     Medium,
@@ -43,11 +56,79 @@ pub enum Tier {
     Compaction,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
+pub struct InvalidTier(String);
+
+impl ModelTier {
+    /// `Compaction` is not a capability tier: it is a user-assigned slot for the
+    /// cheap model that rewrites history. It therefore ranks below every agent
+    /// tier, which makes it the tightest ceiling a parent can impose - a session
+    /// on a compaction model hands its children that same model rather than
+    /// letting them escalate to a capability tier.
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Compaction => 0,
+            Self::Weak => 1,
+            Self::Medium => 2,
+            Self::Strong => 3,
+        }
+    }
+
+    /// The single named way to cap a requested tier, so no call site re-derives
+    /// the cost rule with an ad-hoc comparison.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        if self.strength() <= ceiling.strength() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
+impl Ord for ModelTier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.strength().cmp(&other.strength())
+    }
+}
+
+impl PartialOrd for ModelTier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Weak => "weak",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+            Self::Compaction => "compaction",
+        })
+    }
+}
+
+impl FromStr for ModelTier {
+    type Err = InvalidTier;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "weak" => Ok(Self::Weak),
+            "medium" => Ok(Self::Medium),
+            "strong" => Ok(Self::Strong),
+            "compaction" => Ok(Self::Compaction),
+            other => Err(InvalidTier(other.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelDef {
     pub id: String,
     #[serde(default)]
-    pub tier: Tier,
+    pub tier: ModelTier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,7 +239,7 @@ pub struct BuiltInProvider {
     pub protocol: Protocol,
     pub default_base_url: &'static str,
     pub default_api_key_env: &'static str,
-    pub default_model: &'static str,
+    pub default_model: Option<&'static str>,
     pub plans: Option<&'static [(&'static str, ProviderPlan)]>,
     pub login_url: Option<&'static str>,
     /// Whether the login flow should prompt for a base URL (e.g. local inference servers).
@@ -167,7 +248,12 @@ pub struct BuiltInProvider {
 
 inventory::collect!(BuiltInProvider);
 
+/// Login rows of Lua plugin providers. They show up at runtime, too late for
+/// `inventory`, so they live here and every lookup checks both.
+static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverrideFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
@@ -190,6 +276,7 @@ pub struct OverrideFields {
 /// `zai`, `ollama`, `ikora-openai`). Provider-level fields apply to every model
 /// from that provider; `models` refine individual models.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderOverride {
     #[serde(flatten)]
     pub default: OverrideFields,
@@ -197,12 +284,24 @@ pub struct ProviderOverride {
     pub models: HashMap<String, OverrideFields>,
 }
 
+/// Every struct in a provider entry refuses unknown keys. Otherwise a key maki
+/// never reads, like `drop_params` or a typo'd `api_key_evn`, parses fine and
+/// quietly does nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderDef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Protocol>,
+    /// Legacy v0.6.4 `plugin =` selection, parsed so the slug stays owned and
+    /// the user is told to migrate. Not used for selection.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_plugin"
+    )]
+    pub plugin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +312,15 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Nucleus sampling threshold sent as `top_p` in the request body to this
+    /// provider. When unset, no `top_p` is sent (the provider's own default
+    /// applies). Must be in `(0, 1]`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_top_p"
+    )]
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -240,6 +348,12 @@ pub struct ProviderDef {
     /// price as a reference; see [`maki_providers::Model::subsidised_by`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subsidised_by: Option<String>,
+    /// Whether the endpoint expands `tool_reference` blocks into
+    /// `defer_loading` definitions, so a deferred MCP tool loads without
+    /// rewriting the cached tools prefix. Unset falls back to the built-in
+    /// row at its own URL, `false` for a custom slug or another `base_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_deferred_tools: Option<bool>,
     /// Opencode-only: when `Some(false)`, free catalog models are hidden
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,10 +386,7 @@ impl ProvidersConfig {
     /// Same read, but a typo only costs the answer. For callers past startup,
     /// where taking the process down mid-session is never the right trade.
     pub fn load_or_default() -> Self {
-        Self::read().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "ignoring providers.toml");
-            Self::default()
-        })
+        Self::read().unwrap_or_default()
     }
 
     fn read() -> Result<Self, String> {
@@ -290,10 +401,10 @@ impl ProvidersConfig {
         };
         let stamp = (path, meta.modified().ok(), meta.len());
         let mut parsed = PARSED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached, config)) = parsed.as_ref()
+        if let Some((cached, result)) = parsed.as_ref()
             && *cached == stamp
         {
-            return Ok(config.clone());
+            return result.clone();
         }
         let content = match fs::read_to_string(&stamp.0) {
             Ok(c) => c,
@@ -302,11 +413,12 @@ impl ProvidersConfig {
                 return Ok(Self::default());
             }
         };
-        let config = toml::from_str::<ProvidersConfig>(&content)
-            .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))?;
-        debug!(path = %stamp.0.display(), "loaded providers config");
-        *parsed = Some((stamp, config.clone()));
-        Ok(config)
+        let result = toml::from_str::<ProvidersConfig>(&content)
+            .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))
+            .inspect(|_| debug!(path = %stamp.0.display(), "loaded providers config"))
+            .inspect_err(|e| tracing::warn!(error = %e, "cannot use providers.toml"));
+        *parsed = Some((stamp, result.clone()));
+        result
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
@@ -337,24 +449,33 @@ impl ProvidersConfig {
     }
 }
 
-/// The `providers.toml` we already read, or where a fresh one goes. Both share
-/// this path so `save` cannot leave a second copy behind in the other dir.
+/// The `providers.toml` we already read, or where a fresh one goes; one file
+/// under the config dir is both.
 fn providers_file_path() -> PathBuf {
-    paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
-        paths::config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(PROVIDERS_FILE)
-    })
+    paths::config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(PROVIDERS_FILE)
+}
+
+pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
+    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = rows;
 }
 
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
     inventory::iter::<BuiltInProvider>()
         .into_iter()
         .find(|p| p.slug == slug)
+        .or_else(|| {
+            let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+            registered.iter().copied().find(|p| p.slug == slug)
+        })
 }
 
 pub fn all_builtins() -> Vec<&'static BuiltInProvider> {
-    inventory::iter::<BuiltInProvider>().collect()
+    let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    inventory::iter::<BuiltInProvider>()
+        .chain(registered.iter().copied())
+        .collect()
 }
 
 pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
@@ -372,7 +493,10 @@ pub fn resolve_api_key_env(slug: &str, def: Option<&ProviderDef>) -> String {
 /// The `<SLUG>_BASE_URL` env var name (e.g. `anthropic` -> `ANTHROPIC_BASE_URL`,
 /// `llama-cpp` -> `LLAMA_CPP_BASE_URL`).
 pub fn base_url_env_var(slug: &str) -> String {
-    format!("{}_BASE_URL", slug.to_uppercase().replace('-', "_"))
+    format!(
+        "{}{BASE_URL_ENV_SUFFIX}",
+        slug.to_uppercase().replace('-', "_")
+    )
 }
 
 /// The `<SLUG>_BASE_URL` override, or `None` when unset or empty.
@@ -386,14 +510,13 @@ pub fn base_url_override(slug: &str) -> Option<String> {
 /// that already carry a default (the openai-compat layer, whose static default
 /// can be more specific than the inventory one) use this.
 pub fn configured_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
-    if let Some(url) = base_url_override(slug) {
-        return Some(url);
-    }
-    let def = def?;
-    if let Some(url) = &def.base_url {
-        return Some(url.clone());
-    }
-    let plan_name = def.plan.as_ref()?;
+    base_url_override(slug)
+        .or_else(|| def?.base_url.clone())
+        .or_else(|| plan_base_url(slug, def))
+}
+
+pub fn plan_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String> {
+    let plan_name = def?.plan.as_ref()?;
     builtin_provider(slug)?
         .plans?
         .iter()
@@ -406,18 +529,13 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
         .or_else(|| builtin_provider(slug).map(|b| b.default_base_url.to_string()))
 }
 
-/// Whether a built-in slug reads the thinking keys (`supports_thinking`,
-/// `requires_thinking`, `thinking_fields`) of its `providers.toml` models.
-/// Only the local endpoints do, and only those keys: everything else about
-/// them stays compiled in, so an `OLLAMA_HOST` setup can describe how its
-/// models think without a second slug and without touching auth wiring.
-///
-/// The list is the slugs whose request path merges those keys into the body,
-/// not every slug that serves models we cannot know (`google`, `copilot` and
-/// `mistral` also accept arbitrary models, but their paths would drop the
-/// keys on the floor). It grows when a path learns to read them.
-pub fn overlays_local_thinking(slug: &str) -> bool {
-    LOCAL_OVERLAY_SLUGS.contains(&slug)
+/// Whether a built-in slug runs on `LocalEndpoint`. Unlike the other built-ins
+/// it reads `protocol` and the model thinking keys (`supports_thinking`,
+/// `requires_thinking`, `thinking_fields`) from its `providers.toml` entry, so
+/// an `OLLAMA_HOST` setup can describe its models without a second slug. Auth
+/// and the rest of the model catalog stay compiled in.
+pub fn is_local_endpoint(slug: &str) -> bool {
+    LOCAL_ENDPOINT_SLUGS.contains(&slug)
 }
 
 /// The rest of a local `[[slug.models]]` entry, which still loses to the
@@ -428,7 +546,7 @@ pub fn overlays_local_thinking(slug: &str) -> bool {
 fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
     let any = |is_set: fn(&ModelDef) -> bool| models.iter().any(is_set);
     let mut ignored = Vec::new();
-    if any(|m| m.tier != Tier::default()) {
+    if any(|m| m.tier != ModelTier::default()) {
         ignored.push("models.tier");
     }
     if any(|m| m.context_window.is_some()) {
@@ -454,11 +572,19 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
 ///
-/// [`overlays_local_thinking`] slugs are the exception: their `models` table is
-/// half read, so only the keys nobody reads are named.
+/// [`is_local_endpoint`] slugs read part of their `models` table, so only the
+/// keys nobody reads are named. They also read `protocol`, but `LocalEndpoint`
+/// only branches on `openai-responses` and sends every other value over chat
+/// completions, so only `openai` and `openai-responses` are honored.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
+    let local = is_local_endpoint(slug);
+    let honored_protocol = local
+        && matches!(
+            def.protocol,
+            Some(Protocol::Openai | Protocol::OpenaiResponses)
+        );
     let mut ignored = Vec::new();
-    if def.protocol.is_some() {
+    if def.protocol.is_some() && !honored_protocol {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
@@ -468,7 +594,7 @@ pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str
         ignored.push("discover_models");
     }
     if !def.models.is_empty() {
-        if overlays_local_thinking(slug) {
+        if local {
             ignored.extend(ignored_local_model_fields(&def.models));
         } else {
             ignored.push("models");
@@ -518,7 +644,7 @@ pub fn resolve_default_model(slug: &str, def: Option<&ProviderDef>) -> Option<St
             }
         }
     }
-    builtin_provider(slug).map(|b| b.default_model.to_string())
+    builtin_provider(slug)?.default_model.map(str::to_owned)
 }
 
 pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
@@ -535,6 +661,45 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
         }
     }
     builtin_provider(slug).and_then(|b| b.login_url.map(|u| u.to_string()))
+}
+
+/// The `top_p` configured for `slug`. Read with `load_or_default` so a
+/// mid-session typo in `providers.toml` degrades to the default instead of
+/// taking the process down.
+pub fn top_p_for(slug: &str) -> Option<f64> {
+    ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.top_p)
+}
+
+fn de_plugin<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(de)?;
+    if let Some(name) = &value
+        && (name.is_empty() || name.trim() != name)
+    {
+        return Err(serde::de::Error::custom(
+            "plugin must name an owner without surrounding whitespace",
+        ));
+    }
+    Ok(value)
+}
+
+fn de_top_p<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(de)?;
+    if let Some(v) = value
+        && (v.is_nan() || v <= TOP_P_MIN || v > TOP_P_MAX)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "top_p must be in ({TOP_P_MIN}, {TOP_P_MAX}], got {v}"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -596,6 +761,22 @@ mod tests {
         assert_eq!(def.enable_free_models, None);
     }
 
+    #[test]
+    fn legacy_plugin_selection_parses() {
+        let config: ProvidersConfig =
+            toml::from_str("[my-slug]\nplugin = \"my-package\"\n").unwrap();
+        assert_eq!(
+            config.get("my-slug").unwrap().plugin.as_deref(),
+            Some("my-package")
+        );
+    }
+
+    #[test]
+    fn legacy_plugin_selection_rejects_empty_or_padded_name() {
+        assert!(toml::from_str::<ProvidersConfig>("[slug]\nplugin = \"\"\n").is_err());
+        assert!(toml::from_str::<ProvidersConfig>("[slug]\nplugin = \" padded\"\n").is_err());
+    }
+
     const UNKNOWN_TIER_TOML: &str = r#"id = "x"
 tier = "mediums"
 "#;
@@ -607,17 +788,42 @@ tier = "mediums"
         assert!(msg.contains("medium"), "expected enum hint, got: {msg}");
     }
 
+    #[test_case("[litellm]\nprotocol = \"openai\"\ndrop_params = true\n", "drop_params" ; "provider_key")]
+    #[test_case("[litellm]\nprotocol = \"openai\"\n[[litellm.models]]\nid = \"m\"\ncontext_windw = 1\n", "context_windw" ; "model_key")]
+    #[test_case("[aperture.overrides.zai]\nbsae = \"zai\"\n", "bsae" ; "override_provider_key")]
+    #[test_case("[aperture.overrides.zai.models.glm]\npath_prefx = \"\"\n", "path_prefx" ; "override_model_key")]
+    fn an_unknown_key_fails_the_parse_and_names_itself(toml_src: &str, key: &str) {
+        let error = toml::from_str::<ProvidersConfig>(toml_src)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(key), "{error}");
+    }
+
+    /// serde does not promise `deny_unknown_fields` works with `flatten`, and
+    /// `ProviderOverride` uses both. This checks real keys still get through.
+    #[test]
+    fn override_keys_parse_at_provider_and_model_level() {
+        let config: ProvidersConfig = toml::from_str(
+            "[aperture.overrides.zai]\nbase = \"zai\"\n\
+             [aperture.overrides.zai.models.glm]\npath_prefix = \"\"\n",
+        )
+        .unwrap();
+        let zai = &config.get("aperture").unwrap().overrides["zai"];
+        assert_eq!(zai.default.base.as_deref(), Some("zai"));
+        assert_eq!(zai.models["glm"].path_prefix.as_deref(), Some(""));
+    }
+
     #[test]
     fn model_def_tier_defaults_to_medium() {
         let m: ModelDef = toml::from_str(r#"id = "x""#).unwrap();
-        assert_eq!(m.tier, Tier::Medium);
+        assert_eq!(m.tier, ModelTier::Medium);
     }
 
-    #[test_case("weak", Tier::Weak ; "weak")]
-    #[test_case("medium", Tier::Medium ; "medium")]
-    #[test_case("strong", Tier::Strong ; "strong")]
-    #[test_case("compaction", Tier::Compaction ; "compaction")]
-    fn model_def_tier_roundtrip(input: &str, expected: Tier) {
+    #[test_case("weak", ModelTier::Weak ; "weak")]
+    #[test_case("medium", ModelTier::Medium ; "medium")]
+    #[test_case("strong", ModelTier::Strong ; "strong")]
+    #[test_case("compaction", ModelTier::Compaction ; "compaction")]
+    fn model_def_tier_roundtrip(input: &str, expected: ModelTier) {
         let toml = format!(
             r#"id = "x"
 tier = "{input}"
@@ -625,6 +831,69 @@ tier = "{input}"
         );
         let m: ModelDef = toml::from_str(&toml).unwrap();
         assert_eq!(m.tier, expected);
+    }
+
+    const TIERS: [ModelTier; 4] = [
+        ModelTier::Weak,
+        ModelTier::Medium,
+        ModelTier::Strong,
+        ModelTier::Compaction,
+    ];
+
+    /// Declaration index of `Compaction`, which a derived `Ord` would read as
+    /// the strongest tier.
+    const COMPACTION_DECLARED_LAST: u8 = 3;
+
+    #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
+    #[test_case(ModelTier::Weak, ModelTier::Strong, ModelTier::Weak ; "weak_child_stays_weak_under_strong_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Medium, ModelTier::Medium ; "equal_tiers_pass_through")]
+    #[test_case(ModelTier::Strong, ModelTier::Compaction, ModelTier::Compaction ; "strong_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Medium, ModelTier::Compaction, ModelTier::Compaction ; "medium_child_capped_to_compaction_parent")]
+    #[test_case(ModelTier::Compaction, ModelTier::Strong, ModelTier::Compaction ; "compaction_child_is_not_escalated")]
+    fn capped_at_never_exceeds_ceiling(
+        requested: ModelTier,
+        ceiling: ModelTier,
+        expected: ModelTier,
+    ) {
+        assert_eq!(requested.capped_at(ceiling), expected);
+        assert!(requested.capped_at(ceiling) <= ceiling);
+    }
+
+    #[test]
+    fn every_tier_under_a_compaction_ceiling_stays_at_compaction() {
+        for tier in TIERS {
+            assert_eq!(tier.capped_at(ModelTier::Compaction), ModelTier::Compaction);
+        }
+    }
+
+    /// Fails if the variants get reordered (the hand-written strength table
+    /// would no longer be the thing that disagrees with declaration order) or if
+    /// the explicit `Ord` is ever replaced by a derive, which would rank
+    /// `Compaction` above `Strong` and turn the subagent cap into a no-op.
+    #[test]
+    fn tier_order_is_explicit_not_declaration_order() {
+        assert_eq!(ModelTier::Compaction as u8, COMPACTION_DECLARED_LAST);
+        assert!(ModelTier::Compaction < ModelTier::Weak);
+
+        let mut tiers = TIERS;
+        tiers.sort();
+        assert_eq!(
+            tiers,
+            [
+                ModelTier::Compaction,
+                ModelTier::Weak,
+                ModelTier::Medium,
+                ModelTier::Strong
+            ]
+        );
+    }
+
+    #[test]
+    fn tier_display_roundtrip() {
+        for tier in TIERS {
+            assert_eq!(tier.to_string().parse::<ModelTier>().unwrap(), tier);
+        }
+        assert!("turbo".parse::<ModelTier>().is_err());
     }
 
     #[test_case("anthropic", None => "ANTHROPIC_API_KEY".to_string(); "builtin_default")]
@@ -739,6 +1008,21 @@ tier = "{input}"
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
     }
 
+    #[test_case("ollama", Protocol::OpenaiResponses, Vec::new() ; "local_honors_responses")]
+    #[test_case("llama-cpp", Protocol::Openai, Vec::new() ; "local_honors_completions")]
+    #[test_case("ollama", Protocol::Anthropic, vec!["protocol"] ; "local_warns_on_other_wires")]
+    fn ignored_builtin_fields_on_local_protocol(
+        slug: &str,
+        protocol: Protocol,
+        expected: Vec<&str>,
+    ) {
+        let def = ProviderDef {
+            protocol: Some(protocol),
+            ..ProviderDef::default()
+        };
+        assert_eq!(ignored_builtin_fields(slug, &def), expected);
+    }
+
     /// The literal below stops compiling when [`ModelDef`] grows a field, which
     /// is the one reminder to decide what a local slug does with it: read it in
     /// the overlay, or name it here as dropped. Otherwise the warning slowly
@@ -747,7 +1031,7 @@ tier = "{input}"
     fn every_model_def_field_is_read_or_reported() {
         let every_field_set = ModelDef {
             id: "qwen".to_string(),
-            tier: Tier::Strong,
+            tier: ModelTier::Strong,
             context_window: Some(131_072),
             max_output_tokens: Some(8192),
             supports_tool_examples: Some(true),
@@ -782,6 +1066,30 @@ tier = "{input}"
     fn thinking_level_keys_are_checked_at_parse(fields: &str, parses: bool) {
         let entry = format!(r#"models = [{{ id = "m", thinking_fields = {fields} }}]"#);
         assert_eq!(toml::from_str::<ProviderDef>(&entry).is_ok(), parses);
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-0.1; "negative")]
+    #[test_case(1.5; "above_one")]
+    fn top_p_out_of_range_rejected(value: f64) {
+        let res = toml::from_str::<ProviderDef>(&format!("top_p = {value}"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn top_p_nan_rejected() {
+        let err = toml::from_str::<ProviderDef>("top_p = nan")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("top_p must be in"), "{err}");
+    }
+
+    #[test]
+    fn top_p_boundaries_accepted() {
+        let def: ProviderDef = toml::from_str("top_p = 1.0").unwrap();
+        assert_eq!(def.top_p, Some(1.0));
+        let def2: ProviderDef = toml::from_str(&format!("top_p = {}", f64::MIN_POSITIVE)).unwrap();
+        assert!(def2.top_p.unwrap() > 0.0);
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

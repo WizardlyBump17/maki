@@ -28,8 +28,8 @@ maki.setup({
         mouse_scroll_lines = 5,
         theme = "tokyonight",
         tool_output_lines = {
-            bash = 8,
-            read = 5,
+            bash = 6,
+            read = 2,
         },
     },
     agent = {
@@ -66,7 +66,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
-| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `always_thinking` | bool \| string | `none` | Pin the thinking level of every new session: true/"adaptive", false/"off", "minimal" to "max", or a token budget. Unset, new sessions start at the last `/thinking` level |
 
 ### `ui`
 
@@ -75,23 +75,34 @@ All fields are optional. Typos in field names cause an error right away.
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
-| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
+| `notifications` | string | `auto` | - | Notification method: auto, osc9, bell, notify, or off |
+| `program_status` | bool | `true` | - | Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501 |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
-| `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
+| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH) |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
-| `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 
 ### `ui.theme`
 
 Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
 
-Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
+To match a light or dark terminal, give a theme for each:
+
+```lua
+theme = { light = "catppuccin_latte", dark = "catppuccin_macchiato" }
+```
+
+Maki asks the terminal for its background color once at startup, and uses `dark` if it gets no answer. Restart Maki after your terminal switches between light and dark.
+
+Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `system`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
+
+The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.
 
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 
@@ -101,33 +112,36 @@ These work everywhere a hex value does, including syntax highlighting scopes, so
 
 ### `ui.tool_output_lines`
 
-How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1.
+Lines of output a tool call shows before it collapses. Click the call to see all of it.
 
-| Field | Default |
-|-------|---------|
-| `bash` | 5 |
-| `code_execution` | 5 |
-| `task` | 5 |
-| `index` | 3 |
-| `grep` | 3 |
-| `read` | 3 |
-| `write` | 7 |
-| `web` | 3 |
-| `other` | 3 |
+With 0 you see only the header. The read, index and list tools default to 0, because their header already says how many lines or entries came back. Errors and MCP tools still show their first line.
+
+| Field | Default | Tools |
+|-------|---------|-------|
+| `bash` | 3 | bash |
+| `code_execution` | 3 | code_execution |
+| `task` | 3 | task |
+| `index` | 0 | index |
+| `grep` | 3 | glob, grep |
+| `read` | 0 | list, read |
+| `write` | 5 | edit, edit_lines, insert_lines, memory, multiedit, write |
+| `web` | 3 | webfetch, websearch |
+| `other` | 3 | Every other tool, MCP tools included |
 
 ### `agent`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
-| `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
+| `max_output_bytes` | usize | `51200` | 1024 | Max bytes of tool output the model sees |
+| `max_output_lines` | usize | `2000` | 10 | Max lines of tool output the model sees |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `max_turn_output` | u32 | `32768` | 1024 | Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
-| `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `rtk` | bool | `true` | - | Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `shell` | string | `auto` | - | Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash if installed, else `cmd.exe`), `cmd`, or a path to an executable |
 
 ### `provider`
 
@@ -185,6 +199,31 @@ maki.setup({
 
 `paths` is a list of globs matched against the project root, empty by default. `prompt` is a bool, `true` by default. Setting it to `false` drops the startup card and leaves the folder restricted unless a `paths` entry matches. [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax and which run modes apply the policy.
 
+### `instructions`
+
+Which instruction files Maki loads from each project directory. Read from the global `~/.config/maki/init.lua` only, since a project file that could pick its own instructions would be trusting itself.
+
+`files` replaces the built-in list (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and friends) with your own, in priority order. An empty list loads no project instruction files at all, and `AGENTS.local.md` still loads:
+
+```lua
+maki.setup({
+    instructions = { files = { "CLAUDE.md" } },
+})
+```
+
+`overrides` narrows it per checkout, for when one repository wants a different answer. Each entry matches a checkout by `path` (a glob against the project root, `~` included, like `trust.paths`) or by `remote` (a glob against every git remote URL of the project, normalized to `host/path`: `https://host/a/b.git` and `git@host:a/b.git` both become `host/a/b`). When both are set, both must match; an entry with neither matches every project. The first matching entry wins, and one that sets no `files` still ends the search, keeping the global `files`:
+
+```lua
+maki.setup({
+    instructions = {
+        overrides = {
+            { remote = "github.com/example/*", files = {} },
+            { path = "~/src/secret", files = { "CLAUDE.md" } },
+        },
+    },
+})
+```
+
 ### `telemetry`
 
 | Field | Type | Default | Env | Description |
@@ -192,26 +231,24 @@ maki.setup({
 | `enabled` | bool | `false` | `MAKI_ENABLE_TELEMETRY` | Master switch |
 | `metrics_exporter` | string | `none` | `OTEL_METRICS_EXPORTER` | Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix |
 | `logs_exporter` | string | `none` | `OTEL_LOGS_EXPORTER` | Where events go: `otlp`, `console`, `none`, or a comma-separated mix |
-| `protocol` | string | `-` | `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp` |
-| `endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs` |
-| `headers` | table | `{}` | `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers sent with every export |
-| `timeout_ms` | integer | `10000` | `OTEL_EXPORTER_OTLP_TIMEOUT` | Per-export request timeout (ms) |
+| `protocol` | string | `http/json` | `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json` |
+| `endpoint` | string | `http://localhost:4318` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. The gRPC default is `http://localhost:4317` |
+| `headers` | table | `{}` | `OTEL_EXPORTER_OTLP_HEADERS` | Headers sent with every export |
+| `timeout_ms` | integer | `10000` | `OTEL_EXPORTER_OTLP_TIMEOUT` | Deadline for one export, retries included (ms) |
 | `compression` | string | `none` | `OTEL_EXPORTER_OTLP_COMPRESSION` | Payload compression: `gzip` or `none` |
 | `metrics_protocol` | string | `-` | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | Metrics-only protocol override |
 | `metrics_endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-only endpoint, used verbatim with no path appended |
 | `metrics_headers` | table | `{}` | `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Metrics-only headers, merged over `headers` |
-| `metrics_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Metrics-only request timeout (ms) |
+| `metrics_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Metrics-only export deadline (ms) |
 | `logs_protocol` | string | `-` | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Logs-only protocol override |
 | `logs_endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Logs-only endpoint, used verbatim with no path appended |
 | `logs_headers` | table | `{}` | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | Logs-only headers, merged over `headers` |
-| `logs_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Logs-only request timeout (ms) |
+| `logs_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Logs-only export deadline (ms) |
 | `metrics_interval_ms` | integer | `60000` | `OTEL_METRIC_EXPORT_INTERVAL` | How often metrics are exported (ms) |
-| `metrics_export_timeout_ms` | integer | `30000` | `OTEL_METRIC_EXPORT_TIMEOUT` | Deadline for one metrics export, retries included (ms) |
-| `logs_interval_ms` | integer | `5000` | `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_BLRP_SCHEDULE_DELAY` | How often queued events are flushed (ms) |
-| `logs_max_queue_size` | integer | `2048` | `OTEL_BLRP_MAX_QUEUE_SIZE` | Event queue capacity. Events are dropped and counted when it is full |
+| `logs_interval_ms` | integer | `1000` | `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_BLRP_SCHEDULE_DELAY` | How often queued events are flushed (ms) |
+| `logs_max_queue_size` | integer | `2048` | `OTEL_BLRP_MAX_QUEUE_SIZE` | Event queue capacity, at most 65536. Events are dropped when it is full |
 | `logs_max_export_batch_size` | integer | `512` | `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE` | Maximum events per export request |
-| `logs_export_timeout_ms` | integer | `30000` | `OTEL_BLRP_EXPORT_TIMEOUT` | Deadline for one events export, retries included (ms) |
-| `metrics_temporality` | string | `delta` | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Metric temporality: `delta` or `cumulative` |
+| `metrics_temporality` | string | `delta` | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | Metric temporality: `cumulative`, `delta` or `lowmemory` |
 | `service_name` | string | `maki` | `OTEL_SERVICE_NAME` | `service.name` on the exported resource |
 | `resource_attributes` | table | `{}` | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, your place for team or environment labels |
 | `metrics_include_session_id` | bool | `true` | `OTEL_METRICS_INCLUDE_SESSION_ID` | Attach `session.id` to metrics. Turn off to keep metric cardinality low |
@@ -220,7 +257,7 @@ maki.setup({
 | `log_tool_details` | bool | `false` | `OTEL_LOG_TOOL_DETAILS` | Include tool input in `maki.tool_result` events. Off by default |
 | `content_max_length` | integer | `10240` | `MAKI_OTEL_CONTENT_MAX_LENGTH` | Character cap on any logged prompt or tool input |
 
-Every field also has an environment variable, shown in the Env column, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
+The Env column names the matching environment variable. For `enabled`, the exporters, `metrics_include_*`, `log_user_prompts`, `log_tool_details` and `content_max_length`, the variable wins. Every other field is passed to the OpenTelemetry SDK and wins over its variable. See [Telemetry](/docs/telemetry/) for the full picture.
 
 ## Plugins
 
@@ -247,6 +284,8 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `background_log_bytes` | integer | `33554432` | 1024 | Size at which the output log of a command rotates to `.log.1`. A command gets a log once its output outgrows the reply or it moves to the background. Values above 1 GiB count as 1 GiB. |
+| `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
@@ -280,13 +319,13 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
+| `search_result_limit` | integer | `100` | 10 | Max files the model sees per search. |
 
 ### `plugins.grep`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Skip lines longer than this many bytes. |
+| `max_line_bytes` | integer | `500` | 80 | Truncate lines the model sees at this many bytes. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
@@ -301,7 +340,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Truncate lines longer than this many bytes. |
+| `max_line_bytes` | integer | `500` | 80 | Truncate lines the model sees at this many bytes. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 
 ### `plugins.skill`
@@ -314,6 +353,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `allow_background` | boolean | `true` | - | Expose a `background` input that pushes subagent results to the chat when they finish. |
 | `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 
@@ -323,7 +363,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
+| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes, at most 64 MiB. |
 
 ### `plugins.websearch`
 
@@ -331,8 +371,9 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
-| `provider` | string | `"exa"` | - | Search backend: "exa" (default) or "youcom" (You.com MCP). |
+| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes, at most 64 MiB. |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), or "searxng" (self-hosted). |
+| `searxng_base_url` | string | `""` | - | SearXNG instance URL; falls back to the `SEARXNG_BASE_URL` env var. A LAN instance also needs its host in `net.allowed_private_hosts`. Only this backend accepts websearch's `time_range` (day, week, month, or year); its `num_results` is capped by the instance page size. |
 
 ## Validation
 
@@ -352,17 +393,19 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.maki/` (or `%USERPROFILE%\.maki\`) is the layout older versions used. Maki does not read it anymore.
 
-### Migrating from ~/.maki/
+### Moving from ~/.maki/
+
+Maki moves `~/.maki/` into the locations above on the first start that finds it, before it reads or writes anything else, and shows where the files went. Files maki writes go to state. Your own files (`init.lua`, `lua/`, `permissions.toml`, `mcp.toml`, `providers.toml`, `.env`, `AGENTS.md`, `pack-lock.json`, `commands/`, `skills/`, `themes/` and `providers/`) go to config. Logs go to logs. Caches are rebuilt.
+
+When both places hold the same file, folder trust and recent models are merged. For any other file maki keeps the copy written last and moves the other one to `~/.maki.bak/`. The exception is `permissions.toml`: older versions applied the one in `~/.config/maki/`, so that one stays.
+
+Maki does not move a `~/.maki/` that is a symlink, because it most likely points into a dotfiles repository. Run the move yourself, or retry one that failed, with:
 
 ```
 maki migrate xdg
 ```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 
@@ -370,6 +413,7 @@ On top of the project instruction files Maki loads from the git root down to the
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `instructions.files` in the global `init.lua` to replace the project file list, scoped per checkout with `instructions.overrides` (see [`instructions`](#instructions))
 
 All of these are added to the system prompt at the start of every session.
 

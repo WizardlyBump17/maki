@@ -1,11 +1,36 @@
 use crate::terminal;
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
-use arboard::{LinuxClipboardKind, SetExtLinux};
+use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 
 pub(crate) enum CopyResult {
     Copied,
     Noop,
+}
+
+/// Reads the PRIMARY selection, the one middle-click pastes. Only Linux has
+/// one, and on Wayland only when the compositor offers it. Blocks until the
+/// app owning the selection answers, so never call it on the UI thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_primary_selection() -> Option<String> {
+    let mut clipboard = Clipboard::new().ok()?;
+    let text = clipboard
+        .get()
+        .clipboard(LinuxClipboardKind::Primary)
+        .text()
+        .ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_primary_selection() -> Option<String> {
+    None
+}
+
+/// Blocks, so never call it on the UI thread.
+pub(crate) fn read_text() -> Option<String> {
+    let text = Clipboard::new().ok()?.get_text().ok()?;
+    (!text.is_empty()).then_some(text)
 }
 
 pub(crate) struct ClipboardState {
@@ -17,6 +42,13 @@ impl ClipboardState {
         Self {
             native: Clipboard::new().ok(),
         }
+    }
+
+    /// Copies through the terminal alone, so a test never writes to the
+    /// desktop's clipboard.
+    #[cfg(test)]
+    pub(crate) fn terminal_only() -> Self {
+        Self { native: None }
     }
 
     pub(crate) fn copy_text(&mut self, text: &str) -> Result<CopyResult, String> {

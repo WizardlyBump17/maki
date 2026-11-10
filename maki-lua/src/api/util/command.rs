@@ -1,21 +1,35 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::SharedBuf;
+use maki_agent::agent::SessionExport;
+use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
+use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
+use crate::api::ui::marks::Mark;
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
+use crate::plugin_permissions::{Permission, PluginReach};
 
-pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) const PLUGIN_LOADING_ERR: &str =
+    "not available while a plugin loads: call it from a callback";
 
+/// Text in the chat input is what the user's Enter sends.
+const EDITS_TEXT: &[Permission] = &[
+    Permission::Input,
+    Permission::Agent,
+    Permission::SessionWrite,
+];
 const ROW_REFINE: &str = "refine";
 const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
 const ROW_IMPLEMENT: &str = "implement";
@@ -25,6 +39,10 @@ pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
+    /// The handler runs with this, so a plugin calling it through
+    /// `maki.api.run_command` must reach as far. Otherwise it could borrow
+    /// this plugin's reach and pick the arguments.
+    pub reach: PluginReach,
     pub max_args: usize,
 }
 
@@ -82,12 +100,37 @@ impl LuaCommandWriter {
     }
 }
 
-pub type HintEntries = Vec<(Arc<str>, Vec<(String, String)>)>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct HintEntry {
+    pub plugin: Arc<str>,
+    /// `None` shows in every tab.
+    pub session: Option<MakiId>,
+    pub spans: Vec<(String, String)>,
+}
+
+pub type HintEntries = Vec<HintEntry>;
 
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
     pub generation: u64,
+}
+
+impl HintSnapshot {
+    /// A plugin's hint for this session takes the place of its every-tab
+    /// hint here. A plugin often sets both, one from a keymap and one from a
+    /// tool call, and the tab would show it twice otherwise.
+    pub fn visible_in(&self, session: MakiId) -> impl Iterator<Item = &HintEntry> {
+        self.entries
+            .iter()
+            .filter(move |entry| match entry.session {
+                Some(owner) => owner == session,
+                None => !self
+                    .entries
+                    .iter()
+                    .any(|other| other.plugin == entry.plugin && other.session == Some(session)),
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -135,6 +178,7 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub reach: PluginReach,
     pub max_args: usize,
 }
 
@@ -148,6 +192,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 name: Arc::clone(name),
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
+                reach: entry.reach.clone(),
                 max_args: entry.max_args,
             })
         })
@@ -431,12 +476,18 @@ pub enum SessionRequest {
     Current,
     /// UI-mode fallback for `maki.session.read` when no snapshot slot is
     /// installed — the UI resolves the id and returns a `session_snapshot_json`
-    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
-    /// so `read` doesn't need a UI.
+    /// payload, or [`crate::SessionSnapshot::stored`] for an id no tab has
+    /// open. Headless drivers install a `SessionSnapshotSlot` instead so
+    /// `read` doesn't need a UI.
     Read {
         id: Option<String>,
     },
+    /// {transcript} is parsed but not validated yet. The UI lays it over the
+    /// focused tab's blank session, the one place that decides a new
+    /// session's defaults, and answers what is wrong with it. Without
+    /// {prompt} or {focus} it is only stored, otherwise it opens in a tab.
     New {
+        transcript: Box<Transcript>,
         prompt: Option<String>,
         focus: bool,
     },
@@ -466,6 +517,8 @@ pub enum SessionRequest {
 pub enum TaskRequest {
     List,
     Focus { id: String },
+    Remove { id: String },
+    Stop { id: String, session: String },
 }
 
 pub enum ModelRequest {
@@ -567,27 +620,79 @@ pub struct PlanMenu {
 
 /// Offsets are flat byte counts into the whole input, newlines counted as one
 /// byte each, because Lua indexes strings by byte.
-#[derive(Default)]
-pub struct InputEdit {
+#[derive(Debug)]
+pub struct TextEdit {
     pub start: usize,
     pub stop: usize,
     pub text: String,
-    /// Where to leave the cursor, the end of {text} when absent.
+}
+
+impl TextEdit {
+    pub fn changes_text(&self) -> bool {
+        self.start != self.stop || !self.text.is_empty()
+    }
+}
+
+pub struct InputEdit {
+    /// All planned against the value at {version}, and applied together as
+    /// one change.
+    pub edits: Vec<TextEdit>,
+    /// Where to leave the cursor, in the value the edits produce. The end of
+    /// the text of the edit with the highest start when absent, or where the
+    /// cursor is now when {edits} is empty.
     pub cursor: Option<usize>,
+    /// Selects from here to the cursor, counted like {cursor}. Nothing stays
+    /// selected when absent.
+    pub anchor: Option<usize>,
     /// The value counter the reader was handed. Required, because an optional
     /// guard makes the shortest call the unguarded one.
     pub version: u64,
+    /// Refuses any {version} but the current one instead of mapping the edits
+    /// past what changed since.
+    pub strict: bool,
     /// The tab the offsets were read from, refused once another is focused.
     /// Required for the same reason as {version}.
     pub session_id: String,
-    /// Rides along on the `InputChanged` this edit fires, so one input plugin
-    /// can tell another's writes from its own.
+    /// What the edit may change, checked on the UI side, which alone knows
+    /// the text the edits land on. Its owner rides along on the
+    /// `InputChanged` this edit fires, so one input plugin can tell another's
+    /// writes from its own, and owns {marks}.
+    pub caller: PluginReach,
+    /// Counted in the value the edits produce, like {cursor}, and placed in
+    /// the same change as the text, so no frame shows one without the other.
+    pub marks: Option<InputMarks>,
+}
+
+/// Everything a plugin's namespace {ns} holds from now on.
+pub struct InputMarks {
+    pub ns: String,
+    pub marks: Vec<Mark>,
+}
+
+/// Marks planned against the value at {version} of the input of
+/// {session_id}, which guard them like they guard an [`InputEdit`].
+pub struct InputDecorate {
+    pub version: u64,
+    pub session_id: String,
     pub plugin: Arc<str>,
+    pub marks: InputMarks,
+}
+
+/// Sends the input of {session_id} the way Enter does, only while it still
+/// holds {version}.
+pub struct InputSubmit {
+    pub version: u64,
+    pub session_id: String,
+    /// What the send may reach, checked on the UI side, which alone knows
+    /// what Enter would do with the text.
+    pub caller: PluginReach,
 }
 
 pub enum InputRequest {
     Read,
     Edit(InputEdit),
+    Decorate(InputDecorate),
+    Submit(InputSubmit),
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -617,10 +722,60 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    InputRaw,
+    Undo,
+    Redo,
+    HistoryPrev,
+    HistoryNext,
+    Newline,
+    /// Moves the main chat's movable running calls to the background.
+    Background,
+}
+
+impl BuiltinAction {
+    /// The built-ins that change the chat input. A plugin runs them only
+    /// with `input`, like an edit, and the text they leave is the plugin's.
+    /// Switching chats is not one of them: it shows another chat's own draft.
+    pub fn changes_input(self) -> bool {
+        self.needs().contains(&Permission::Input)
+    }
+
+    /// What a plugin needs to run this through `maki.ui.action`, the same
+    /// price as the API that does the same thing. Matched without a fallback,
+    /// so a new action has to be priced before it builds.
+    ///
+    /// Most actions open something the user then sees and drives, or move
+    /// focus like `maki.task.focus`, so they are open. The plan form only
+    /// shows, and the user decides there. Popping the queue throws away a
+    /// prompt the user wrote, with nobody asked. An edit of the chat input
+    /// needs what `maki.ui.input_edit` needs to change the text.
+    pub fn needs(self) -> &'static [Permission] {
+        match self {
+            Self::FilePicker
+            | Self::Search
+            | Self::Help
+            | Self::PlanToggle
+            | Self::PlanEditor
+            | Self::EditInput
+            | Self::PrevChat
+            | Self::NextChat
+            | Self::ModelPicker
+            | Self::InputRaw => &[],
+            Self::PopQueue => &[Permission::SessionWrite],
+            Self::Undo | Self::Redo | Self::HistoryPrev | Self::HistoryNext | Self::Newline => {
+                EDITS_TEXT
+            }
+            // Each moved call's result wakes the chat and costs a turn, the
+            // price of `notify{ wake = true }`.
+            Self::Background => &[Permission::Agent],
+        }
+    }
 }
 
 pub enum UiAction {
     OpenWin {
+        /// `None` opens it in the focused tab.
+        session: Option<MakiId>,
         buf: Arc<SharedBuf>,
         config: FloatConfig,
         focus: bool,
@@ -636,6 +791,14 @@ pub enum UiAction {
     Session {
         req: SessionRequest,
         reply_tx: flume::Sender<UiReply>,
+    },
+    /// `maki.session.export` and `messages`: a live tab answers from memory,
+    /// unsaved messages included, any other id from disk. Typed rather than
+    /// JSON, with the messages shared, so neither the UI thread nor the Lua
+    /// thread copies them.
+    ExportSession {
+        id: MakiId,
+        reply_tx: flume::Sender<Result<SessionExport, String>>,
     },
     Model {
         req: ModelRequest,
@@ -659,14 +822,56 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u32,
     },
-    Builtin(BuiltinAction),
+    /// `reply_tx` answers whether the action did anything, which is what lets
+    /// a key handler try one action and fall back to another.
+    Builtin {
+        action: BuiltinAction,
+        caller: PluginReach,
+        reply_tx: flume::Sender<bool>,
+    },
+    /// The handler of the keystroke with this ticket id returned. It comes
+    /// after everything the handler asked of the UI, so the keys typed after
+    /// that keystroke can go.
+    KeybindDone(u64),
+    /// The handler of the keystroke with this ticket id called
+    /// `ev.fallback()`: run what the host itself does for that key, before
+    /// the keys typed after it.
+    KeybindFallback(u64),
+    /// The plugin of this name was unloaded, or a fresh load of it starts, so
+    /// whatever it left in the UI has to go.
+    PluginUnloaded(Arc<str>),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not
     /// how the command itself went: `/compact` streams for a minute, and the
     /// Lua caller must not park for that long.
     RunCommand {
         cmdline: String,
         depth: u8,
+        /// Checked on the UI side, since only the UI knows what each command
+        /// can reach.
+        caller: PluginReach,
         reply_tx: flume::Sender<Result<(), String>>,
+    },
+    /// An event from a subagent session a plugin opened on a chat session,
+    /// which shows it as a task. A tab keeps its channels across `/new`, so
+    /// the chat session id is the only way to tell if the tab still shows the
+    /// session that owns it.
+    PluginTaskEvent {
+        session: MakiId,
+        plugin: Arc<str>,
+        envelope: Box<Envelope>,
+    },
+    PluginTaskOpened {
+        session: MakiId,
+        plugin: Arc<str>,
+        info: Box<SubagentInfo>,
+    },
+    /// How moved call `id` ended, when its final reply cannot say. A stopped
+    /// call's reply often reads as a failure, since its process was killed,
+    /// so `Cancelled` comes first. A `Lost` call never replies at all.
+    PluginTaskEnded {
+        session: MakiId,
+        id: String,
+        end: TaskEnd,
     },
 }
 
@@ -678,8 +883,9 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Starts attached, so what a TUI host sends before its loop is up gets
+    /// answered once it is. A headless host has no sender at all, so this bit
+    /// only ever tells of a loop that went away.
     fn default() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }
@@ -705,6 +911,7 @@ impl UiAttachment {
 // handle through every `#[ctx]` sender.
 thread_local! {
     static UI_ATTACHMENT: RefCell<Option<UiAttachment>> = const { RefCell::new(None) };
+    static PLUGIN_LOADING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) fn install_ui_attachment(attachment: UiAttachment) {
@@ -730,9 +937,31 @@ pub(crate) fn ui_send(
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
+/// Whether an action sent now would reach an event loop, for a call that must
+/// refuse before doing anything a missing UI would leave half done.
+pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {
+    ui_attached() && tx.is_some_and(|tx| !tx.is_disconnected())
+}
+
+/// Runs a plugin's top level, where every [`ui_roundtrip`] fails at once.
+/// The host blocks on the load and starts the event loop only after every
+/// plugin loaded, so an answer would never come. The flag is up only while
+/// {load} itself is polled: a task the executor runs while the load is
+/// parked, and a callback the load scheduled, still reach the UI.
+pub(crate) async fn as_plugin_load<F: Future>(load: F) -> F::Output {
+    let mut load = pin!(load);
+    poll_fn(|cx| {
+        let outer = PLUGIN_LOADING.replace(true);
+        let polled = load.as_mut().poll(cx);
+        PLUGIN_LOADING.set(outer);
+        polled
+    })
+    .await
+}
+
 /// Send an action carrying a reply channel and await the answer. Only
 /// works from a callback: the loop drains `UiAction` between frames, so a
-/// call at config load time would wait forever.
+/// call from a plugin's top level fails, see [`as_plugin_load`].
 ///
 /// No deadline on purpose: the loop legitimately stops answering for a long
 /// time (`open_editor` holds it for as long as the editor is up). Teardown
@@ -741,6 +970,9 @@ pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
 ) -> Result<T, &'static str> {
+    if PLUGIN_LOADING.get() {
+        return Err(PLUGIN_LOADING_ERR);
+    }
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
     reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
@@ -762,6 +994,8 @@ pub(crate) async fn ui_json_roundtrip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_permissions::PluginPermissions;
+    use futures::FutureExt;
     use mlua::Lua;
     use test_case::test_case;
 
@@ -771,6 +1005,7 @@ mod tests {
         CommandEntry {
             handler: key,
             description: Arc::from(desc),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }
     }
@@ -831,16 +1066,14 @@ mod tests {
     /// The loop's receiver is a clone and the runtime keeps another one for
     /// the whole process, so the channel never disconnects: without the bit a
     /// roundtrip would park on a reply nobody is left to send.
-    #[test]
-    fn ui_roundtrip_fails_once_the_loop_detaches() {
+    #[tokio::test]
+    async fn ui_roundtrip_fails_once_the_loop_detaches() {
         let (tx, rx) = flume::unbounded();
         let attachment = UiAttachment::default();
         install_ui_attachment(attachment.clone());
 
         attachment.detach();
-        let detached = smol::block_on(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
-            reply_tx,
-        }));
+        let detached = ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
         assert_eq!(detached.err(), Some(NO_UI_ERR));
         assert!(
             !rx.is_disconnected(),
@@ -850,6 +1083,33 @@ mod tests {
         // `/reload` builds a new loop around the same handles.
         attachment.attach();
         assert!(ui_send(Some(&tx), UiAction::WinRestView { scroll_top: 0 }).is_ok());
+    }
+
+    /// The load is refused, while a task that runs as the load waits is not.
+    #[tokio::test]
+    async fn only_the_plugin_load_itself_is_refused_a_roundtrip() {
+        let (tx, rx) = flume::unbounded();
+        let (resume_tx, resume_rx) = flume::bounded::<()>(1);
+
+        let (in_load, beside_load) = tokio::join!(
+            as_plugin_load(async {
+                let refused =
+                    ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx }).await;
+                resume_rx.recv_async().await.ok();
+                refused
+            }),
+            async {
+                let sent = ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView { reply_tx })
+                    .now_or_never();
+                resume_tx.send(()).ok();
+                sent
+            },
+        );
+
+        assert_eq!(in_load.err(), Some(PLUGIN_LOADING_ERR));
+        assert!(beside_load.is_none(), "still waiting for the UI's answer");
+        assert!(matches!(rx.try_recv(), Ok(UiAction::WinSaveView { .. })));
+        assert!(rx.is_empty(), "the refused call never reached the UI");
     }
 
     #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]
@@ -989,13 +1249,45 @@ mod tests {
         let (writer, reader) = HintWriter::new();
         assert!(reader.load_full().entries.is_empty());
 
-        writer.publish(vec![(
-            Arc::from("plugA"),
-            vec![(" 2/4 ".into(), "fg".into())],
-        )]);
+        writer.publish(vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)]);
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.generation, 1);
+    }
+
+    const SHADOWED_PLUGIN: &str = "shadowed";
+    const OTHER_PLUGIN: &str = "other";
+    const EVERY_TAB_HINT: &str = "every tab";
+    const SESSION_HINT: &str = "session";
+
+    fn hint(plugin: &str, session: Option<MakiId>, text: &str) -> HintEntry {
+        HintEntry {
+            plugin: Arc::from(plugin),
+            session,
+            spans: vec![(text.into(), String::new())],
+        }
+    }
+
+    #[test_case(true, &[EVERY_TAB_HINT, SESSION_HINT] ; "own_tab_swaps_in_the_session_hint")]
+    #[test_case(false, &[EVERY_TAB_HINT, EVERY_TAB_HINT] ; "other_tab_keeps_the_every_tab_hint")]
+    fn session_hint_shadows_the_plugins_every_tab_hint(own_tab: bool, expected: &[&str]) {
+        let owner = MakiId::generate();
+        let snap = HintSnapshot {
+            entries: vec![
+                hint(OTHER_PLUGIN, None, EVERY_TAB_HINT),
+                hint(SHADOWED_PLUGIN, None, EVERY_TAB_HINT),
+                hint(SHADOWED_PLUGIN, Some(owner), SESSION_HINT),
+            ],
+            generation: 0,
+        };
+        let tab = if own_tab { owner } else { MakiId::generate() };
+
+        let shown: Vec<_> = snap
+            .visible_in(tab)
+            .map(|entry| entry.spans[0].0.as_str())
+            .collect();
+
+        assert_eq!(shown, expected);
     }
 }

@@ -42,7 +42,7 @@ one line stays              ~20k tokens never seen
 
 **Deferred MCP tools.** An MCP server with 100 tools would ship 100 definitions in every request. Maki loads a single `tool_search` tool instead; the model searches when it actually needs something and only the matches load. See [MCP](/docs/mcp/#tool-search).
 
-**Truncation everywhere.** Tool output is capped (`agent.max_output_bytes`, `agent.max_output_lines`), overlong grep lines are skipped, and every builtin tool description nags the model to read only what it needs. The nagging works.
+**Capped tool output.** Tool output the model sees is capped (`agent.max_output_bytes`, `agent.max_output_lines`), and long lines from read and grep are clipped. Every built-in tool description tells the model to read only what it needs.
 
 **Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
@@ -52,7 +52,7 @@ Every round-trip re-sends the context, so round-trips are the other half of the 
 
 **batch** runs independent tool calls in one turn: one request, N results.
 
-**code_execution** goes further: a Python sandbox where tools are async functions. Chained calls, loops, and filtering happen inside the sandbox; only what the script prints enters context.
+**code_execution** goes further: a Python sandbox where tools are async functions. Chained calls, loops, and filtering happen inside the sandbox, and only what the script prints or returns enters context. Tools called from Python return complete output, without the caps or RTK rewriting, so the script can parse it.
 
 ```
 without                          with code_execution
@@ -62,6 +62,8 @@ read × 300  → 300 files          filter in python
 300 turns, every file            print("3 files call foo_v1")
 in context forever               1 turn, 1 line in context
 ```
+
+**Background tasks** keep a slow build from holding the loop. The model gets a short receipt and carries on, and the result arrives as one message when the build ends, so no turns go to polling. See [Background Tasks](/docs/background-tasks/).
 
 **Compaction** resets the multiplier when a session runs long: older turns are summarized and dropped. [Context](/docs/context/#when-the-window-fills) has the details.
 

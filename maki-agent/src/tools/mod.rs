@@ -1,10 +1,11 @@
-//! Shared plumbing for tools. The registry itself lives in `registry.rs`; this file
-//! holds the helpers every tool leans on: `ToolFilter` to enable/disable per caller,
-//! `Deadline` so a parent tool can cap a child's timeout, the walker that skips `.git`,
+//! Shared plumbing for tools. The registry itself lives in `registry.rs` and the
+//! call deadline in `deadline.rs`; this file holds the helpers every tool leans on:
+//! `ToolFilter` to enable/disable per caller, the walker that skips `.git`,
 //! and `sanitize_tool_input` which patches up small JSON mistakes models make (stray
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
+mod deadline;
 mod file_access;
 pub mod grep;
 pub mod hook;
@@ -12,12 +13,13 @@ pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
+pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
-    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
-    RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
-    ToolRegistry, ToolSource,
+    BoxFuture, ExecFuture, HeaderFuture, HeaderResult, MovedCall, MovedLand, ParseError,
+    PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
+    ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
 
 use std::collections::HashMap;
@@ -25,25 +27,34 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
-use humantime::format_duration;
 use ignore::WalkBuilder;
+use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
-use crate::agent::{CallInstructions, LoadedInstructions};
+use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
+use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::live_session::SessionMailbox;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::prompt::ResolvedPrompts;
 use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
+const COMPACT_DURATION: SpanPrinter = SpanPrinter::new()
+    .designator(Designator::Compact)
+    .spacing(Spacing::None);
+const COMPACT_DURATION_UNITS: [char; 3] = ['h', 'm', 's'];
+const TIMEOUT_SUFFIX: &str = " timeout";
 /// What `maki.task` calls the session's own chat.
 pub const MAIN_TASK_ID: &str = "main";
 
@@ -68,6 +79,31 @@ impl CallOrigin {
         match self {
             Self::Model => "model",
             Self::Nested => "nested",
+        }
+    }
+}
+
+/// Result presentation, independent of tool visibility and history ownership.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    #[default]
+    Full,
+    Compact,
+}
+
+impl ToolOutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Self::Full),
+            "compact" => Some(Self::Compact),
+            _ => None,
         }
     }
 }
@@ -172,6 +208,23 @@ impl RequestTools {
         workflow: bool,
         mcp: bool,
     ) -> Self {
+        Self::build_with_background(registry, vars, model, config, excluded, workflow, mcp, true)
+    }
+
+    /// [`Self::build`] for a session whose `background` is known: when it is
+    /// off, tools and parameters that only exist to move a call to the
+    /// background stay out of the array for the whole session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_background(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+        background: bool,
+    ) -> Self {
         let filter = ToolFilter::from_config(config, model, excluded);
         let ctx = DescriptionContext {
             filter: &filter,
@@ -180,7 +233,12 @@ impl RequestTools {
             mcp,
         };
         Self {
-            definitions: registry.definitions(vars, &ctx, model.supports_tool_examples()),
+            definitions: registry.definitions_with_background(
+                vars,
+                &ctx,
+                model.supports_tool_examples(),
+                background,
+            ),
             filter: Arc::new(filter),
         }
     }
@@ -252,53 +310,23 @@ pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
 pub(crate) const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
-pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
-
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Deadline {
-    #[default]
-    None,
-    At(Instant),
-}
-
-impl Deadline {
-    pub fn after(duration: Duration) -> Self {
-        Self::At(Instant::now() + duration)
-    }
-
-    pub fn check(self) -> Result<(), String> {
-        match self {
-            Self::None => Ok(()),
-            Self::At(instant) if instant.saturating_duration_since(Instant::now()).is_zero() => {
-                Err(DEADLINE_EXCEEDED.into())
-            }
-            Self::At(_) => Ok(()),
-        }
-    }
-
-    pub fn cap_timeout(self, timeout_secs: u64) -> Result<u64, String> {
-        match self {
-            Self::None => Ok(timeout_secs),
-            Self::At(instant) => {
-                let remaining = instant.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    Err(DEADLINE_EXCEEDED.into())
-                } else {
-                    Ok(timeout_secs.min(remaining.as_secs().max(1)))
-                }
-            }
-        }
-    }
+/// Whole seconds as `1h1m1s`. Hours are the largest unit, so a day reads `24h`.
+pub fn compact_duration(secs: u64) -> String {
+    COMPACT_DURATION.unsigned_duration_to_string(&Duration::from_secs(secs))
 }
 
 pub fn timeout_annotation(secs: u64) -> String {
-    let d = Duration::from_secs(secs);
-    let formatted: String = format_duration(d)
-        .to_string()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    format!("{formatted} timeout")
+    format!("{}{TIMEOUT_SUFFIX}", compact_duration(secs))
+}
+
+/// Whether {note} is what [`timeout_annotation`] writes.
+pub fn is_timeout_annotation(note: &str) -> bool {
+    note.strip_suffix(TIMEOUT_SUFFIX).is_some_and(|span| {
+        !span.is_empty()
+            && span
+                .chars()
+                .all(|c| c.is_ascii_digit() || COMPACT_DURATION_UNITS.contains(&c))
+    })
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -337,27 +365,44 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// See [`crate::AgentParams::background_for`]. Every nested call clones
+    /// this context, so batch and code_execution children carry it too.
+    pub background_for: BackgroundFor,
     /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
     /// spawning call's `tool_use_id` in a subagent. A subagent shares
     /// `session_id` with its parent on purpose (provider affinity, hooks,
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
+    /// offers a re-login only where its parent does.
+    pub reauth: bool,
     /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
+    /// The file list resolved at session start, so a subdirectory walk never
+    /// re-resolves it.
+    pub instruction_files: Arc<Vec<String>>,
     /// Per model call, shared with its nested calls.
     pub call_instructions: CallInstructions,
+    /// The model call this context serves, shared by its nested calls. `None`
+    /// outside a model call (one-shots, plugin-opened sessions).
+    pub call: Option<Arc<CallScope>>,
+    /// Where a call moved off this run reports its result: the run's own
+    /// mailbox. `None` outside an agent run (one-shots, the interpreter), so
+    /// nothing there moves.
+    pub mailbox: Option<SessionMailbox>,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_filter: Arc<ToolFilter>,
     pub tool_output_lines: ToolOutputLines,
+    pub output_mode: ToolOutputMode,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
-    pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub prompt_slots: Arc<ResolvedPrompts>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
     /// Shared with the run that spawned this tool, so a subagent's spend lands
@@ -367,10 +412,9 @@ pub struct ToolContext {
     pub workflow: bool,
     pub audience: ToolAudience,
     pub local_tools: LocalTools,
-    /// Streams a dispatched child's live bufs and annotations back to the
-    /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
-    /// Never inherited: `to_tool_context` clears it, and each caller sets
-    /// it for its own call only.
+    /// Streams a dispatched child's live bufs and annotations back to its
+    /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
+    /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
 }
@@ -380,6 +424,34 @@ pub enum ToolLive {
     Buf(Arc<SharedBuf>),
     Annotation(String),
     Usage(String),
+    /// The plugin that answered the child's permission prompt.
+    AllowedBy(Arc<str>),
+    /// The child registered (`true`) or lost (`false`) a background hook.
+    Movable(bool),
+    /// The child runs as this subagent task, which `/tasks` lists on its own.
+    Task(String),
+}
+
+/// The chat whose plan mode blocks this work's writes, see
+/// [`crate::AgentSeed::background_write_block`].
+#[derive(Clone, Default)]
+pub enum BackgroundFor {
+    /// Watched by the user: never blocked.
+    #[default]
+    None,
+    Chat(MakiId),
+    /// Foreground until the call moves, then the chat it moved to.
+    Call(Arc<CallScope>),
+}
+
+impl BackgroundFor {
+    pub fn chat(&self) -> Option<MakiId> {
+        match self {
+            Self::None => None,
+            Self::Chat(chat) => Some(*chat),
+            Self::Call(scope) => scope.home().map(|home| home.chat),
+        }
+    }
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -517,13 +589,20 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
     result
 }
 
+fn registers_a_tool(name: &str) -> bool {
+    maki_config::DEFAULT_BUILTINS.contains(&name)
+        && !maki_config::PROVIDER_BUILTINS.contains(&name)
+        && !maki_config::NON_TOOL_BUILTINS.contains(&name)
+}
+
 pub fn is_builtin_tool(name: &str) -> bool {
-    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    registers_a_tool(name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
+        .filter(|name| registers_a_tool(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
         .copied()
         .collect()
@@ -560,7 +639,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
@@ -572,21 +651,27 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        background_for: BackgroundFor::None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
+        reauth: false,
         loaded_instructions: LoadedInstructions::new(),
+        instruction_files: Arc::new(default_instruction_files()),
         call_instructions: CallInstructions::default(),
+        call: None,
+        mailbox: None,
         cancel,
         mcp: None,
-        deadline: Deadline::None,
+        deadline: Deadline::default(),
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
+        output_mode: ToolOutputMode::Full,
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_access,
-        prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        prompt_slots: Arc::new(ResolvedPrompts::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
         ledger: Arc::default(),
@@ -628,7 +713,12 @@ pub fn cli_tool_ctx() -> ToolContext {
 pub mod test_support {
     use std::borrow::Cow;
 
-    use crate::{Envelope, EventSender, ToolOutput};
+    use arc_swap::ArcSwap;
+    use maki_providers::Timeouts;
+    use maki_storage::id::MakiId;
+
+    use crate::live_session::AgentSeed;
+    use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
 
     use super::*;
 
@@ -768,11 +858,30 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 
     pub fn stub_ctx(mode: &AgentMode) -> ToolContext {
         stub_ctx_with(mode, None, None)
+    }
+
+    pub fn stub_seed(id: MakiId) -> AgentSeed {
+        let ctx = stub_ctx(&AgentMode::Build);
+        let slot = ModelSlot {
+            model: (*ctx.model).clone(),
+            provider: ctx.provider,
+        };
+        AgentSeed::new(
+            SessionRef::from(id),
+            Arc::new(ArcSwap::from_pointee(slot)),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            ctx.permissions,
+            None,
+            Timeouts::default(),
+            Arc::default(),
+        )
     }
 
     #[cfg(test)]
@@ -792,7 +901,21 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = None;
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
+    }
+
+    /// Plays someone else's edit. It pushes the mtime ahead instead of writing
+    /// again, because two writes close together can share one mtime on
+    /// filesystems with coarse timestamps.
+    #[cfg(test)]
+    pub(crate) fn future_mtime(path: &Path) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
     }
 }
 
@@ -844,26 +967,21 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
+        assert!(is_timeout_annotation(expected));
     }
 
-    #[test_case(Deadline::None,                          120, 120 ; "none_passes_through")]
-    #[test_case(Deadline::after(Duration::from_secs(60)), 10,  10  ; "requested_under_remaining")]
-    fn cap_timeout_ok(deadline: Deadline, requested: u64, expected: u64) {
-        assert_eq!(deadline.cap_timeout(requested).unwrap(), expected);
+    #[test_case("network timeout" ; "words")]
+    #[test_case(" timeout"        ; "no_span")]
+    #[test_case("24 lines"        ; "another_note")]
+    fn is_timeout_annotation_rejects(note: &str) {
+        assert!(!is_timeout_annotation(note));
     }
 
-    #[test]
-    fn cap_timeout_clamps_to_remaining() {
-        let clamped = Deadline::after(Duration::from_secs(3600))
-            .cap_timeout(7200)
-            .unwrap();
-        assert!(clamped <= 3600, "expected <= 3600, got {clamped}");
-    }
-
-    #[test]
-    fn cap_timeout_expired() {
-        let expired = Deadline::At(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
-        assert_eq!(expired.cap_timeout(120).unwrap_err(), DEADLINE_EXCEEDED);
+    #[test_case(0,     "0s"     ; "zero")]
+    #[test_case(3661,  "1h1m1s" ; "all_units")]
+    #[test_case(90000, "25h"    ; "days_stay_in_hours")]
+    fn compact_duration_cases(secs: u64, expected: &str) {
+        assert_eq!(compact_duration(secs), expected);
     }
 
     #[test_case("short",                            "short"                             ; "short_passthrough")]
@@ -1050,9 +1168,12 @@ mod tests {
 
         let root_str = root.to_string_lossy();
         let collect = |patterns: &[&str]| -> Vec<String> {
-            walk_builder(&root_str, patterns)
-                .unwrap()
-                .build()
+            // A developer's global gitignore decides for itself whether a
+            // dotfile like `.env` is ignored, and this test is about our
+            // filters, not theirs.
+            let mut wb = walk_builder(&root_str, patterns).unwrap();
+            wb.git_global(false);
+            wb.build()
                 .flatten()
                 .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
                 .map(|e| {
@@ -1199,6 +1320,18 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for name in &names {
             assert!(seen.insert(name), "duplicate builtin tool name: {name}");
+        }
+    }
+
+    #[test]
+    fn provider_and_non_tool_plugins_are_not_tools() {
+        for &name in maki_config::PROVIDER_BUILTINS
+            .iter()
+            .chain(maki_config::NON_TOOL_BUILTINS)
+        {
+            assert!(maki_config::DEFAULT_BUILTINS.contains(&name), "{name}");
+            assert!(!is_builtin_tool(name), "{name}");
+            assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
     }
 }

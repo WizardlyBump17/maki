@@ -11,7 +11,9 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, local_tool,
 };
+use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
 
@@ -46,6 +48,34 @@ const MARKER_A: &str = "AAA";
 const MARKER_B: &str = "BBB";
 const EDITED_A: &str = "aaa";
 const EDITED_B: &str = "bbb";
+const OPEN_TARGET: &str = "notes.txt";
+const OPEN_ORIGINAL: &str = "hello\n";
+const PLAN_FILE: &str = "plan.md";
+const FILE_WRITE_FAILED: &str = "file write failed";
+const OPEN_REFUSED: &str = "refused";
+const BLOCKING_READ_HOOK: &str =
+    r#"maki.api.set_slot("tool.read.input", function() return nil, "blocked" end)"#;
+/// Points reads at a file that exists, so the read tool says yes.
+const REWRITING_READ_HOOK: &str = concat!(
+    r#"maki.api.set_slot("tool.read.input", function(prev, input) input.path = ""#,
+    env!("CARGO_MANIFEST_DIR"),
+    r#"/Cargo.toml" return input end)"#
+);
+const WILDCARD_INPUT_HOOK: &str =
+    r#"maki.api.set_slot("tool.*.input", function(prev, input) return input end)"#;
+const NO_POLICY: &str = "";
+const LIST_HOOK: &str =
+    r#"maki.api.set_slot("tool.list.input", function(prev, input) return input end)"#;
+const RUNTIME_ERROR: &str = "RuntimeError";
+const MADE_DIR: &str = "made/deep";
+const OPEN_APPEND_REFUSED: &str = "write tool has no append option";
+const WRITE_WITHOUT_APPEND: &str = r#"maki.api.register_tool({
+    name = "write",
+    description = "replacement write without append",
+    audiences = { "main", "interpreter" },
+    schema = { type = "object", properties = { path = { type = "string" }, content = { type = "string" } } },
+    handler = function(input) maki.fs.write(input.path, input.content) return "ok" end,
+})"#;
 
 fn fixture_plugin() -> String {
     format!(
@@ -163,7 +193,8 @@ fn run_tool(
 ) -> Result<String, String> {
     let entry = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
@@ -290,6 +321,111 @@ fn parallel_edits_to_one_file_all_apply() {
         std::fs::read_to_string(&path).unwrap(),
         format!("{EDITED_A}\n{EDITED_B}\n")
     );
+}
+
+/// Binds `path` to a file holding [`OPEN_ORIGINAL`] and returns the script's
+/// result with what the file holds afterwards. `policy` is Lua loaded next to
+/// the builtins, minus the `disabled` ones.
+fn run_on_file(
+    code: &str,
+    policy: &str,
+    shape: fn(&mut ToolContext),
+    disabled: &[&str],
+) -> (Result<String, String>, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(OPEN_TARGET);
+    std::fs::write(&path, OPEN_ORIGINAL).unwrap();
+    let quoted = path.to_str().expect("utf-8 temp path");
+
+    let reg = Arc::new(ToolRegistry::new());
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&PluginsConfig::from_plugins(
+        disabled
+            .iter()
+            .map(|name| {
+                let off = PluginFileConfig {
+                    enabled: Some(false),
+                    ..PluginFileConfig::default()
+                };
+                ((*name).to_owned(), off)
+            })
+            .collect(),
+    ))
+    .unwrap();
+    host.load_source("policy", policy).unwrap();
+    let out = exec_code(
+        &reg,
+        &shaped_ctx(&reg, shape),
+        &format!("path = '{quoted}'\n{code}"),
+    );
+    (out, std::fs::read_to_string(&path).unwrap())
+}
+
+#[test_case::test_case("text = open(path).read()\nwith open(path, 'w') as f:\n    f.write(text.upper())", "HELLO\n" ; "read_then_write")]
+#[test_case::test_case("with open(path, 'a') as f:\n    f.write('world\\n')\n    f.write('!')", "hello\nworld\n!" ; "append")]
+fn open_reads_and_writes_through_the_file_tools(code: &str, expected: &str) {
+    let (out, content) = run_on_file(code, NO_POLICY, |_| {}, &[]);
+    out.expect("open must be served");
+    assert_eq!(content, expected);
+}
+
+/// Validation drops the `append` flag a replacement tool does not declare, so
+/// going ahead would overwrite the file with only the new text.
+#[test]
+fn open_append_is_refused_when_the_write_tool_cannot_append() {
+    let code = "with open(path, 'a') as f:\n    f.write('world')";
+    let (out, content) = run_on_file(code, WRITE_WITHOUT_APPEND, |_| {}, &["write"]);
+    let err = out.expect_err("the append must be refused");
+    assert!(err.contains(OPEN_APPEND_REFUSED), "got: {err}");
+    assert_eq!(content, OPEN_ORIGINAL);
+}
+
+/// `open()` reads the file itself, so it cannot follow a hook that points the
+/// read somewhere else. Refusing is the only answer that never hands the
+/// script a file the hook steered it away from.
+#[test_case::test_case(BLOCKING_READ_HOOK ; "blocking_hook")]
+#[test_case::test_case(REWRITING_READ_HOOK ; "rewriting_hook")]
+#[test_case::test_case(WILDCARD_INPUT_HOOK ; "wildcard_hook")]
+fn open_reads_are_refused_while_the_read_tool_is_hooked(policy: &str) {
+    let code = format!(
+        "try:\n    out = open(path).read()\nexcept OSError:\n    out = '{OPEN_REFUSED}'\nout"
+    );
+    let (out, _) = run_on_file(&code, policy, |_| {}, &[]);
+    let out = out.expect("the refusal must reach the script as OSError");
+    assert!(out.contains(OPEN_REFUSED), "got: {out}");
+}
+
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB ; "write_tool_not_callable")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()) ; "plan_mode_blocks_the_write_tool")]
+fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContext)) {
+    let (out, content) = run_on_file("open(path, 'w').write('x')", NO_POLICY, shape, &[]);
+    let err = out.expect_err("the write must be refused");
+    assert!(err.contains(FILE_WRITE_FAILED), "got: {err}");
+    assert_eq!(content, OPEN_ORIGINAL);
+}
+
+/// Loud on purpose, since `os.path.exists` would turn an `OSError` into False.
+/// mkdir looks before it creates, so it needs the list tool too.
+#[test_case::test_case("os.path.exists(path)", LIST_HOOK, &[] ; "list_tool_hooked")]
+#[test_case::test_case("os.path.exists(path)", NO_POLICY, &["list"] ; "list_tool_disabled")]
+#[test_case::test_case("os.makedirs(path + '.d', exist_ok=True)", NO_POLICY, &["list"] ; "mkdir_with_list_tool_disabled")]
+fn os_metadata_is_refused_where_the_list_tool_is(code: &str, policy: &str, disabled: &[&str]) {
+    let (out, _) = run_on_file(code, policy, |_| {}, disabled);
+    let err = out.expect_err("the query must be refused");
+    assert!(err.contains(RUNTIME_ERROR), "got: {err}");
+}
+
+/// `build_mode` also proves metadata is served, as a refused `isdir` would raise.
+#[test_case::test_case(|_| {}, true ; "build_mode")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()), false ; "plan_mode_blocks_the_write_tool")]
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB, false ; "write_tool_not_callable")]
+fn os_makedirs_goes_where_the_write_tool_would(shape: fn(&mut ToolContext), made: bool) {
+    let code = format!(
+        "target = os.path.join(os.path.dirname(path), '{MADE_DIR}')\ntry:\n    os.makedirs(target)\nexcept OSError:\n    pass\nos.path.isdir(target)"
+    );
+    let (out, _) = run_on_file(&code, NO_POLICY, shape, &[]);
+    let out = out.expect("a refused mkdir raises OSError, which the script catches");
+    assert!(out.contains(&format!("return: {made}")), "got: {out}");
 }
 
 /// Only a failed tool call belongs in the results. The script's own mistake
@@ -435,7 +571,7 @@ fn start_preview_text(code: &str) -> String {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, code);
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.start(&ctx));
+    runtime().block_on(inv.start(&ctx));
     let body = rx
         .drain()
         .find_map(|env| match env.event {
@@ -501,7 +637,8 @@ fn handler_renders_script_when_start_never_ran() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print('hi')");
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.execute(&ctx))
+    runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect("execute ok");
     let text = final_body_text(&rx);
@@ -528,7 +665,8 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print(boom_undefined)");
     let (ctx, rx) = event_ctx(&reg);
-    let err = smol::block_on(inv.execute(&ctx))
+    let err = runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect_err("undefined name must error");
     let text = final_body_text(&rx);
@@ -537,9 +675,10 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
         text.contains("1 print(boom_undefined)"),
         "script header must survive the error path: {text}"
     );
+    let exception = err.trim_end().lines().last().unwrap();
     assert!(
-        text.contains(err.trim_end()),
-        "error must render below the script, err: {err:?}, body: {text}"
+        text.contains(exception),
+        "exception line must render below the script, err: {err:?}, body: {text}"
     );
     assert!(
         !text.contains("Waiting for output"),

@@ -32,6 +32,7 @@ local DIGIT = "^%d$"
 -- Rows without a budget fill the wide column with this. A mode we have never
 -- heard of gets nothing rather than invented prose.
 local MODE_NOTES = { off = "no reasoning", adaptive = "model decides" }
+local SENDS_PREFIX = "sends "
 
 local STYLE_NAME = "item"
 local STYLE_NAME_PICKED = "bold"
@@ -100,18 +101,19 @@ local function row_name(row)
 end
 
 -- {model} is a `maki.model.get()` table. The cursor opens on the row named by
--- the value the session runs. A value no row names is a raw token budget, so
--- the custom row takes it, pre-filled.
+-- the effective mode the session shows, while the stored intent remains held.
+-- A value no row names is a raw token budget, so the custom row takes it,
+-- pre-filled.
 function M.new(model)
   local rows = build_rows(model.thinking_options)
-  local state = { rows = rows, custom = "", editing = false, max_tokens = 0 }
+  local state = { rows = rows, custom = "", editing = false, max_tokens = 0, held = model.thinking }
   for i, row in ipairs(rows) do
     if row.custom then
       state.custom_row = i
     elseif row.option then
       state.max_tokens = math.max(state.max_tokens, row.option.tokens or 0)
-      if row.option.name == model.thinking then
-        state.cursor = i
+      if row.option.name == model.thinking_shown then
+        state.cursor, state.opened = i, i
       end
     end
   end
@@ -122,9 +124,22 @@ function M.new(model)
   return state
 end
 
+-- Until the cursor moves, the row the picker opened on sends what the session
+-- holds. Replacing intent with a snapped level or toggle would change the
+-- delegation ceiling even though the user did not choose a different mode.
 function M.value(state)
+  if state.cursor == state.opened then
+    return state.held
+  end
   local row = state.rows[state.cursor]
   return row.option and row.option.name or state.custom
+end
+
+-- Once the cursor leaves the opened row, landing back on it is a choice.
+local function place(state, i)
+  if i ~= state.cursor then
+    state.cursor, state.opened = i, nil
+  end
 end
 
 -- Skips the blank spacers, and stops at either end instead of wrapping.
@@ -132,7 +147,7 @@ local function move(state, delta)
   local i = state.cursor + delta
   while state.rows[i] do
     if selectable(state.rows[i]) then
-      state.cursor = i
+      place(state, i)
       return
     end
     i = i + delta
@@ -181,13 +196,26 @@ end
 
 function M.click(state, row)
   if state.rows[row] and selectable(state.rows[row]) then
-    state.cursor, state.editing = row, false
+    place(state, row)
+    state.editing = false
   end
 end
 
+-- A level the model does not take goes out as another row. Its cost is that
+-- row's, so it names the row rather than drawing a gauge of its own.
+local function alias_of(row)
+  local sends = row.option and row.option.sends
+  return sends ~= nil and sends ~= row.option.name and sends or nil
+end
+
 -- What a budget-less row says in the wide column where the gauges are: a mode
--- describes itself, the custom row shows what is typed.
+-- describes itself, an alias names the row it sends, the custom row shows what
+-- is typed.
 local function note_spans(state, row)
+  local alias = alias_of(row)
+  if alias then
+    return { { SENDS_PREFIX .. alias, STYLE_DIM } }
+  end
   if row.option then
     return { { MODE_NOTES[row.option.name] or "", STYLE_DIM } }
   end
@@ -223,11 +251,12 @@ local function layout(state, width)
 end
 
 local function row_spans(state, row, picked, cols)
+  local alias = alias_of(row)
   local spans = {
     { INDENT .. (picked and PICKED or UNPICKED), picked and STYLE_PICKED or STYLE_DIM },
-    { pad_right(row_name(row), cols.name), picked and STYLE_NAME_PICKED or STYLE_NAME },
+    { pad_right(row_name(row), cols.name), picked and STYLE_NAME_PICKED or (alias and STYLE_DIM or STYLE_NAME) },
   }
-  local tokens = row.option and row.option.tokens
+  local tokens = not alias and row.option and row.option.tokens
   if not tokens then
     local left = cols.room
     for _, span in ipairs(note_spans(state, row)) do

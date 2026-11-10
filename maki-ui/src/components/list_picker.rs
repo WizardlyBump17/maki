@@ -5,10 +5,10 @@ use nucleo_matcher::{Config, Matcher};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
-use crate::components::is_ctrl;
 use crate::components::keybindings::key;
-use crate::components::modal::Modal;
+use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{chevron_span, hint_footer, is_ctrl, render_field};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -16,16 +16,21 @@ use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
+const ERROR_LABEL: &str = "Error: ";
 const MIN_WIDTH_PERCENT: u16 = 65;
+/// Fits a long model id next to its tier and price columns.
+const MIN_WIDTH_COLS: u16 = 72;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
+
+/// Key and action pairs for the bottom border, empty for none.
+type Hints = &'static [(&'static str, &'static str)];
 
 pub trait PickerItem {
     fn label(&self) -> &str;
@@ -42,6 +47,11 @@ pub trait PickerItem {
         false
     }
     fn is_highlighted(&self) -> bool {
+        false
+    }
+    /// Drawn in place of its section header, so the cursor can land on the
+    /// section itself.
+    fn is_section_row(&self) -> bool {
         false
     }
 }
@@ -63,7 +73,7 @@ pub struct ListPicker<T> {
     state: Option<State<T>>,
     title: String,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Hints,
     error_text: Option<String>,
 }
 
@@ -77,6 +87,7 @@ struct State<T> {
     inner_area: Rect,
     enabled: Option<Vec<bool>>,
     matcher: Matcher,
+    notice: Option<&'static str>,
 }
 
 impl<T: PickerItem> State<T> {
@@ -92,6 +103,7 @@ impl<T: PickerItem> State<T> {
             inner_area: Rect::default(),
             enabled: None,
             matcher: Matcher::new(Config::DEFAULT),
+            notice: None,
         }
     }
 
@@ -107,7 +119,7 @@ impl<T: PickerItem> State<T> {
             self.filtered = (0..self.items.len()).collect();
         } else {
             let pattern = Pattern::new(
-                &query,
+                query,
                 CaseMatching::Smart,
                 Normalization::Smart,
                 AtomKind::Fuzzy,
@@ -231,7 +243,7 @@ impl<T: PickerItem> ListPicker<T> {
             state: None,
             title: String::new(),
             max_visible: None,
-            footer: None,
+            footer: &[],
             error_text: None,
         }
     }
@@ -241,8 +253,8 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
-        self.footer = Some(builder);
+    pub fn with_footer(mut self, hints: Hints) -> Self {
+        self.footer = hints;
         self
     }
 
@@ -287,7 +299,25 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn set_error_text(&mut self, text: Option<String>) {
+        self.error_text = text.map(|text| format!("{ERROR_LABEL}{text}"));
+    }
+
+    /// A line in the error style that is not a failure, such as a question
+    /// to confirm before acting.
+    pub fn set_alert_text(&mut self, text: Option<String>) {
         self.error_text = text;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alert_text(&self) -> Option<&str> {
+        self.error_text.as_deref()
+    }
+
+    /// A dim line under the list, for state that is not an item.
+    pub fn set_notice(&mut self, notice: Option<&'static str>) {
+        if let Some(s) = self.state.as_mut() {
+            s.notice = notice;
+        }
     }
 
     pub fn replace_items(&mut self, items: Vec<T>) {
@@ -436,17 +466,24 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.as_ref().and_then(|s| s.selected_item_index())
     }
 
+    /// Closes with the selected item, for pickers that commit on more than
+    /// Enter. Stays open when nothing is selected.
+    pub fn take_selected(&mut self) -> Option<T> {
+        let idx = self.selected_index()?;
+        let mut state = self.state.take()?;
+        Some(state.items.swap_remove(idx))
+    }
+
     pub fn item(&self, idx: usize) -> Option<&T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
     }
 
-    pub fn handle_paste(&mut self, text: &str) -> bool {
+    pub fn handle_paste(&mut self, text: &str) {
         let Some(s) = self.state.as_mut() else {
-            return false;
+            return;
         };
         s.search.insert_text(text);
         s.update_search_and_clamp();
-        true
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -466,10 +503,10 @@ impl<T: PickerItem> ListPicker<T> {
         }
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> (Rect, Option<Position>) {
         let footer = self.footer;
         match self.state.as_mut() {
-            None => Rect::default(),
+            None => (Rect::default(), None),
             Some(s) => render_ready(
                 frame,
                 area,
@@ -484,6 +521,10 @@ impl<T: PickerItem> ListPicker<T> {
 }
 
 impl<T: PickerItem> Overlay for ListPicker<T> {
+    fn is_prompting(&self) -> bool {
+        false
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }
@@ -503,10 +544,10 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &str,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Hints,
     error_text: Option<&str>,
-) -> Rect {
-    let footer_rows = if footer.is_some() { 1u16 } else { 0 };
+) -> (Rect, Option<Position>) {
+    let notice = s.notice;
     let content_rows = if s.filtered.is_empty() {
         1
     } else {
@@ -517,41 +558,41 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
+    let notice_rows = notice.is_some() as u16;
     let modal = Modal {
         title,
         width_percent: MIN_WIDTH_PERCENT,
+        min_width: MIN_WIDTH_COLS + BORDER,
         max_height_percent: MAX_HEIGHT_PERCENT,
     };
-    let (popup, inner) = modal.render(
+    let (popup, inner) = modal.render_with_footer(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows,
+        content_rows + SEARCH_ROW + error_rows + notice_rows,
+        (!footer.is_empty()).then(|| hint_footer(footer)),
     );
     let viewport_h = inner
         .height
-        .saturating_sub(error_rows + SEARCH_ROW + footer_rows);
+        .saturating_sub(error_rows + notice_rows + SEARCH_ROW);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
     let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(3 + footer.is_some() as usize + error_text.is_some() as usize);
+        Vec::with_capacity(3 + error_text.is_some() as usize + notice.is_some() as usize);
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
     }
     constraints.push(Constraint::Min(1)); // list
-    constraints.push(Constraint::Length(1)); // search
-    if footer.is_some() {
+    if notice.is_some() {
         constraints.push(Constraint::Length(1));
     }
+    constraints.push(Constraint::Length(1)); // search
 
     let areas = Layout::vertical(constraints).split(inner);
     let mut area_idx = 0;
 
     if let Some(err) = error_text {
-        let line = Line::from(Span::styled(
-            format!("  Error: {err}"),
-            theme::current().error,
-        ));
+        let line = Line::from(Span::styled(format!("  {err}"), theme::current().error));
         frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
         area_idx += 1;
     }
@@ -559,8 +600,16 @@ fn render_ready<T: PickerItem>(
     let list_area = areas[area_idx];
     area_idx += 1;
 
+    if let Some(notice) = notice {
+        let line = Line::from(Span::styled(
+            format!("  {notice}"),
+            theme::current().tool_dim,
+        ));
+        frame.render_widget(Paragraph::new(vec![line]), areas[area_idx]);
+        area_idx += 1;
+    }
+
     let search_area = areas[area_idx];
-    area_idx += 1;
 
     render_list(
         frame,
@@ -572,11 +621,7 @@ fn render_ready<T: PickerItem>(
         s.viewport_height,
         s.enabled.as_deref(),
     );
-    render_search(frame, search_area, &s.search);
-
-    if let Some(build) = footer {
-        frame.render_widget(Paragraph::new(build()), areas[area_idx]);
-    }
+    let caret = render_search(frame, search_area, &s.search);
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
     if total_visual as u16 > viewport_h {
@@ -585,20 +630,24 @@ fn render_ready<T: PickerItem>(
     }
 
     s.inner_area = inner;
-    popup
+    (popup, caret)
 }
 
 fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
-    let Some(sec) = items[filtered[idx]].section() else {
+    let item = &items[filtered[idx]];
+    let Some(sec) = item.section() else {
         return 0;
     };
+    // A section row draws itself where the header would have gone, so it costs
+    // the blank spacer above it and nothing more.
+    let header = usize::from(!item.is_section_row());
     if idx == start {
-        return 1;
+        return header;
     }
     let is_break = items[filtered[idx - 1]]
         .section()
         .is_none_or(|prev| prev != sec);
-    if is_break { 2 } else { 0 }
+    if is_break { 1 + header } else { 0 }
 }
 
 fn visual_rows_in_range<T: PickerItem>(
@@ -694,7 +743,7 @@ fn render_list<T: PickerItem>(
             if !lines.is_empty() && lines.len() < viewport_height {
                 lines.push(Line::raw(""));
             }
-            if lines.len() < viewport_height {
+            if !item.is_section_row() && lines.len() < viewport_height {
                 lines.push(Line::from(Span::styled(
                     format!("  {sec}"),
                     theme::current().keybind_section,
@@ -716,6 +765,9 @@ fn render_list<T: PickerItem>(
             }
             (true, false) => (t.item_selected, t.item_selected),
             (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
+            (false, false) if item.is_section_row() => {
+                (t.keybind_section, theme::dim_style(t.keybind_section, 0.4))
+            }
             (false, false) => (t.item, t.item_desc),
         };
         let checkbox = enabled.map(|en| {
@@ -782,22 +834,15 @@ fn render_list<T: PickerItem>(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
-    let query = search.value();
-    let cursor_x = search.x();
-    let chars: Vec<char> = query.chars().collect();
-    let before: String = chars[..cursor_x].iter().collect();
-    let cursor_char = chars.get(cursor_x).copied().unwrap_or(' ');
-    let after_start = cursor_x.saturating_add(1).min(chars.len());
-    let after: String = chars[after_start..].iter().collect();
-
-    let line = Line::from(vec![
-        super::chevron_span(),
-        Span::styled(before, Style::default()),
-        Span::styled(cursor_char.to_string(), theme::current().cursor),
-        Span::styled(after, Style::default()),
-    ]);
-    frame.render_widget(Paragraph::new(vec![line]), area);
+fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) -> Option<Position> {
+    render_field(
+        frame,
+        area,
+        vec![chevron_span()],
+        search.value(),
+        search.cursor_byte(),
+        theme::current().cursor,
+    )
 }
 
 #[cfg(test)]
@@ -1041,6 +1086,7 @@ mod tests {
     struct SectionEntry {
         label: String,
         section: &'static str,
+        is_section_row: bool,
     }
 
     impl PickerItem for SectionEntry {
@@ -1050,22 +1096,41 @@ mod tests {
         fn section(&self) -> Option<&str> {
             Some(self.section)
         }
+        fn is_section_row(&self) -> bool {
+            self.is_section_row
+        }
+    }
+
+    fn in_section(label: &str, section: &'static str) -> SectionEntry {
+        SectionEntry {
+            label: label.into(),
+            section,
+            is_section_row: false,
+        }
+    }
+
+    fn heading(section: &'static str) -> SectionEntry {
+        SectionEntry {
+            label: section.into(),
+            section,
+            is_section_row: true,
+        }
     }
 
     fn section_entries() -> Vec<SectionEntry> {
         vec![
-            SectionEntry {
-                label: "a1".into(),
-                section: "A",
-            },
-            SectionEntry {
-                label: "a2".into(),
-                section: "A",
-            },
-            SectionEntry {
-                label: "b1".into(),
-                section: "B",
-            },
+            in_section("a1", "A"),
+            in_section("a2", "A"),
+            in_section("b1", "B"),
+        ]
+    }
+
+    fn headed_entries() -> Vec<SectionEntry> {
+        vec![
+            heading("Anthropic"),
+            in_section("a1", "Anthropic"),
+            heading("Openrouter"),
+            in_section("b1", "Openrouter"),
         ]
     }
 
@@ -1075,6 +1140,20 @@ mod tests {
         let filtered: Vec<usize> = (0..items.len()).collect();
         let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
         assert_eq!(rows, 6);
+    }
+
+    #[test]
+    fn a_section_row_costs_its_spacer_and_not_a_second_header() {
+        let items = headed_entries();
+        let filtered: Vec<usize> = (0..items.len()).collect();
+
+        let rows = visual_rows_in_range(&filtered, &items, 0, items.len());
+        assert_eq!(rows, 5, "4 items and the one spacer between the sections");
+        assert_eq!(
+            find_scroll_offset_for(&filtered, &items, 3, 3),
+            2,
+            "scrolling has to count the spacer the second heading brings"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::path::Path;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
+use maki_agent::HostPrompt;
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
@@ -13,51 +14,83 @@ use maki_config::providers::{
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
 use maki_providers::provider::fetch_all_models;
+use maki_providers::spec::Owner;
 use maki_providers::{ProviderData, catalog_providers};
-use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
+use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
-    delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
+    delete_plugin_auth, delete_provider_credentials, load_plugin_auth, load_provider_credentials,
+    load_tokens, lock_credentials, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 
-pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
+use crate::cli::{PromptArgs, PromptVariant};
+use crate::provider_scripts;
+
+const PROTOCOL_CHOICES: &str = "openai, openai-responses, anthropic or google";
+const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
+const CONFIGURED: &str = "\x1b[32m✓\x1b[0m";
+const FROM_ENV: &str = "\x1b[33m~\x1b[0m";
+const UNCONFIGURED: &str = " ";
+const CUSTOM_PROVIDER_LABEL: &str = "Custom provider...";
+const PLAN_PREVIEW_PATH: &str = "plan.md";
+
+pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
-        Some("openai") => openai_auth::login(storage)?,
-        Some("xai") => xai_auth::login(storage)?,
+        Some("openai") => openai_auth::login(storage).await?,
+        Some("xai") => xai_auth::login(storage).await?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => {
             let slug = slugify(slug);
             if builtin_provider(&slug).is_none()
-                && dynamic::display_name(&slug).is_none()
+                && !plugin::is_registered(&slug)
                 && ProvidersConfig::load().get(&slug).is_none()
-                && let Some(provider_data) = maki_providers::catalog_provider(&slug)
+                && let Some(provider_data) = maki_providers::catalog_provider(&slug).await
             {
                 login_catalog_provider(&provider_data, storage)?;
             } else {
-                login_provider(&slug, storage)?;
+                login_provider(&slug, storage).await?;
             }
         }
-        None => login_interactive(storage)?,
+        None => login_interactive(storage).await?,
     }
     Ok(())
 }
 
-fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
+async fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     let builtin = builtin_provider(slug);
     let is_custom = ProvidersConfig::load().get(slug).is_some();
-    if builtin.is_none() && dynamic::display_name(slug).is_none() && !is_custom {
-        bail!("unknown provider '{slug}'");
+    if builtin.is_none() && !plugin::is_registered(slug) && !is_custom {
+        match provider_scripts::unknown_provider_hint(slug) {
+            Some(hint) => bail!(hint),
+            None => bail!("unknown provider '{slug}'"),
+        }
     }
 
-    if builtin.is_none() && dynamic::auth_providers().iter().any(|(s, _)| *s == slug) {
-        dynamic::login(slug)?;
+    // A `login` hook is the plugin's own flow and wins over asking for a key.
+    // A plugin with neither has no way in, which `plugin::login` reports.
+    let hooked = plugin::auth_providers().iter().any(|(s, _)| s == slug);
+    if hooked || (builtin.is_none() && plugin::is_registered(slug)) {
+        plugin::login(slug).await?;
         return Ok(());
     }
 
     let mut config = ProvidersConfig::load();
     let def = config.get(slug).cloned();
+
+    // Past the check above, an `Unknown` owner is a `providers.toml` entry with
+    // no `protocol`. Login would say "Configured" and it would never work,
+    // unless the slug is a models.dev provider, which brings its own protocol.
+    if matches!(Owner::of(slug), Owner::Unknown)
+        && known_outside_catalog(slug, &catalog_slugs().await)
+    {
+        bail!(
+            "providers.toml entry [{slug}] has no `protocol` and is not a models.dev provider, so maki cannot talk to it\n\
+             add `protocol` ({PROTOCOL_CHOICES}) and `base_url`, or run `maki auth login` and pick \"Custom provider...\"\n\n\
+             See {PROVIDERS_TOML_DOCS}"
+        );
+    }
 
     let plan = select_plan(slug, builtin, def.as_ref())?;
 
@@ -133,85 +166,131 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-fn login_interactive(storage: &StateDir) -> Result<()> {
-    let builtins = all_builtins();
+async fn catalog_slugs() -> Vec<String> {
+    catalog_providers()
+        .await
+        .into_iter()
+        .map(|provider| provider.slug)
+        .collect()
+}
+
+/// An empty list means models.dev could not load, say offline with a cold
+/// cache. The slug may still be one of its providers then, so only a loaded
+/// catalog can rule it out.
+fn known_outside_catalog(slug: &str, catalog_slugs: &[String]) -> bool {
+    !catalog_slugs.is_empty() && !catalog_slugs.iter().any(|known| known == slug)
+}
+
+/// One line of the `maki auth login` picker.
+struct LoginRow {
+    status: &'static str,
+    label: String,
+    target: LoginTarget,
+}
+
+/// What picking a [`LoginRow`] starts.
+enum LoginTarget {
+    Provider(String),
+    /// A models.dev provider, which logs in through its catalog entry.
+    Catalog(Box<ProviderData>),
+    Custom,
+}
+
+impl LoginRow {
+    fn new(status: &'static str, slug: &str, display_name: &str, target: LoginTarget) -> Self {
+        Self {
+            status,
+            label: format!("{slug:<14} {display_name}"),
+            target,
+        }
+    }
+
+    fn provider(status: &'static str, slug: &str, display_name: &str) -> Self {
+        Self::new(
+            status,
+            slug,
+            display_name,
+            LoginTarget::Provider(slug.to_owned()),
+        )
+    }
+}
+
+async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
-    let custom_slugs: Vec<&String> = config
-        .providers
-        .keys()
-        .filter(|s| builtin_provider(s).is_none() && *s != "opencode")
-        .collect();
+    let mut rows: Vec<LoginRow> = Vec::new();
+
+    let saved = |slug: &str| load_provider_credentials(storage, slug).is_some();
+    let mark = |configured: bool| if configured { CONFIGURED } else { UNCONFIGURED };
+
+    // A plugin with both a `login` hook and an `api_key_env` has a row here,
+    // and either credential signs it in.
+    for b in all_builtins() {
+        let status = if saved(b.slug) || load_plugin_auth(storage, b.slug).is_some() {
+            CONFIGURED
+        } else if env::var(b.default_api_key_env).is_ok() {
+            FROM_ENV
+        } else {
+            UNCONFIGURED
+        };
+        rows.push(LoginRow::provider(status, b.slug, b.display_name));
+    }
+    for (slug, display) in hooked_login_providers() {
+        let status = mark(load_plugin_auth(storage, &slug).is_some());
+        rows.push(LoginRow::provider(status, &slug, &display));
+    }
+    let custom = config.providers.iter().filter(|(slug, _)| {
+        builtin_provider(slug).is_none() && !plugin::is_registered(slug) && *slug != "opencode"
+    });
+    for (slug, def) in custom {
+        let display = def.display_name.as_deref().unwrap_or(slug);
+        rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
+    }
+    for provider in catalog_providers().await {
+        let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
+        rows.push(LoginRow::new(
+            mark(saved(&slug)),
+            &slug,
+            &display,
+            LoginTarget::Catalog(Box::new(provider)),
+        ));
+    }
+    rows.push(LoginRow {
+        status: UNCONFIGURED,
+        label: CUSTOM_PROVIDER_LABEL.to_owned(),
+        target: LoginTarget::Custom,
+    });
 
     println!();
     println!("  Available providers:");
     println!();
-    for (i, b) in builtins.iter().enumerate() {
-        let status = if load_provider_credentials(storage, b.slug).is_some() {
-            "\x1b[32m✓\x1b[0m"
-        } else if env::var(b.default_api_key_env).is_ok() {
-            "\x1b[33m~\x1b[0m"
-        } else {
-            " "
-        };
-        println!("  {} {}. {:<14} {}", status, i + 1, b.slug, b.display_name);
+    for (i, row) in rows.iter().enumerate() {
+        println!("  {} {}. {}", row.status, i + 1, row.label);
     }
-    let mut idx = builtins.len();
-    for slug in &custom_slugs {
-        idx += 1;
-        let status = if load_provider_credentials(storage, slug).is_some() {
-            "\x1b[32m✓\x1b[0m"
-        } else {
-            " "
-        };
-        let display = config
-            .get(slug)
-            .and_then(|d| d.display_name.as_deref())
-            .unwrap_or(slug);
-        println!("  {} {}. {:<14} {}", status, idx, slug, display);
-    }
-
-    let catalog_entries = catalog_providers();
-    for cat in &catalog_entries {
-        idx += 1;
-        let status = if load_provider_credentials(storage, &cat.slug).is_some() {
-            "\x1b[32m✓\x1b[0m"
-        } else {
-            " "
-        };
-        println!(
-            "  {} {}. {:<14} {}",
-            status, idx, cat.slug, cat.display_name
-        );
-    }
-    idx += 1;
-    let custom_idx = idx;
-    println!("    {}. Custom provider...", custom_idx);
     println!();
 
-    print!("  Select [1-{}]: ", custom_idx);
+    print!("  Select [1-{}]: ", rows.len());
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let choice: usize = input.trim().parse().context("enter a number")?;
 
-    if choice == 0 || choice > custom_idx {
+    let Some(row) = choice.checked_sub(1).and_then(|i| rows.into_iter().nth(i)) else {
         bail!("invalid selection");
+    };
+    match row.target {
+        LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
+        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage),
+        LoginTarget::Custom => login_custom(storage),
     }
+}
 
-    if choice == custom_idx {
-        login_custom(storage)?;
-    } else if choice <= builtins.len() {
-        let slug = builtins[choice - 1].slug;
-        login_provider(slug, storage)?;
-    } else if choice <= builtins.len() + custom_slugs.len() {
-        let slug = custom_slugs[choice - builtins.len() - 1];
-        login_provider(slug, storage)?;
-    } else {
-        let provider = &catalog_entries[choice - builtins.len() - custom_slugs.len() - 1];
-        login_catalog_provider(provider, storage)?;
-    }
-
-    Ok(())
+/// Plugin providers that log in through their own `login` hook and declare
+/// no key, so no login row lists them.
+fn hooked_login_providers() -> Vec<(String, String)> {
+    plugin::auth_providers()
+        .into_iter()
+        .filter(|(slug, _)| builtin_provider(slug).is_none())
+        .collect()
 }
 
 fn login_catalog_provider(provider: &ProviderData, storage: &StateDir) -> Result<()> {
@@ -406,31 +485,47 @@ fn prompt_api_key(url: Option<&str>, display_name: &str, optional: bool) -> Resu
     Ok(api_key)
 }
 
-pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
+pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
         "xai" => xai_auth::logout(storage)?,
         "copilot" => copilot_auth::logout(storage)?,
         _ => {
-            let mut config = ProvidersConfig::load();
-            let deleted =
+            // Logging out forgets every credential maki keeps for the slug,
+            // whichever way it was saved, so it never depends on the plugin
+            // cooperating. The hook goes first, while a token it may want to
+            // revoke upstream still exists, and a hook that fails is reported
+            // only once the local credentials are gone.
+            let hook = plugin::logout(&slug).await;
+            let removed_key =
                 delete_provider_credentials(storage, &slug).context("delete credentials")?;
-            if deleted {
-                println!("Removed credentials for '{}'.", slug);
+            let removed_login = {
+                let _lock = lock_credentials(storage, &slug);
+                delete_plugin_auth(storage, &slug).context("delete plugin login")?
+            };
+            if removed_key {
+                println!("Removed credentials for '{slug}'.");
             }
+            if removed_login {
+                println!("Removed the plugin login for '{slug}'.");
+            }
+            let mut config = ProvidersConfig::load();
             if config.remove(&slug) {
                 config.save().context("save providers.toml")?;
             }
-            if !deleted && builtin_provider(&slug).is_none() {
-                dynamic::logout(&slug)?;
+            let hooked = hook.with_context(|| {
+                format!("removed the local credentials for '{slug}', but its logout hook failed")
+            })?;
+            if !(hooked || removed_key || removed_login) {
+                println!("No credentials stored for '{slug}'.");
             }
         }
     }
     Ok(())
 }
 
-pub fn auth_status(storage: &StateDir) -> Result<()> {
+pub async fn auth_status(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
     let builtins = all_builtins();
 
@@ -441,6 +536,8 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
 
         if load_tokens(storage, b.slug).is_some() {
             println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
+        } else if load_plugin_auth(storage, b.slug).is_some() {
+            println!("  {CONFIGURED} {:<14} {} (plugin login)", b.slug, display);
         } else if let Some(creds) = load_provider_credentials(storage, b.slug) {
             let plan_info = def
                 .and_then(|d| d.plan.as_deref())
@@ -474,9 +571,18 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         }
     }
 
+    for (slug, display) in hooked_login_providers() {
+        if load_plugin_auth(storage, &slug).is_some() {
+            println!("  {CONFIGURED} {slug:<14} {display} (plugin login)");
+        } else {
+            println!("  \x1b[31m✗\x1b[0m {slug:<14} {display} (run: maki auth login {slug})");
+        }
+    }
+
     for (slug, def) in &config.providers {
         // 'opencode' could show up here, when the user configured free models on that provider.
         if builtin_provider(slug).is_some()
+            || plugin::is_registered(slug)
             || (slug == "opencode" && def.enable_free_models.is_some())
         {
             continue;
@@ -506,7 +612,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         }
     }
     // Catalog providers from models.dev
-    let catalog_entries = catalog_providers();
+    let catalog_entries = catalog_providers().await;
     if !catalog_entries.is_empty() {
         println!("  \x1b[1mCatalog Providers (models.dev):\x1b[0m");
         for entry in &catalog_entries {
@@ -535,18 +641,24 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
-    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
+pub async fn models(
+    no_plugins: bool,
+    no_jit: bool,
+    refresh: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
+    // Model listing calls plugin hooks, so the host outlives the fetch.
+    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
     let mut refresh_failure = None;
     if refresh {
-        match maki_providers::refresh_catalog() {
+        match maki_providers::refresh_catalog().await {
             Ok(()) => eprintln!("models.dev catalog has been refreshed"),
             Err(e) => refresh_failure = Some(e),
         }
     }
 
-    smol::block_on(fetch_all_models(
+    fetch_all_models(
         &config.provider.model_policy,
         |batch| {
             for model in batch.models {
@@ -557,7 +669,8 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
             }
         },
         None,
-    ));
+    )
+    .await;
 
     if let Some(e) = refresh_failure {
         bail!("catalog refresh failed, keeping existing cache: {e}");
@@ -565,10 +678,15 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     Ok(())
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
+pub async fn index(
+    path: &str,
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<()> {
     // Load-bearing binding: `index` is a Lua builtin, and dropping the host
     // stops the Lua thread the tool runs on.
-    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
+    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -583,7 +701,7 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
         .parse(&input)
         .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
     let ctx = maki_agent::tools::cli_tool_ctx();
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let result = inv.execute(&ctx).await;
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
         Err(e) => bail!("index failed: {e}"),
@@ -591,33 +709,38 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
     Ok(())
 }
 
-pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
-    smol::block_on(async {
-        let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-        let trust = project::resolve(storage, &cwd, trust_mode);
-        super::report_warnings(trust.notices());
-        let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
-        let raw = config
-            .mcp
-            .get(server)
-            .ok_or_else(|| color_eyre::eyre::eyre!("unknown MCP server: {server}"))?;
-        let (url, oauth) = match mcp_config::parse_server(server.to_owned(), raw.clone())?.transport
-        {
-            mcp_config::Transport::Http { url, oauth, .. } => (url, oauth),
+pub async fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let trust = project::resolve(storage, &cwd, trust_mode);
+    super::report_warnings(trust.notices());
+    let (config, _) = mcp_config::load_config(&cwd, trust.project_config);
+    let raw = config
+        .mcp
+        .get(server)
+        .ok_or_else(|| color_eyre::eyre::eyre!("unknown MCP server: {server}"))?;
+    let origin = config.origins.get(server).cloned().unwrap_or_default();
+    let (url, oauth, ca_file) =
+        match mcp_config::parse_server(server.to_owned(), raw.clone(), &origin)?.transport {
+            mcp_config::Transport::Http {
+                url,
+                oauth,
+                ca_file,
+                ..
+            } => (url, oauth, ca_file),
             _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
         };
-        mcp_oauth::authenticate(
-            server,
-            &url,
-            None,
-            storage,
-            mcp_oauth::Interaction::Cli,
-            oauth,
-        )
-        .await?;
-        eprintln!("Successfully authenticated with MCP server '{server}'");
-        Ok(())
-    })
+    mcp_oauth::authenticate(
+        server,
+        &url,
+        None,
+        storage,
+        mcp_oauth::Interaction::Cli,
+        oauth,
+        ca_file.as_deref(),
+    )
+    .await?;
+    eprintln!("Successfully authenticated with MCP server '{server}'");
+    Ok(())
 }
 
 pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
@@ -630,27 +753,31 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn prompt(
-    variant: &crate::cli::PromptVariant,
-    plan: bool,
-    tools: bool,
-    names: bool,
+pub async fn prompt(
+    PromptArgs {
+        variant,
+        plan,
+        tools,
+        names,
+    }: PromptArgs,
+    host_prompt: HostPrompt,
     no_plugins: bool,
     no_jit: bool,
     trust_mode: TrustMode,
 ) -> Result<()> {
-    use crate::cli::PromptVariant;
-    use maki_agent::agent::{build_system_prompt, load_instruction_text};
-    use maki_agent::prompt::{PromptId, assemble};
+    use maki_agent::agent::{load_instruction_text, plan_mode_update};
+    use maki_agent::prompt::PromptId;
     use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
+    use maki_agent::tools::{
+        DescriptionContext, RequestTools, ToolAudience, ToolFilter, ToolRegistry,
+    };
     use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
+    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode).await?;
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
@@ -679,28 +806,64 @@ pub fn prompt(
     }
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let instructions = load_instruction_text(&cwd.to_string_lossy());
+    let instructions = load_instruction_text(&cwd.to_string_lossy(), &config.agent.instructions);
     let slots = host.event_handle().collect_prompt_slots();
 
     let output = match variant {
         PromptVariant::System => {
-            let mode = if plan {
-                maki_agent::AgentMode::Plan(std::path::PathBuf::from("plan.md"))
-            } else {
-                maki_agent::AgentMode::Build
-            };
             let model_spec = config
                 .provider
                 .default_model
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
-            let model = Model::from_spec(model_spec).context("invalid default model")?;
-            build_system_prompt(&vars, &mode, &instructions, &slots, &model)
+            let model = Model::from_spec_or_warm_catalog(model_spec)
+                .await
+                .context("invalid default model")?;
+            let prompt = host_prompt
+                .context(
+                    &vars,
+                    &instructions,
+                    &slots,
+                    &model,
+                    RequestTools::default(),
+                )
+                .system;
+            // Plan mode reaches the model as a context update after the
+            // prompt, so this shows that message too.
+            if plan {
+                format!(
+                    "{prompt}\n\n{}",
+                    plan_mode_update(Path::new(PLAN_PREVIEW_PATH), &slots)
+                )
+            } else {
+                prompt
+            }
         }
-        PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions),
-        PromptVariant::General => assemble(PromptId::General, &slots, &instructions),
+        PromptVariant::Research => slots.render(PromptId::Research, &vars, &instructions),
+        PromptVariant::General => slots.render(PromptId::General, &vars, &instructions),
     };
 
     print!("{output}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    const CATALOG_SLUG: &str = "fireworks-ai";
+    const OTHER_CATALOG_SLUG: &str = "togetherai";
+
+    #[test_case(&[], false ; "unloaded_catalog_rules_nothing_out")]
+    #[test_case(&[CATALOG_SLUG], false ; "slug_in_loaded_catalog")]
+    #[test_case(&[OTHER_CATALOG_SLUG], true ; "slug_missing_from_loaded_catalog")]
+    fn known_outside_catalog_needs_a_loaded_catalog(catalog: &[&str], expected: bool) {
+        let catalog_slugs: Vec<String> = catalog.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            known_outside_catalog(CATALOG_SLUG, &catalog_slugs),
+            expected
+        );
+    }
 }

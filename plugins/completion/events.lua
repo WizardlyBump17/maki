@@ -14,10 +14,10 @@ local Events = {}
 -- the `InputChanged` handler tells an accept from the user typing.
 Events.PLUGIN = "completion"
 
--- The chat input moved, and the event says how: `text`, `cursor`, `version`
--- and `session_id` are every field `maki.ui.input` would answer with, so the
--- refresh below reads nothing back and the rows answer the keystroke a round
--- trip sooner.
+-- The chat input moved, and the event says how: `text`, `cursor`, `anchor`,
+-- `version` and `session_id` are every field `maki.ui.input` would answer
+-- with, so the refresh below reads nothing back and the rows answer the
+-- keystroke a round trip sooner.
 function Events.input_changed(data)
   -- An accept is an `input_edit`, which fires an `InputChanged` of its own
   -- naming this plugin. Acting on it would reopen the popup on the path it
@@ -39,7 +39,10 @@ function Events.input_changed(data)
   if open and open ~= data.session_id then
     Menu.close()
   end
-  if not Menu.session_id() and not Trigger.find(data.text, data.cursor) then
+  -- Which punctuation opens a mention depends on the sources loaded, and
+  -- asking them is too slow for this handler. So any punctuation earns a
+  -- refresh, and the refresh sorts it out.
+  if not Menu.session_id() and not Trigger.may_open(data.text, data.cursor) then
     return
   end
   Menu.refresh_later(data)

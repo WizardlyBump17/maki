@@ -11,8 +11,8 @@ pub fn latest_version() -> Option<&'static str> {
 }
 
 pub fn spawn_check() {
-    smol::spawn(async {
-        match version::fetch_latest_async().await {
+    tokio::spawn(async {
+        match version::fetch_latest().await {
             Ok(v) if is_newer(&v, CURRENT) => {
                 let _ = LATEST.set(v);
             }
@@ -21,6 +21,5 @@ pub fn spawn_check() {
                 tracing::debug!(error = %e, "update check failed");
             }
         }
-    })
-    .detach();
+    });
 }

@@ -1,12 +1,16 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, Result as LuaResult, Table, Value};
 
+use crate::agent_autocmd::host_event_fields;
+use crate::api::util::convert::TableExt;
 use crate::api::util::dispatch::{DepthGuard, Reentry};
-use crate::runtime::{run_detached, strip_traceback};
+use crate::plugin_permissions::{Permission, grant_hint};
+use crate::runtime::{quoted_list, run_detached, strip_traceback, warn_plugin_once};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -18,6 +22,9 @@ pub(crate) struct AutocmdEntry {
     pub plugin: Arc<str>,
     pub once: bool,
     pub patterns: Option<Vec<String>>,
+    /// Whether the plugin holds `session_read`, so it gets a host event
+    /// whole rather than only its metadata.
+    pub reads_content: bool,
 }
 
 #[derive(Default)]
@@ -58,7 +65,7 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
 /// Each callback runs in its own coroutine under its own detached task
 /// scope, so it may suspend (the `maki.fs.*` helpers park on
-/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// `spawn_blocking`); an inline resume would die with "attempt to yield
 /// across metamethod / C-call boundary". The per-callback scope also means
 /// task-owned jobs a handler starts die with that handler instead of
 /// outliving it to the end of the batch.
@@ -69,13 +76,17 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 ///
 /// `data` is shared across callbacks (nvim does the same), but each callback
 /// gets its own `ev` table, so one plugin's mutation cannot leak into the
-/// next.
+/// next. A callback whose plugin lacks `session_read` shares a second `data`
+/// instead, built once before any callback runs, holding only the keys
+/// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
+/// calls metadata. An event the host never fires is a plugin's own, and
+/// arrives as fired.
 pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, data: Value) {
     let Ok(_guard) = DepthGuard::enter(&lua, "autocmd", &event, Reentry::Vm) else {
         tracing::warn!(event, "autocmd dispatch exceeded max depth, skipping");
         return;
     };
-    let snapshot: Vec<(u64, Arc<str>, Function)> = {
+    let snapshot: Vec<(u64, Arc<str>, Function, bool)> = {
         let Some(mut store) = lua.app_data_mut::<AutocmdStore>() else {
             return;
         };
@@ -88,26 +99,46 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
         entries.retain(|e| {
             let fires = pattern_matches(e.patterns.as_deref(), pattern.as_deref());
             if fires {
-                snapshot.push((e.id, Arc::clone(&e.plugin), e.callback.clone()));
+                snapshot.push((
+                    e.id,
+                    Arc::clone(&e.plugin),
+                    e.callback.clone(),
+                    e.reads_content,
+                ));
             }
             !(fires && e.once)
         });
         snapshot
     };
-    for (id, plugin, callback) in snapshot {
-        let ev = match make_ev_table(&lua, id, &event, pattern.as_deref(), &data) {
+    let redacted = if snapshot.iter().all(|(.., reads_content)| *reads_content) {
+        None
+    } else {
+        match metadata_only(&lua, &event, &data) {
+            Ok(redacted) => redacted,
+            Err(e) => {
+                tracing::warn!(event, error = %e, "failed to build redacted autocmd data");
+                return;
+            }
+        }
+    };
+    for (id, plugin, callback, reads_content) in snapshot {
+        let data = match &redacted {
+            Some((stripped, removed)) if !reads_content => {
+                warn_plugin_once(&lua, &plugin, &event, || {
+                    content_omitted_message(&plugin, &event, removed)
+                });
+                stripped
+            }
+            _ => &data,
+        };
+        let ev = match make_ev_table(&lua, id, &event, pattern.as_deref(), data) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!(event, error = %e, "failed to build autocmd ev table");
                 return;
             }
         };
-        if let Err(e) = run_detached(&lua, async {
-            let thread = lua.create_thread(callback)?;
-            thread.into_async::<()>(ev)?.await
-        })
-        .await
-        {
+        if let Err(e) = run_detached(&lua, callback.call_async::<()>(ev)).await {
             tracing::warn!(
                 event,
                 plugin = &*plugin,
@@ -116,6 +147,55 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
             );
         }
     }
+}
+
+/// {data} cut down to the keys {event} classifies as metadata, and the keys
+/// cut, sorted. `None` when nothing was cut, so the caller shares the
+/// original and warns nobody, and for an event the host never fires.
+///
+/// An allowlist on purpose: a key the host sends but nobody classified is
+/// cut too, so a field that slips past the pin test fails closed.
+///
+/// Most events carry only metadata, so the keys are checked before anything
+/// is built. A key that is not a string is cut by its type name and never
+/// formatted, because a plugin can fire a host event with a key whose
+/// `__tostring` throws, and that must not drop the event for everyone.
+fn metadata_only(lua: &Lua, event: &str, data: &Value) -> LuaResult<Option<(Value, Vec<String>)>> {
+    let (Some(fields), Value::Table(table)) = (host_event_fields(event), data) else {
+        return Ok(None);
+    };
+    let is_metadata = |key: &Value| matches!(key, Value::String(k) if k.to_str().is_ok_and(|k| fields.is_metadata(&k)));
+    if table
+        .pairs::<Value, Value>()
+        .all(|pair| pair.is_ok_and(|(key, _)| is_metadata(&key)))
+    {
+        return Ok(None);
+    }
+    let stripped = lua.create_table()?;
+    let mut removed = Vec::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        if is_metadata(&key) {
+            stripped.raw_set(key, value)?;
+        } else if let Value::String(k) = &key {
+            removed.push(k.to_string_lossy());
+        } else {
+            removed.push(format!("[{}]", key.type_name()));
+        }
+    }
+    removed.sort_unstable();
+    removed.dedup();
+    stripped.set_metatable(table.metatable())?;
+    Ok(Some((Value::Table(stripped), removed)))
+}
+
+pub fn content_omitted_message(plugin: &str, event: &str, removed: &[impl Display]) -> String {
+    format!(
+        "plugin {plugin}: '{event}' arrives without {}, which needs '{}'. {}",
+        quoted_list(removed),
+        Permission::SessionRead,
+        grant_hint(&[Permission::SessionRead])
+    )
 }
 
 fn make_ev_table(
@@ -149,20 +229,27 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
-/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
-/// `"FileIndexReady"`. Plugins can also fire their own events with
-/// `exec_autocmds`.
+/// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
+/// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+/// `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
+/// events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id` except `"FileIndexReady"`,
-/// which is about a directory rather than a session. For `"SessionReset"` and
+/// which is about a directory rather than a session, and `"ModeChanged"`,
+/// since the mode is the same in every session. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
 /// name the session now running or focused. What each event adds:
 ///
 /// - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+/// - `"ToolDone"` adds `data.is_error` and `data.bytes`, the size of the
+///   text the model reads. A call that ran also carries `data.duration_ms`
+///   and `data.input`, the input after every `tool.*.input` layer. A call
+///   that never ran, like a cancelled one, has neither.
+/// - `"TurnStart"`: `data.text`, the message that started the turn.
 /// - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
-///   `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
-///   cache included), `data.cost`, `data.list_cost`, `data.context_size`,
+///   `"max_turns"`, `"cancelled"`, or `"dropped"` when an
+///   `agent.user_message` layer refused the message), `data.usage` (four
+///   token fields, cache included), `data.cost`, `data.list_cost`, `data.context_size`,
 ///   `data.context_window`, and `data.num_turns` (model round-trips the
 ///   turn took). `list_cost` is the un-subsidised list price and `cost` is
 ///   the real bill, so a budget plugin charges against whichever one it
@@ -170,18 +257,32 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
 ///   trigger time.
 /// - `"CompactionDone"`: `data.context_size_before`,
-///   `data.context_size_after`, and `data.context_window`.
+///   `data.context_size_after`, `data.context_window`, and `data.summary`,
+///   the text that replaced the history.
 /// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
 ///   agent just wrote. Fires once per draft. Plan state is per session, so
 ///   pass `data.session_id` to `maki.plan.read`.
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+///   or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+///   stays `"working"` while a background task it waits on still runs.
+/// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
+///   when the title changes (rename or auto-generation).
+/// - `"SessionCwdChanged"`: `data.cwd`, the session's new working
+///   directory, when `/cd` changes it.
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-///   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
-///   changes status. A task that comes back from disk already finished
-///   stays quiet, so reloading a session does not replay old tasks.
+///   (`"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
+///   or changes status. A task a plugin opened with `maki.agent.session`
+///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
+///   task that comes back from disk already finished stays quiet, so
+///   reloading a session does not replay old tasks.
+/// - `"TaskStopped"`: `data.id`, when the user stops a task with Esc in its
+///   tab or through `maki.task.stop`. A plugin task carries `data.plugin`,
+///   and by then it is already gone from `maki.agent.list()`.
+///   `"TaskStatusChanged"` compares tasks once per frame, so it can miss a
+///   task that opened and stopped in the same frame. This event never does,
+///   so an owner can rely on it to drop work it still has queued.
 /// - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
 ///   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
 ///   the chat cycling keys, `maki.task.focus`, and a session switch that
@@ -189,15 +290,23 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
-/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
-///   name when that plugin's `maki.ui.input_edit` was the only writer this
-///   frame, and nil otherwise (including when the user moved the caret), so
-///   ignoring your own name never drops a change. `data.cursor_only` is true
-///   when only the caret moved. Handlers that only care about the text
-///   should return early on it. Fires at most once per frame, and only when
-///   the text or caret changed. Focusing another session republishes that
-///   session's input.
+/// - `"InputChanged"`: `data.text`, `data.cursor`, `data.anchor`,
+///   `data.version` and `data.session_id`, as
+///   [`maki.ui.input`](#maki-ui-input) reports them. `data.cursor_only` is
+///   true when only the cursor or the selection moved. `data.source` names
+///   the plugin whose `maki.ui.input_edit` made the only change since the
+///   last `"InputChanged"`, and is nil otherwise, so a handler can skip its
+///   own edits. A package goes by its
+///   [package name](/docs/packages/#install-from-git), and `init.lua` code
+///   by `"global/init.lua"` or `"project/init.lua"`. Fires at most once per
+///   screen redraw, and again for the input of a tab that takes focus.
+///   [Marks](#input-marks) alone do not fire it, so a handler can call
+///   `maki.ui.input_decorate` without looping.
+/// - `"ModeChanged"`: `data.old_mode` and `data.new_mode`, each `"n"` or
+///   `"i"`. Fires whenever `maki.fn.mode()` changes: on `maki.ui.set_mode`,
+///   and when the chat input gains or loses the keyboard, as when a picker
+///   opens. Use it to draw a mode indicator. Like `"InputChanged"`, it fires
+///   only with a UI.
 /// - `"FileIndexReady"`: `data.root`, the absolute directory that was
 ///   walked, `data.files`, how many paths the walk left, and `data.crashed`
 ///   and `data.truncated`, the two ways that list is not the whole tree.
@@ -208,6 +317,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   the `root` of the call that asked for the walk, so a plugin matching
 ///   the two takes an event without a root as a reason to ask again. Asking
 ///   again only ever re-reads the root the plugin passed.
+///
+/// Conversation content needs the `session_read` permission. Without it a
+/// host event still arrives, carrying only its metadata fields:
+/// `"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
+/// `"CompactionDone"` without `data.summary`, and `"InputChanged"` without
+/// `data.text`. Maki warns once per plugin and event, naming what was left
+/// out. Events a plugin fires under its own names arrive as fired.
 ///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
 /// subagent turns never show up. A manual `/compact` ends its run without
@@ -253,10 +369,16 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   end,
 /// })
 #[lua_fn]
-fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table) -> LuaResult<u64> {
+fn create_autocmd(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] reads_content: bool,
+    event: Value,
+    opts: Table,
+) -> LuaResult<u64> {
     let events = parse_string_or_seq(event, "event")?;
     let callback: Function = opts.get("callback")?;
-    let once: bool = opts.get("once").unwrap_or(false);
+    let once: bool = opts.opt_bool("once").unwrap_or(false);
     let patterns = match opts.get::<Value>("pattern")? {
         Value::Nil => None,
         v => Some(parse_string_or_seq(v, "pattern")?),
@@ -274,6 +396,7 @@ fn create_autocmd(lua: &Lua, #[ctx] plugin: Arc<str>, event: Value, opts: Table)
                 plugin: Arc::clone(&plugin),
                 once,
                 patterns: patterns.clone(),
+                reads_content,
             },
         );
     }
@@ -331,8 +454,8 @@ async fn exec_autocmds(lua: Lua, event: Value, opts: Option<Table>) -> LuaResult
 }
 
 lua_table! {
-    extend "maki.api" => pub(crate) fn add_autocmd_methods(plugin: Arc<str>), DOCS [
-        create_autocmd(plugin), del_autocmd, exec_autocmds,
+    extend "maki.api" => pub(crate) fn add_autocmd_methods(plugin: Arc<str>, reads_content: bool), DOCS [
+        create_autocmd(plugin, reads_content), del_autocmd, exec_autocmds,
     ]
 }
 

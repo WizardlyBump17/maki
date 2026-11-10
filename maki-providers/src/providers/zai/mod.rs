@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -12,7 +13,7 @@ use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
 };
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
@@ -33,12 +34,13 @@ const MAX_TOKENS_FIELD: &str = "max_tokens";
 const AUTH_NOTE: &str = "(shared across both endpoints)";
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: ENV_VAR,
-    base_url: BASE_URL,
-    max_tokens_field: MAX_TOKENS_FIELD,
+    slug: Cow::Borrowed(SLUG),
+    api_key_env: Cow::Borrowed(ENV_VAR),
+    base_url: Cow::Borrowed(BASE_URL),
+    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: false,
-    provider_name: DISPLAY_NAME,
+    usage_cost: false,
+    provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
 const PLANS: &[(&str, ProviderPlan)] = &[
@@ -71,17 +73,21 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Glm,
     supports_thinking: false,
+    supports_deferred_tools: false,
+    sends_thinking: |_, choice| dialect::GLM.sends(choice),
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: NO_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: NO_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
@@ -181,7 +187,7 @@ pub struct Zai {
 
 impl Zai {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("zai", CONFIG_STANDARD.api_key_env)?;
+        let pool = KeyPool::resolve("zai", &CONFIG_STANDARD.api_key_env)?;
         let mut auth = ResolvedAuth::bearer("zai", pool.current())?;
         let provider_config = maki_config::providers::ProvidersConfig::load();
         if let Some(url) =
@@ -227,7 +233,9 @@ impl Provider for Zai {
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let mut body =
+                self.compat
+                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
             if model.supports_thinking() {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::GLM, model);
@@ -267,11 +275,7 @@ impl Provider for Zai {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     fn adjust_model(&self, model: &mut Model) {
@@ -280,7 +284,6 @@ impl Provider for Zai {
 }
 
 /// `glm-5.3` -> `(5, 3)`, `glm-5.3-flash` -> `(5, 3)`, `glm-5-code` -> `(5, 0)`.
-/// Same trick as `claude_version`.
 fn glm_version(model_id: &str) -> Option<(u32, u32)> {
     let mut parts = model_id.strip_prefix("glm-")?.split(['-', '.']);
     let major = parts.next()?.parse().ok()?;

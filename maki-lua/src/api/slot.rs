@@ -13,14 +13,25 @@ use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
 use crate::api::tool::permission_keys;
 use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
-use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
+use crate::plugin_permissions::{Ceiling, Permission, PluginPermissions, grant_hint};
 
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
 pub(crate) const HOST_PREFIX: &str = "tool.";
-/// The other closed namespace: built-in surfaces a plugin layers to take over.
+/// The other closed namespaces: built-in surfaces a plugin layers to take
+/// over, and the points the agent loop fires itself.
 pub(crate) const UI_PREFIX: &str = "ui.";
-const HOST_PREFIXES: [&str; 2] = [HOST_PREFIX, UI_PREFIX];
+pub(crate) const AGENT_PREFIX: &str = "agent.";
+const PERMISSION_PREFIX: &str = "permission.";
+const DECLARE_SLOT: &str = "declare_slot";
+pub(crate) const UNGRANTED_PRICE_ERR: &str = "which this plugin was not granted";
+const HOST_PREFIXES: [&str; 4] = [HOST_PREFIX, UI_PREFIX, AGENT_PREFIX, PERMISSION_PREFIX];
+/// `tool.*.input` wraps every call, whichever tool it names.
+pub(crate) const ANY_TOOL: &str = "*";
+
+/// Fired where the permission prompt would show. The default is the prompt
+/// itself, so a layer either answers for the user or passes the call on.
+pub(crate) const PERMISSION_PROMPT_SLOT: &str = "permission.prompt";
 
 /// Fired when the agent finishes writing a plan. The default opens the
 /// built-in plan form, so a layer that answers `false` owns the surface for
@@ -36,6 +47,9 @@ const SEAM: &str = "slot";
 pub(crate) struct SlotLayer {
     pub plugin: Arc<str>,
     pub func: Function,
+    /// The [`Ceiling`] the layer was set under, which caps what it may steer
+    /// below its plugin's grants.
+    pub ceiling: Option<Ceiling>,
 }
 
 /// What a foreign layer pays to steer a declared slot, set by the owner at
@@ -44,10 +58,55 @@ pub(crate) struct SlotLayer {
 ///
 /// `None` is a slot that named no price. Like a tool that declares no
 /// capability, that is not a promise the default exercises none, only that
-/// nobody asked, so a layer pays [`Authority::Unbounded`]: every permission.
+/// nobody asked, so a layer pays [`LayerCost::TOTAL`]: every permission.
 /// An empty list is the owner saying the arguments are inert, and layering is
 /// free.
 pub(crate) type SlotPrice = Option<Arc<[Permission]>>;
+
+/// What a layer has to hold to sit in one chain, weighed every time it fires.
+#[derive(Debug)]
+pub(crate) enum LayerCost<'a> {
+    /// A host chain: the [`Authority`] of the call it steers, plus the
+    /// conversation content it hands a layer or lets one change.
+    Host {
+        authority: Authority,
+        content: &'static [Permission],
+    },
+    /// A plugin-declared slot: exactly the capabilities its owner named.
+    Named(&'a [Permission]),
+}
+
+impl LayerCost<'_> {
+    /// Every permission, for a chain no narrower price would be honest about.
+    pub(crate) const TOTAL: Self = Self::Host {
+        authority: Authority::Total,
+        content: &[],
+    };
+
+    /// Everything {granted} lacks to pay this, in [`Permission::ALL`] order,
+    /// so the same gap always reads the same. Lazy, because this runs for
+    /// every layer on every tool call and the usual answer is nothing.
+    pub(crate) fn missing<'b>(
+        &'b self,
+        granted: &'b PluginPermissions,
+    ) -> impl Iterator<Item = Permission> + 'b {
+        granted.lacking().filter(|&perm| self.charges(perm))
+    }
+
+    /// A cost that even a plugin holding nothing can pay.
+    pub(crate) fn is_free(&self) -> bool {
+        self.missing(&PluginPermissions::denied()).next().is_none()
+    }
+
+    fn charges(&self, perm: Permission) -> bool {
+        match *self {
+            Self::Host { authority, content } => {
+                content.contains(&perm) || authority.requires(perm)
+            }
+            Self::Named(needed) => needed.contains(&perm),
+        }
+    }
+}
 
 /// `owner: None` means orphan fillers: `set_slot` ran before the owner's
 /// `declare_slot`. They wait here and attach once the owner declares, and what
@@ -106,7 +165,10 @@ impl SlotStore {
             if let Some((tool, stage)) = host_slot_target(name) {
                 stages[stage as usize].insert(Arc::from(tool));
             }
-            if name.starts_with(UI_PREFIX) {
+            if name.starts_with(UI_PREFIX)
+                || name.starts_with(AGENT_PREFIX)
+                || name.starts_with(PERMISSION_PREFIX)
+            {
                 surfaces.insert(Arc::from(name.as_str()));
             }
         }
@@ -127,15 +189,18 @@ type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
 #[derive(Default)]
 pub struct LayeredTools {
     stages: ArcSwap<StageSets>,
-    /// The `ui.` slots with at least one layer. The UI reads this before it
-    /// asks a chain anything, so a stock install draws its built-in surface
-    /// in the same frame instead of waiting on a roundtrip.
+    /// The `ui.`, `agent.` and `permission.` slots with at least one layer. The
+    /// host reads this before it asks a chain anything, so a stock install draws
+    /// its built-in surface in the same frame instead of waiting on a
+    /// roundtrip. The agent loop reads it too, so it never leaves its thread for
+    /// a slot nobody wrapped.
     surfaces: ArcSwap<HashSet<Arc<str>>>,
 }
 
 impl LayeredTools {
     pub fn wraps(&self, tool: &str, stage: HookStage) -> bool {
-        self.stages.load()[stage as usize].contains(tool)
+        let layered = &self.stages.load()[stage as usize];
+        layered.contains(tool) || layered.contains(ANY_TOOL)
     }
 
     /// Whether any plugin is layering the host surface {slot}.
@@ -174,7 +239,7 @@ fn set_state(cell: &PrevCell, state: PrevState) {
     *cell.lock().expect("prev state poisoned") = state;
 }
 
-type DelegationFn = Box<dyn Fn(&str, Authority, &str) -> bool>;
+type DelegationFn = Box<dyn Fn(&SlotLayer, LayerCost<'_>, &str) -> bool>;
 
 thread_local! {
     /// Lives on the Lua runtime thread, installed by the runtime because only
@@ -183,15 +248,15 @@ thread_local! {
     static LAYER_DELEGATION: RefCell<Option<DelegationFn>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn set_layer_delegation(f: impl Fn(&str, Authority, &str) -> bool + 'static) {
+pub(crate) fn set_layer_delegation(f: impl Fn(&SlotLayer, LayerCost<'_>, &str) -> bool + 'static) {
     LAYER_DELEGATION.with(|c| *c.borrow_mut() = Some(Box::new(f)));
 }
 
-fn delegated(plugin: &str, authority: Authority, slot: &str) -> bool {
+fn delegated(layer: &SlotLayer, cost: LayerCost<'_>, slot: &str) -> bool {
     LAYER_DELEGATION.with(|c| {
         c.borrow()
             .as_ref()
-            .is_some_and(|gate| gate(plugin, authority, slot))
+            .is_some_and(|gate| gate(layer, cost, slot))
     })
 }
 
@@ -202,10 +267,9 @@ fn delegated(plugin: &str, authority: Authority, slot: &str) -> bool {
 ///
 /// The owner steers its own chain for free. Anyone else pays what the owner
 /// priced the slot at: the capabilities it named, all of them at once, or
-/// every permission if it named none, the toll a layer on a tool that declares
-/// no capability pays. One denied is dropped from the chain and logged, never
-/// an error, because a layer is an opinion about a call and never a
-/// precondition for making it.
+/// every permission if it named none. One denied is dropped from the chain and
+/// its plugin warned once per gap, never an error, because a layer is an
+/// opinion about a call and never a precondition for making it.
 fn entitled_layers(
     name: &str,
     owner: &str,
@@ -216,12 +280,11 @@ fn entitled_layers(
         if layer.plugin.as_ref() == owner {
             return true;
         }
-        match price {
-            None => delegated(&layer.plugin, Authority::Unbounded, name),
-            Some(needed) => needed
-                .iter()
-                .all(|p| delegated(&layer.plugin, Authority::Capability(*p), name)),
-        }
+        let cost = match price {
+            None => LayerCost::TOTAL,
+            Some(needed) => LayerCost::Named(needed),
+        };
+        delegated(layer, cost, name)
     };
     if layers.iter().all(&entitled) {
         return layers;
@@ -396,20 +459,24 @@ pub(crate) fn host_slot_target(slot: &str) -> Option<(&str, HookStage)> {
 }
 
 /// Fires a host-owned slot: same layer contract as a declared one, with an
-/// identity default nobody can replace. `allow_layer` says which plugins'
-/// layers may see it, and living in the caller keeps slots ignorant of tools
-/// and permissions.
+/// identity default nobody can replace. `allow_layer` says which layers may
+/// see it, asked with the layer and the name it layered, and living in the
+/// caller keeps slots ignorant of tools and permissions.
 ///
 /// `None` means nothing ran, which the identity default handing back `args`
 /// would not say: the caller has to leave the value alone rather than report a
 /// rewrite.
+///
+/// Several `names` run as one chain, innermost first. `[tool.bash.input,
+/// tool.*.input]` puts every wildcard layer outside every `bash` one, so an
+/// override written for one tool always has the last word on it.
 pub(crate) async fn run_host_chain(
     lua: &Lua,
-    name: &str,
+    names: &[&str],
     args: MultiValue,
-    allow_layer: &dyn Fn(&str) -> bool,
+    allow_layer: &dyn Fn(&SlotLayer, &str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
-    run_host_chain_with(lua, name, identity_default(lua)?, args, allow_layer, None).await
+    run_host_chain_with(lua, names, identity_default(lua)?, args, allow_layer, None).await
 }
 
 /// [`run_host_chain`] with a default of the host's choosing, for a slot whose
@@ -419,24 +486,31 @@ pub(crate) async fn run_host_chain(
 /// apart from the layer that produced it.
 pub(crate) async fn run_host_chain_with(
     lua: &Lua,
-    name: &str,
+    names: &[&str],
     default: Function,
     args: MultiValue,
-    allow_layer: &dyn Fn(&str) -> bool,
+    allow_layer: &dyn Fn(&SlotLayer, &str) -> bool,
     observe: Option<ChainObserver>,
 ) -> LuaResult<Option<MultiValue>> {
-    let Some((_, _, _, layers)) = snapshot(lua, name) else {
+    let [inner, ..] = names else {
         return Ok(None);
     };
-    let layers: Arc<[SlotLayer]> = layers
-        .iter()
-        .filter(|layer| allow_layer(&layer.plugin))
-        .cloned()
-        .collect();
+    let mut layers = Vec::new();
+    for name in names {
+        if let Some((_, _, _, found)) = snapshot(lua, name) {
+            layers.extend(
+                found
+                    .iter()
+                    .filter(|layer| allow_layer(layer, name))
+                    .cloned(),
+            );
+        }
+    }
+    let layers: Arc<[SlotLayer]> = layers.into();
     if layers.is_empty() {
         return Ok(None);
     }
-    run_chain(lua, Arc::from(name), default, layers, args, observe)
+    run_chain(lua, Arc::from(*inner), default, layers, args, observe)
         .await
         .map(Some)
 }
@@ -480,12 +554,12 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// with the arguments it is handed. Pass `{ capability = { "net" } }` to
 /// charge the permissions you name, all of them at once; `{ capability = {} }`
 /// to let anyone layer for free, which is the honest price for a slot whose
-/// arguments are inert; or leave {opts} out to charge every permission, what a
-/// tool declaring no capability charges. You can only name permissions your
-/// own plugin holds.
+/// arguments are inert; or leave {opts} out to charge every permission. You
+/// can only name permissions your own plugin holds.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
-/// if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
+/// if {name} starts with `"tool."`, `"ui."`, `"agent."`, or `"permission."`,
+/// which the host fires itself.
 /// The name stays yours across an unload: nobody else can take it over, or
 /// re-declare it cheaper, while maki runs.
 ///
@@ -523,7 +597,7 @@ fn declare_slot(
             name.trim_start_matches(prefix)
         )));
     }
-    let capability = parse_slot_capability(opts.as_ref(), &name, &permissions)?;
+    let capability = parse_capability(opts.as_ref(), DECLARE_SLOT, &name, &permissions.now(lua))?;
     {
         let mut store = slot_store_mut(lua)?;
         let entry = store.slots.entry(name.clone()).or_default();
@@ -544,12 +618,23 @@ fn declare_slot(
     make_callable(lua, name)
 }
 
-/// The price the owner set, weighed against what the owner itself holds: a
-/// plugin cannot price its slot in a capability it was never granted, the same
+/// The Lua list `get_slots` reports for `capability` and `get_tool` for
+/// `permission`, so both read back in one shape.
+pub(crate) fn permission_list(
+    lua: &Lua,
+    permissions: impl IntoIterator<Item = Permission>,
+) -> LuaResult<Table> {
+    lua.create_sequence_from(permissions.into_iter().map(Permission::manifest_key))
+}
+
+/// The price the owner set in `opts.capability` for what other plugins pay,
+/// weighed against what the owner itself holds: a plugin cannot
+/// price its slot or action in a capability it was never granted, the same
 /// rule `register_tool` applies to the capability a tool exposes. Otherwise a
 /// denied plugin could mint a toll booth on reach it has no claim to.
-fn parse_slot_capability(
+pub(crate) fn parse_capability(
     opts: Option<&Table>,
+    api: &str,
     name: &str,
     permissions: &PluginPermissions,
 ) -> LuaResult<SlotPrice> {
@@ -561,7 +646,7 @@ fn parse_slot_capability(
         Value::Table(declared) => declared,
         _ => {
             return Err(mlua::Error::runtime(format!(
-                "declare_slot: '{name}' must give 'capability' as a list of permission names, \
+                "{api}: '{name}' must give 'capability' as a list of permission names, \
                  e.g. {{ capability = {{ \"net\" }} }} (valid: {})",
                 permission_keys()
             )));
@@ -572,14 +657,14 @@ fn parse_slot_capability(
         let key = key?;
         let permission = Permission::from_key(&key).ok_or_else(|| {
             mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at unknown permission '{key}' (valid: {})",
+                "{api}: '{name}' lists unknown permission '{key}' in 'capability' (valid: {})",
                 permission_keys()
             ))
         })?;
         if !permissions.is_allowed(permission) {
             return Err(mlua::Error::runtime(format!(
-                "declare_slot: '{name}' prices layers at '{permission}', which this plugin was not granted. \
-                 Add `{permission} = true` under `[permissions]` in the {MANIFEST_FILE} next to the plugin file"
+                "{api}: '{name}' lists '{permission}' in 'capability', {UNGRANTED_PRICE_ERR}. {}",
+                grant_hint(&[permission])
             )));
         }
         if !priced.contains(&permission) {
@@ -613,9 +698,23 @@ fn parse_slot_capability(
 /// permissions look at the call, and `tool.<name>.output` on the text it
 /// produced. Both take `function(prev, value, ctx)` and answer with a
 /// table to replace the value, nothing to leave it alone, or
-/// `nil, reason` to stop the call. Wrapping one costs the capability the
-/// tool declares, and a tool declaring none costs every permission. See
+/// `nil, reason` to stop the call. An input layer can also answer
+/// `value, { ask = reason }` to make the user approve the call. Name the
+/// tool `*` (`tool.*.input`) to wrap every tool. What a layer costs is in
+/// the [Hooks price table](/docs/hooks/#rules).
+///
+/// The agent loop fires `agent.user_message`, `agent.stop`,
+/// `agent.compact.before`, and `agent.compact.prepare`, with the same
+/// contract. Wrapping one costs every permission. See
 /// [Hooks](/docs/hooks/).
+///
+/// `permission.prompt` fires where the permission prompt would show, with
+/// the prompt as its default. A layer takes `function(prev, req, ctx)` and
+/// answers `{ decision = "allow" }` or `{ decision = "deny", guidance = … }`,
+/// or passes the call on with `prev(req, ctx)`. A verdict decides that one call
+/// and records no rule, and an escalated call (`ask`) is never offered to a
+/// layer. It costs what a layer on the same call does. See
+/// [Hooks](/docs/hooks/#permission-prompt).
 ///
 /// Wrapping a slot another plugin declared steers a chain that plugin's
 /// callers trust, so it costs whatever the owner priced it at in
@@ -624,7 +723,9 @@ fn parse_slot_capability(
 /// you declared yourself is free. Like the `tool.*` slots, this is decided
 /// when the chain fires: the call skips a layer that is not entitled and
 /// carries on, and a reload that changes what you hold takes effect on the
-/// next call.
+/// next call. A layer set inside an
+/// [action](#maki-api-register_action) callback is weighed against the
+/// action's price too.
 ///
 /// @param name string Slot name to wrap.
 /// @param wrapper function Layer: `function(prev, ...)`. Call `prev(...)` to continue.
@@ -638,6 +739,7 @@ fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function)
     let mut store = slot_store_mut(lua)?;
     let entry = store.slots.entry(name.clone()).or_default();
     entry.layers.push(SlotLayer {
+        ceiling: Ceiling::current_for(lua, &plugin),
         plugin: Arc::clone(&plugin),
         func: wrapper,
     });
@@ -668,11 +770,7 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
         info.set("owner", entry.owner.as_deref())?;
         info.set("declared", entry.default.is_some())?;
         if let Some(priced) = &entry.capability {
-            let capability = lua.create_table()?;
-            for permission in priced.iter() {
-                capability.push(permission.manifest_key())?;
-            }
-            info.set("capability", capability)?;
+            info.set("capability", permission_list(lua, priced.iter().copied())?)?;
         }
         let fillers = lua.create_table()?;
         for layer in &entry.layers {
@@ -706,6 +804,7 @@ mod tests {
             .map(|p| SlotLayer {
                 plugin: Arc::from(*p),
                 func: noop(lua),
+                ceiling: None,
             })
             .collect()
     }
@@ -778,11 +877,48 @@ mod tests {
     /// Stands in for the gate the runtime installs: `full` holds everything,
     /// `netonly` holds `net`, and nobody else holds anything.
     fn grant_gate() {
-        set_layer_delegation(|plugin, authority, _| match plugin {
-            "full" => true,
-            "netonly" => authority == Authority::Capability(Permission::Net),
-            _ => false,
+        set_layer_delegation(|layer, cost, _| {
+            let mut granted = PluginPermissions::denied();
+            match &*layer.plugin {
+                "full" => granted = PluginPermissions::trusted(),
+                "netonly" => granted.set(Permission::Net, true),
+                _ => {}
+            }
+            cost.missing(&granted).next().is_none()
         });
+    }
+
+    /// Everything but `agent` and `session_read`, so the three authorities
+    /// disagree about what is missing.
+    #[test_case(Authority::Capability(Permission::Run), &[], &[] ; "a_held_capability")]
+    #[test_case(Authority::Capability(Permission::SessionRead), &[], &[Permission::SessionRead] ; "a_missing_capability")]
+    #[test_case(Authority::Unbounded, &[], &[Permission::SessionRead] ; "unbounded_leaves_agent_out")]
+    #[test_case(Authority::Total, &[], &[Permission::Agent, Permission::SessionRead] ; "total_names_every_gap")]
+    #[test_case(Authority::Capability(Permission::Run), &[Permission::SessionRead, Permission::SessionWrite], &[Permission::SessionRead] ; "content_adds_to_a_held_capability")]
+    #[test_case(Authority::Capability(Permission::Agent), &[Permission::SessionRead], &[Permission::Agent, Permission::SessionRead] ; "content_and_authority_both_named")]
+    #[test_case(Authority::Inert, &[Permission::SessionRead, Permission::SessionWrite], &[Permission::SessionRead] ; "content_is_the_whole_price_of_an_inert_tool")]
+    fn a_skipped_layer_names_exactly_what_it_lacks(
+        authority: Authority,
+        content: &'static [Permission],
+        expected: &[Permission],
+    ) {
+        let mut granted = PluginPermissions::trusted();
+        granted.set(Permission::Agent, false);
+        granted.set(Permission::SessionRead, false);
+        let cost = LayerCost::Host { authority, content };
+        assert_eq!(cost.missing(&granted).collect::<Vec<_>>(), expected);
+    }
+
+    /// Naming every gap at once is what lets the user close it in one edit.
+    #[test]
+    fn a_named_price_reports_every_capability_missing() {
+        let cost = LayerCost::Named(&[Permission::Run, Permission::Net, Permission::FsRead]);
+        let mut granted = PluginPermissions::denied();
+        granted.set(Permission::Net, true);
+        assert_eq!(
+            cost.missing(&granted).collect::<Vec<_>>(),
+            [Permission::FsRead, Permission::Run]
+        );
     }
 
     fn steering(lua: &Lua, price: SlotPrice, plugins: &[&str]) -> Vec<String> {
