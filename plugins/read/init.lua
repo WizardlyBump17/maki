@@ -1,26 +1,17 @@
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
-local output_limits = require("maki.output_limits")
+-- local output_limits = require("maki.output_limits")
 
-local HIGHLIGHT_CONTEXT_LINES = 200
+local HIGHLIGHT_CONTEXT_LINES = 200000
 
-local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
+local DESCRIPTION = [[Read a file.
 
 - Supports absolute, relative, and ~/ paths.
-- **offset** and **limit** are required. Use offset=1 to read from the first line.
-- Use limit=0 to read until the end of file (capped at 2000 lines).
-- Use the **index** tool or **grep** tool first to find the offset and limit.
-- Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
-- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
-- Do not reread the same range (same file and same offset).
-- Prefer grep to locate content instead of scanning full files.
-- Call in parallel when reading multiple files.
-- Avoid tiny repeated slices - read a larger window if you need more context.]]
+- Call in parallel when reading multiple files.]]
 
 local opts = maki.api.register_options({
-  max_line_bytes = { default = 500, min = 80, desc = "Truncate lines the model sees at this many bytes." },
-  max_output_lines = output_limits.specs.max_output_lines,
+  max_line_bytes = { default = 50000, min = 50000, desc = "Truncate lines the model sees at this many bytes." },
+  max_output_lines = { type = "integer", default = 200000, min = 200000, desc = "Deprecated" },
 })
 
 local function read_view_opts(ctx)
@@ -50,12 +41,14 @@ end
 -- Lines arrive already cut to `max_line_bytes`, so even a huge file or line
 -- never fills the Lua heap that all plugins share.
 local function read_window(path, start, limit, count, ctx)
+  limit = 100000
+  start = 1
   local first = math.max(start - HIGHLIGHT_CONTEXT_LINES, 1)
   local context_len = start - first
   local page, err = maki.fs.read_lines(path, {
     offset = first,
     limit = limit and context_len + limit,
-    max_line_bytes = output_limits.line_bytes(opts, ctx),
+    max_line_bytes = 100000,
     count = count,
   })
   if not page then
@@ -106,8 +99,9 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
 end
 
 local function read_file(path, offset, limit, ctx)
-  local start = math.max(math.floor(offset), 1)
-  local max_output_lines = output_limits.resolve(opts, ctx)
+  local start = 1
+  limit = 100000
+  local max_output_lines = 100000
   local max_lines = limit > 0 and limit or nil
   if max_output_lines then
     max_lines = math.min(max_lines or max_output_lines, max_output_lines)
@@ -160,12 +154,12 @@ local function read_file(path, offset, limit, ctx)
   }
 end
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = [[
-- When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
-})
+-- maki.api.register_prompt_hint({
+--  slot = "tool_usage",
+--  content = [[
+-- - When using the **read** tool, only read the sections you actually need.
+-- - Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
+-- })
 
 maki.api.register_tool({
   name = "read",
@@ -184,13 +178,11 @@ maki.api.register_tool({
       },
       offset = {
         type = "integer",
-        description = "Line number to start from (1-indexed). Use 1 for the first line.",
-        required = true,
+        description = "Deprecated.",
       },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
-        required = true,
+        description = "Deprecated.",
       },
     },
   },
@@ -252,6 +244,6 @@ maki.api.register_tool({
     if meta.is_dir then
       return { llm_output = "error: path is a directory, use the list tool instead", is_error = true }
     end
-    return read_file(path, input.offset, input.limit, ctx)
+    return read_file(path, input.offset or 1, input.limit or 0, ctx)
   end,
 })
