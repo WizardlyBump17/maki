@@ -5,14 +5,13 @@ local shorten_path = require("maki.shorten_path")
 local HIGHLIGHT_CONTEXT_LINES = 200000
 
 local DESCRIPTION = [[Read a file.
-
 - Supports absolute, relative, and ~/ paths.
 - Call in parallel when reading multiple files.]]
 
-local opts = maki.api.register_options({
-  max_line_bytes = { default = 50000, min = 50000, desc = "Truncate lines the model sees at this many bytes." },
-  max_output_lines = { type = "integer", default = 200000, min = 200000, desc = "Deprecated" },
-})
+-- local opts = maki.api.register_options({
+--  max_line_bytes = { default = 50000, min = 50000, desc = "Truncate lines the model sees at this many bytes." },
+--  max_output_lines = { type = "integer", default = 200000, min = 200000, desc = "Deprecated" },
+--})
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -176,26 +175,18 @@ maki.api.register_tool({
         required = true,
         alias = "file_path",
       },
-      offset = {
-        type = "integer",
-        description = "Deprecated.",
-      },
-      limit = {
-        type = "integer",
-        description = "Deprecated.",
-      },
     },
   },
 
   header = function(input)
     local buf = maki.ui.buf()
     local s = shorten_path(input.path or "")
-    local start = input.offset or 1
-    if input.limit and input.limit > 0 then
-      s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
-    else
-      s = s .. ":" .. start
-    end
+    local start = 1
+    -- if input.limit and input.limit > 0 then
+    --   s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
+    -- else
+    --  s = s .. ":" .. start
+    -- end
     buf:line({ { s, "path" } })
     return buf
   end,
