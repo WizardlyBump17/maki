@@ -1,12 +1,13 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::time::Duration;
 
-use flume::Sender;
+use futures::TryStreamExt;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -14,7 +15,7 @@ use crate::providers::copilot::copilot_usd;
 use crate::providers::openai_compat::{
     StreamedText, assistant_response, parse_tool_input, tool_parameters,
 };
-use crate::providers::{ResolvedAuth, ok_sse, sse_error_status};
+use crate::providers::{ResolvedAuth, SseBody, ok_sse, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -29,8 +30,9 @@ pub(crate) fn build_body(
     messages: &[Message],
     system: &str,
     tools: &Value,
+    replay_reasoning: bool,
 ) -> Value {
-    let input = convert_input(messages);
+    let input = convert_input(messages, replay_reasoning);
     let wire_tools = convert_tools(tools);
 
     let mut body = json!({
@@ -61,7 +63,7 @@ pub(crate) fn apply_responses_reasoning(
     }
 }
 
-pub(crate) fn convert_input(messages: &[Message]) -> Value {
+pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Value {
     let mut input = Vec::new();
 
     for msg in messages {
@@ -102,11 +104,21 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                 }
             }
             Role::Assistant => {
+                let mut reasoning = String::new();
+                let mut reasoning_id = None;
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
+                        ContentBlock::Thinking {
+                            thinking,
+                            reasoning_id: id,
+                            ..
+                        } => {
+                            reasoning.push_str(thinking);
+                            reasoning_id = reasoning_id.or_else(|| id.clone());
+                        }
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse {
                             id, name, input, ..
@@ -115,10 +127,21 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::Unknown(_) => {}
                     }
+                }
+
+                if replay_reasoning && !reasoning.is_empty() {
+                    let mut item = json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": reasoning}]
+                    });
+                    if let Some(id) = reasoning_id {
+                        item["id"] = json!(id);
+                    }
+                    input.push(item);
                 }
 
                 if !text_parts.is_empty() {
@@ -166,21 +189,14 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
     )
 }
 
-static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
-    SUMMARY_REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
-}
+static SUMMARY_REJECTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 fn summary_rejected(base: &str) -> bool {
-    init_summary_rejected().lock().unwrap().contains(base)
+    SUMMARY_REJECTED.lock().unwrap().contains(base)
 }
 
 fn reject_summary(base: &str) {
-    init_summary_rejected()
-        .lock()
-        .unwrap()
-        .insert(base.to_owned());
+    SUMMARY_REJECTED.lock().unwrap().insert(base.to_owned());
 }
 
 fn has_summary(body: &Value) -> bool {
@@ -195,11 +211,14 @@ fn strip_summary(body: &mut Value) {
     }
 }
 
+/// `headers` are the provider's own for this request: over maki's, under
+/// the credentials.
 pub(crate) async fn do_stream(
     client: &Client,
     model: &crate::model::Model,
+    headers: &HeaderMap,
     body: &Value,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
@@ -210,12 +229,32 @@ pub(crate) async fn do_stream(
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
     }
-    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    let result = post_responses(
+        client,
+        model,
+        headers,
+        &body,
+        event_tx,
+        auth,
+        base,
+        stream_timeout,
+    )
+    .await;
     match result {
         Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
             reject_summary(base);
             strip_summary(body.to_mut());
-            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+            post_responses(
+                client,
+                model,
+                headers,
+                &body,
+                event_tx,
+                auth,
+                base,
+                stream_timeout,
+            )
+            .await
         }
         result => result,
     }
@@ -225,23 +264,22 @@ pub(crate) async fn do_stream(
 async fn post_responses(
     client: &Client,
     model: &crate::model::Model,
+    headers: &HeaderMap,
     body: &Value,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
     base: &str,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
-    let request = auth
-        .configure_request(
-            client
-                .post(format!("{base}{RESPONSES_PATH}"))
-                .header("content-type", "application/json")
-                .header("user-agent", super::super::user_agent()),
-        )
-        .body(json_body)
-        .build()?;
+    let request = auth.finish(
+        client
+            .post(format!("{base}{RESPONSES_PATH}"))
+            .header("content-type", "application/json")
+            .headers(headers.clone())
+            .body(json_body),
+    )?;
 
     debug!(
         model = %model.id,
@@ -249,8 +287,8 @@ async fn post_responses(
         "sending Responses API request"
     );
 
-    ok_sse(client, request, |body| {
-        parse_sse(body, event_tx, stream_timeout)
+    ok_sse(client, request, stream_timeout, |body| {
+        parse_sse(body, event_tx)
     })
     .await
 }
@@ -263,31 +301,19 @@ struct ToolAccumulator {
 }
 
 pub(crate) async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + stream_timeout;
-    let mut current_event = String::new();
 
-    while let Some(line) =
-        crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
-    {
-        if let Some(event_type) = line.strip_prefix("event:") {
-            current_event = event_type.trim().to_string();
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data.as_deref().map(str::trim) else {
             continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
         };
+        let current_event = event.event.as_deref().map_or("", str::trim);
 
         if current_event == "error" {
             if let Ok(ev) = serde_json::from_str::<crate::providers::SseErrorPayload>(data) {
@@ -308,13 +334,13 @@ pub(crate) async fn parse_sse(
         let event = if current_event.is_empty() {
             parsed["type"].as_str().unwrap_or_default()
         } else {
-            current_event.as_str()
+            current_event
         };
 
         match event {
             "response.output_text.delta" => {
                 if let Some(delta) = parsed["delta"].as_str() {
-                    streamed.push_text(delta.to_owned(), event_tx).await?;
+                    streamed.push_text(delta.to_owned(), event_tx)?;
                 }
             }
 
@@ -323,23 +349,27 @@ pub(crate) async fn parse_sse(
                 let output_index = parsed["output_index"]
                     .as_u64()
                     .unwrap_or(tool_accumulators.len() as u64);
-                if item["type"].as_str() == Some("function_call") {
-                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
-                    let name = item["name"].as_str().unwrap_or_default().to_string();
-                    if !name.is_empty() {
-                        event_tx
-                            .send_async(ProviderEvent::ToolUseStart {
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                        let name = item["name"].as_str().unwrap_or_default().to_string();
+                        if !name.is_empty() {
+                            event_tx.send(ProviderEvent::ToolUseStart {
                                 id: call_id.clone(),
                                 name: name.clone(),
-                            })
-                            .await?;
+                            })?;
+                        }
+                        tool_accumulators.push(ToolAccumulator {
+                            output_index,
+                            call_id,
+                            name,
+                            arguments: String::new(),
+                        });
                     }
-                    tool_accumulators.push(ToolAccumulator {
-                        output_index,
-                        call_id,
-                        name,
-                        arguments: String::new(),
-                    });
+                    Some("reasoning") => {
+                        streamed.reasoning_id = item["id"].as_str().map(str::to_owned);
+                    }
+                    _ => {}
                 }
             }
 
@@ -368,13 +398,11 @@ pub(crate) async fn parse_sse(
                     let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
                     let total = pp["total"].as_u64().unwrap_or(0) as u32;
                     let cache = pp["cache"].as_u64().unwrap_or(0) as u32;
-                    event_tx
-                        .send_async(ProviderEvent::PromptProgress {
-                            processed,
-                            total,
-                            cache,
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    })?;
                 }
             }
 
@@ -409,21 +437,17 @@ pub(crate) async fn parse_sse(
                             acc.arguments = arguments;
                         }
                         if should_emit_start {
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: acc.call_id.clone(),
-                                    name: acc.name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: acc.call_id.clone(),
+                                name: acc.name.clone(),
+                            })?;
                         }
                     } else {
                         if !name.is_empty() {
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: call_id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })?;
                         }
                         tool_accumulators.push(ToolAccumulator {
                             output_index: tool_accumulators.len() as u64,
@@ -437,12 +461,12 @@ pub(crate) async fn parse_sse(
 
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = parsed["delta"].as_str() {
-                    streamed.push_reasoning(delta.to_owned(), event_tx).await?;
+                    streamed.push_reasoning(delta.to_owned(), event_tx)?;
                 }
             }
 
             "response.reasoning_summary_part.added" if !streamed.reasoning.is_empty() => {
-                streamed.push_reasoning("\n\n".to_owned(), event_tx).await?;
+                streamed.push_reasoning("\n\n".to_owned(), event_tx)?;
             }
 
             "response.completed" => {
@@ -520,12 +544,12 @@ fn parse_usage(event: &Value) -> Option<TokenUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Cursor;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::test_support::sse_event;
+    use crate::test_support::{sse_body, sse_event};
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
     const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
@@ -561,14 +585,14 @@ mod tests {
         );
         assert_eq!(
             converted[0]["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
-        let (tx, rx) = flume::unbounded();
-        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
-        (result, rx.drain().collect())
+        let (tx, mut rx) = unbounded_channel();
+        let result = parse_sse(sse_body(sse.as_bytes()), &tx).await;
+        (result, iter::from_fn(|| rx.try_recv().ok()).collect())
     }
 
     const COPILOT_NANO_AIU: u64 = 375_000;
@@ -763,7 +787,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
         ];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         let items = input.as_array().unwrap();
 
         assert_eq!(items[0]["type"], "message");
@@ -786,6 +810,48 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
     }
 
     #[test]
+    fn convert_input_replays_past_reasoning() {
+        let assistant = |reasoning_id: Option<String>| Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "weighing it".to_string(),
+                    signature: None,
+                    reasoning_id,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let messages = [Message::user("hello".to_string()), assistant(None)];
+
+        let input = convert_input(&messages, true);
+        let items = input.as_array().unwrap();
+
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["summary"], json!([]));
+        assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(items[1]["content"][0]["text"], "weighing it");
+        assert!(items[1].get("id").is_none());
+        assert_eq!(items[2]["type"], "message");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"][0]["text"], "answer");
+
+        let dropped = convert_input(&messages, false);
+        assert_eq!(dropped[1]["type"], "message");
+        assert_eq!(dropped[1]["role"], "assistant");
+
+        let with_id = [
+            Message::user("hello".to_string()),
+            assistant(Some("rs_1".to_string())),
+        ];
+        let input = convert_input(&with_id, true);
+        assert_eq!(input[1]["id"], "rs_1");
+    }
+
+    #[test]
     fn convert_input_blank_tool_result_gets_marker() {
         let messages = vec![Message {
             role: Role::User,
@@ -793,7 +859,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             ..Default::default()
         }];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["output"], crate::types::EMPTY_RESPONSE_MARKER);
     }
@@ -829,7 +895,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
 
         assert_eq!(resp.message.content.len(), 2);
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, reasoning_id, .. } if thinking == "Let me think about this" && reasoning_id.as_deref() == Some("rs_1"))
         );
         assert!(
             matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")

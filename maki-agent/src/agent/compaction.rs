@@ -12,14 +12,16 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::frame::{RunContext, fit_frame};
-use super::history::{History, remove_orphaned_tool_results, strip_thinking};
+use super::history::{History, remove_orphaned_tool_results, stamp_new, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
+use crate::{
+    AgentError, AgentEvent, DoneReason, EventSender, RunLedger, SteerKind, TurnCompleteEvent,
+};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
@@ -49,17 +51,23 @@ const PREPARE_TEXT_MAX: usize = 4 * 1024;
 const MAX_SUMMARY_ATTEMPTS: u32 = 3;
 
 pub(super) const FIELD_SKIP: &str = "skip";
+const FIELD_REASON: &str = "reason";
 const FIELD_INSTRUCTIONS: &str = "instructions";
 pub(super) const FIELD_CONTINUE: &str = "continue";
+pub(super) const FIELD_DEFER: &str = "defer";
 const FIELD_COLLAPSE: &str = "collapse";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum CompactReason {
+pub enum CompactReason {
     Auto,
     /// The provider already refused the prompt as too long. Compaction is the
     /// only way out, so a layer cannot skip this one.
     Overflow,
     Manual,
+    /// A plugin asked through `maki.session.request_compact`. Hooks get it as
+    /// its own reason so a layer honoring user intent can tell it from a
+    /// typed `/compact`.
+    Requested,
 }
 
 impl CompactReason {
@@ -68,6 +76,7 @@ impl CompactReason {
             Self::Auto => "auto",
             Self::Overflow => "overflow",
             Self::Manual => "manual",
+            Self::Requested => "requested",
         }
     }
 }
@@ -96,25 +105,36 @@ pub(super) fn continue_text(value: &Value) -> Option<&str> {
     normalize(value.get(FIELD_CONTINUE).and_then(Value::as_str))
 }
 
-/// `None` when a layer skipped it. The gauge stays where it was, so an
-/// automatic compaction simply asks again before the next turn.
+/// What a layer settled on for a compaction.
+pub(super) enum CompactionPlan {
+    /// The compaction is skipped. The gauge stays where it was, so an
+    /// automatic one simply asks again before the next turn.
+    Skipped,
+    /// The layer bought the transcript one turn: the nudge is the model's
+    /// next message and the ask after that turn is granted. One defer per
+    /// compaction, automatic only, so a layer cannot starve the gauge.
+    Deferred(String),
+    Proceed(CompactSteer),
+}
+
 pub(super) async fn steer_compaction(
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     reason: CompactReason,
     request: Option<&str>,
-) -> Option<CompactSteer> {
+    can_defer: bool,
+) -> CompactionPlan {
     let verdict = hooks
         .fire(AgentSlot::CompactBefore, || {
             json!({
-                "reason": reason.as_str(),
+                FIELD_REASON: reason.as_str(),
                 "context_size": hooks.context_size,
                 "usable": usable(hooks.model, config),
                 "request_instructions": request,
             })
         })
         .await;
-    let (skip, added, continue_with) = match &verdict {
+    let (skip, added, continue_with, defer) = match &verdict {
         Verdict::Replaced(value) => (
             value
                 .get(FIELD_SKIP)
@@ -122,21 +142,27 @@ pub(super) async fn steer_compaction(
                 .unwrap_or(false),
             value.get(FIELD_INSTRUCTIONS).and_then(Value::as_str),
             continue_text(value),
+            normalize(value.get(FIELD_DEFER).and_then(Value::as_str)),
         ),
         Verdict::Denied(why) => {
             info!(reason = %why, "agent.compact.before asked to skip");
-            (true, None, None)
+            (true, None, None, None)
         }
-        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None),
+        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None, None),
     };
+    // A defer is one turn, so it works the same in a task child as in main.
+    if can_defer && let Some(nudge) = defer {
+        info!("agent.compact.before deferred the compaction");
+        return CompactionPlan::Deferred(nudge.to_owned());
+    }
     if skip && reason != CompactReason::Overflow {
         info!(
             reason = reason.as_str(),
             "agent.compact.before skipped the compaction"
         );
-        return None;
+        return CompactionPlan::Skipped;
     }
-    Some(CompactSteer {
+    CompactionPlan::Proceed(CompactSteer {
         instructions: join_lines([request, added]),
         continue_text: continue_with.map(str::to_owned),
     })
@@ -297,6 +323,43 @@ pub(super) async fn compact_history(
     }
 }
 
+/// Rebuild the transcript after a compaction: a summary pair, then the tail that
+/// was not summarized. Returns the new list and the length of the summary pair,
+/// so the caller can report how many messages carried over.
+///
+/// The summary pair carries the first kept message's stamp, not "now". The pair
+/// is followed by the carried tail, whose stamps predate the summary call that
+/// just returned; stamping the pair now would run the transcript's clock backwards
+/// at the join, and a timing reader would see a negative gap. The compaction
+/// call's own wall time then falls to the first carried message instead.
+fn rebuild_history(
+    summary: Message,
+    history: &[Message],
+    summarized: usize,
+    post_compaction_instructions: Option<&str>,
+) -> (Vec<Message>, usize) {
+    let carried_at = history.get(summarized).and_then(|m| m.created_at);
+    let stamp = |msg: Message| {
+        stamp_new(Message {
+            created_at: carried_at,
+            ..msg
+        })
+    };
+    let mut new_history = vec![
+        stamp(Message::user("What did we do so far?".into())),
+        stamp(summary),
+    ];
+    // Part of the summary block and not the carried input, so the next
+    // compaction summarizes this copy away instead of carrying a duplicate.
+    new_history.extend(
+        normalize(post_compaction_instructions)
+            .map(|text| stamp(Message::synthetic(text.to_owned()))),
+    );
+    let summary_len = new_history.len();
+    new_history.extend_from_slice(&history[summarized..]);
+    (new_history, summary_len)
+}
+
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
@@ -329,18 +392,12 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     };
 
-    let mut new_history = vec![
-        Message::user("What did we do so far?".into()),
+    let (new_history, summary_len) = rebuild_history(
         response.message,
-    ];
-    // Part of the summary block and not the carried input, so the next
-    // compaction summarizes this copy away instead of carrying a duplicate.
-    new_history.extend(
-        normalize(config.post_compaction_instructions.as_deref())
-            .map(|text| Message::synthetic(text.to_owned())),
+        history.as_slice(),
+        summarized,
+        config.post_compaction_instructions.as_deref(),
     );
-    let summary_len = new_history.len();
-    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);
 
     Ok((summary, history.len() - summary_len))
@@ -368,6 +425,7 @@ pub async fn compact(
     config: &AgentConfig,
     instructions: Option<&str>,
     retry: RetryPolicy,
+    reason: CompactReason,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
     let ledger = RunLedger::default();
@@ -385,7 +443,8 @@ pub async fn compact(
             reason: DoneReason::Compact,
         }
     };
-    let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
+    let CompactionPlan::Proceed(steer) =
+        steer_compaction(hooks, config, reason, instructions, false).await
     else {
         event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
@@ -413,6 +472,10 @@ pub async fn compact(
         Err(e) => return Err(e),
     };
     if let Some(text) = steer.continue_text {
+        event_tx.send(AgentEvent::Steered {
+            kind: SteerKind::CompactContinued,
+            text: text.clone(),
+        })?;
         history.push(Message::synthetic(text));
     }
     fit_frame(history, next, mcp, hooks.model);
@@ -654,7 +717,8 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::iter;
+    use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -664,6 +728,8 @@ mod tests {
     use maki_storage::id::SessionRef;
     use serde_json::Value;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::AgentConfig;
@@ -671,6 +737,61 @@ mod tests {
     use crate::cancel::CancelToken;
     use crate::tools::{RequestTools, ToolRegistry};
     use maki_config::CompactionBuffer;
+
+    #[test]
+    fn rebuild_history_keeps_timestamps_monotonic_at_the_join() {
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "summarized".into(),
+                }],
+                created_at: Some(100),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "first kept".into(),
+                }],
+                created_at: Some(1_000),
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "kept".into(),
+                }],
+                created_at: Some(2_000),
+                ..Default::default()
+            },
+        ];
+        let summary = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "the summary".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (rebuilt, summary_len) = rebuild_history(summary, &history, 1, None);
+        assert_eq!(
+            summary_len, 2,
+            "a prompt and its summary head the transcript"
+        );
+        assert_eq!(rebuilt.len(), 2 + 2, "pair + the carried tail");
+        // The pair takes the first kept message's stamp (1_000), never "now": the
+        // summary call started after the tail was written, so "now" would postdate
+        // it and run the transcript clock backwards at the join.
+        assert_eq!(rebuilt[0].created_at, Some(1_000));
+        assert_eq!(rebuilt[1].created_at, Some(1_000));
+        let mut prev = 0;
+        for msg in &rebuilt {
+            let at = msg.created_at.expect("every rebuilt message is stamped");
+            assert!(at >= prev, "timestamps must not go backwards: {rebuilt:?}");
+            prev = at;
+        }
+    }
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
@@ -718,7 +839,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -792,7 +913,7 @@ mod tests {
         instructions: Option<&str>,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        let (raw_tx, _rx) = flume::unbounded();
+        let (raw_tx, _rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         compact(
@@ -807,6 +928,7 @@ mod tests {
             config,
             instructions,
             RetryPolicy::default(),
+            CompactReason::Manual,
         )
         .await
     }
@@ -817,7 +939,7 @@ mod tests {
         carry_len: usize,
         session_id: Option<&SessionRef>,
     ) {
-        let (raw_tx, _rx) = flume::unbounded();
+        let (raw_tx, _rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -909,7 +1031,7 @@ mod tests {
 
     #[test_case(vec![] ; "no_content")]
     #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
-    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None }] ; "thinking_only")]
+    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None, reasoning_id: None }] ; "thinking_only")]
     #[tokio::test]
     async fn a_failed_compaction_leaves_the_context_alone(content: Vec<ContentBlock>) {
         let empty = || {
@@ -931,7 +1053,7 @@ mod tests {
         let provider = MockProvider::new(vec![empty(), empty()]);
         let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
         let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -950,6 +1072,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            CompactReason::Manual,
         )
         .await;
 
@@ -957,7 +1080,9 @@ mod tests {
         assert_eq!(gauge.size(), SUMMARISED_PROMPT);
         assert_eq!(history.len(), 1);
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
-        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
         let [
             AgentEvent::CompactionStarted,
             AgentEvent::TurnComplete(first),
@@ -1015,7 +1140,7 @@ mod tests {
             Message::user(KEPT_TEXT.into()),
             Message::user("second".into()),
         ]);
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -1032,6 +1157,7 @@ mod tests {
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            CompactReason::Manual,
         )
         .await;
 
@@ -1040,7 +1166,9 @@ mod tests {
             .iter()
             .filter(|reply| !matches!(reply, Reply::Overflow))
             .count();
-        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
         assert_eq!(
             events
                 .iter()
@@ -1151,15 +1279,16 @@ mod tests {
         }
     }
 
-    /// Runs the `/compact` path with a gauge at [`SUMMARISED_PROMPT`] and
-    /// hands back every event it sent.
+    /// Runs a compaction with a gauge at [`SUMMARISED_PROMPT`] and hands
+    /// back every event it sent.
     async fn summarize_steered(
         provider: &MockProvider,
         history: &mut History,
         instructions: Option<&str>,
+        reason: CompactReason,
         answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
     ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         script(&registry, answer);
         let model = default_model();
@@ -1176,9 +1305,15 @@ mod tests {
             &AgentConfig::default(),
             instructions,
             RetryPolicy::default(),
+            reason,
         )
         .await;
-        (result, rx.try_iter().map(|e| e.event).collect())
+        (
+            result,
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|e| e.event)
+                .collect(),
+        )
     }
 
     /// The mock holds no responses, so any request would panic.
@@ -1191,6 +1326,7 @@ mod tests {
             &provider,
             &mut history,
             None,
+            CompactReason::Manual,
             before_answers(json!({ FIELD_SKIP: true })),
         )
         .await;
@@ -1235,6 +1371,7 @@ mod tests {
             &provider,
             &mut history,
             Some(REQUEST_EXTRA),
+            CompactReason::Manual,
             before_answers(json!({ FIELD_INSTRUCTIONS: LAYER_EXTRA })),
         )
         .await;
@@ -1245,6 +1382,66 @@ mod tests {
         let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
         let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
         assert!(request_at < layer_at, "{prompt}");
+    }
+
+    #[test_case(CompactReason::Manual, "manual" ; "manual")]
+    #[test_case(CompactReason::Requested, "requested" ; "requested")]
+    #[tokio::test]
+    async fn compact_tells_the_layer_why(reason: CompactReason, expected: &str) {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+        let seen = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+
+        let (result, _) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            reason,
+            move |slot, payload| {
+                if matches!(slot, AgentSlot::CompactBefore) {
+                    *captured.lock().unwrap() = payload
+                        .get(FIELD_REASON)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Verdict::Unchanged
+            },
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(expected));
+    }
+
+    const KEEP_GOING: &str = "keep going after the summary";
+
+    #[tokio::test]
+    async fn manual_compact_steers_the_layers_words() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            CompactReason::Manual,
+            before_answers(json!({ FIELD_CONTINUE: KEEP_GOING })),
+        )
+        .await;
+        assert_eq!(result.unwrap(), DoneReason::Compact);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Steered { kind: SteerKind::CompactContinued, text } if text == KEEP_GOING
+            )),
+            "the TUI hears the layer's words: {events:?}"
+        );
+        assert_eq!(
+            history.as_slice().last().unwrap().first_text_content(),
+            Some(KEEP_GOING)
+        );
     }
 
     #[tokio::test]
@@ -1267,8 +1464,14 @@ mod tests {
         })]);
         let mut history = History::new(vec![Message::user("work".into())]);
 
-        let (result, events) =
-            summarize_steered(&provider, &mut history, None, |_, _| Verdict::Unchanged).await;
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            CompactReason::Manual,
+            |_, _| Verdict::Unchanged,
+        )
+        .await;
         assert_eq!(result.unwrap(), DoneReason::Compact);
 
         let [
@@ -1446,6 +1649,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: Some("sig".into()),
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "hello".into(),

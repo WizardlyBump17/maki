@@ -3,9 +3,10 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
+use maki_storage::auth::now_millis;
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionTools, next_epoch};
+use maki_storage::sessions::{SessionTools, TitleSource, next_epoch};
 use serde_json::Value;
 use strum::Display;
 use tracing::warn;
@@ -256,8 +257,30 @@ impl History {
         &self.snapshot.messages
     }
 
+    pub(crate) fn snapshot(&self) -> &HistorySnapshot {
+        &self.snapshot
+    }
+
+    /// Call before pushing a message a layer kept. Only the message that
+    /// names the session counts, and its typed text only when the kept text
+    /// still holds it whole, as with context a layer wrapped around it. A
+    /// layer that dropped or redacted the text may have kept a secret out,
+    /// so the title then comes from what it kept.
+    pub(crate) fn offer_title_source(&mut self, typed: &str, kept: &str) {
+        if self
+            .as_slice()
+            .iter()
+            .any(|m| m.first_user_text().is_some())
+        {
+            return;
+        }
+        let typed = typed.trim();
+        self.snapshot.title_source =
+            (!typed.is_empty() && kept.contains(typed)).then(|| Arc::from(typed));
+    }
+
     pub fn push(&mut self, msg: Message) {
-        self.edit(|msgs| msgs.push(msg));
+        self.edit(|msgs| msgs.push(stamp_new(msg)));
     }
 
     /// A run future that gets dropped never reaches its cancel path, so the tool
@@ -525,6 +548,15 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     }
 }
 
+/// Fill a message's `created_at` on append. An existing stamp is kept, so a
+/// restored or replayed message holds the time it was first recorded, not now.
+pub(crate) fn stamp_new(mut msg: Message) -> Message {
+    if msg.created_at.is_none() {
+        msg.created_at = Some(now_millis());
+    }
+    msg
+}
+
 fn dangling_results(messages: &[Message], note: &str) -> Option<Message> {
     let last = messages.last()?;
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
@@ -551,9 +583,15 @@ pub(crate) fn sanitize_cancelled_history(
         return;
     }
     let marker = cutter.cancel_marker();
+    // Close dangling tool calls and add the cancel marker, stamping both. The
+    // free `close_dangling_tool_calls` is left for the restore path, which must
+    // not re-time messages it is only repairing.
+    let closing = dangling_results(history.as_slice(), marker).map(stamp_new);
     history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, marker);
-        msgs.push(Message::synthetic(marker.into()));
+        if let Some(closing) = closing {
+            msgs.push(closing);
+        }
+        msgs.push(stamp_new(Message::synthetic(marker.into())));
     });
 }
 
@@ -760,6 +798,41 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn push_stamps_created_at_and_keeps_an_existing_one() {
+        let mut history = History::new(vec![]);
+        history.push(Message::user(GO.into()));
+        assert!(
+            history.as_slice()[0].created_at.is_some(),
+            "push fills created_at on append"
+        );
+
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![],
+            created_at: Some(7),
+            ..Default::default()
+        });
+        assert_eq!(
+            history.as_slice()[1].created_at,
+            Some(7),
+            "an existing stamp survives a push"
+        );
+    }
+
+    #[test]
+    fn sanitize_cancelled_history_stamps_its_appends() {
+        let mut history = History::new(vec![Message::user(GO.into()), make_tool_use_msg(&["t1"])]);
+        sanitize_cancelled_history(&mut history, 0, Cutter::User);
+        let [closing, marker] = &history.as_slice()[2..] else {
+            panic!("expected a closing result and the cancel marker");
+        };
+        assert!(
+            closing.created_at.is_some() && marker.created_at.is_some(),
+            "a cancelled turn's appended messages are timed, so a plugin can measure it"
+        );
+    }
+
     fn text_msg(role: Role, text: &str) -> Message {
         Message {
             role,
@@ -886,6 +959,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: GO.into(),
                     signature: Some(SIGNATURE.into()),
+                    reasoning_id: None,
                 },
             );
         }
@@ -904,6 +978,7 @@ mod tests {
         let thinking = |signature: Option<&str>| ContentBlock::Thinking {
             thinking: GO.into(),
             signature: signature.map(Into::into),
+            reasoning_id: None,
         };
         let tool_use = |thought_signature: Option<&str>| ContentBlock::ToolUse {
             id: FIRST.into(),

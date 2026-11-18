@@ -112,7 +112,7 @@ You can type to a moved subagent in its tab. Other task tabs have no input box, 
 - **You.** The main agent gets it with your next message, without being woken. A subagent waiting on the call gets it right away.
 - **`task_stop`.** The tool waits up to five seconds and returns the output. A task that needs longer returns `stop requested`, and its output arrives later as a message that does not start a turn.
 
-`task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids.
+`task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives with the batch result.
 
 ## Results
 
@@ -139,6 +139,13 @@ maki.setup({
 ```
 
 Inside `batch`, a `background = true` call cannot move by itself. Once only such calls are still running, the whole batch moves.
+
+The batch receipt gives each running subagent its own task id:
+
+| Id | `task_message` | `task_stop` |
+|----|----------------|-------------|
+| Subagent id | That subagent | That subagent |
+| Batch id | Every subagent still running in the batch | The whole batch |
 
 If the move fails, for example with background tasks off, the call runs in the foreground and its result starts with `Could not start in the background (<reason>). Ran in the foreground.`
 
@@ -243,15 +250,11 @@ The message does not start a turn and reaches the model with your next prompt. A
 
 ## Headless, SDK and ACP
 
-These modes have no `Ctrl+B`, but the model can still move work with `background = true`, `ctx:background()` and `background_on_timeout`:
+These modes have no `Ctrl+B`. Where moves are on, the model can still move work with `background = true`, `ctx:background()` and `background_on_timeout`:
 
-| Mode | Results |
-|------|---------|
-| `-p` / `--print` | Off by default, so `background = true` runs in the foreground. With `--background-timeout`, the process stays alive while background work runs, and each result starts a new turn. |
-| SDK, stdin open | Results ride along with the next user message. No turn starts on its own. |
-| SDK, stdin closed | As `-p` with `--background-timeout`. |
-| ACP | Results arrive with the next prompt. No turn starts on its own. Closing the session stops the work. |
+| Mode | Moves | Results |
+|------|-------|---------|
+| `-p` / `--print`, SDK | Off unless you pass `--background-timeout` | See [Headless Mode](/docs/headless/#background-tasks), which also explains why moves are off. |
+| ACP | On unless you pass `--background-timeout 0` | Arrive with the next prompt. No turn starts on its own. Closing the session stops the work. See [ACP](/docs/acp/#background-tasks). |
 
 Nobody answers a moved subagent's prompts here, so they are denied and its tools need [allow rules](/docs/permissions/).
-
-`--background-timeout <SECS>` bounds the wait, and `0` turns moves off. It defaults to 600 in SDK mode and with `--exit-on-done`. `-p` keeps moves off by default because a dev server the model moves never ends and would hold a CI job for the full timeout. See [Headless Mode](/docs/headless/#background-tasks) and [ACP](/docs/acp/#background-tasks).

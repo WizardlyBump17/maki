@@ -1,8 +1,8 @@
 //! Queue of work handed from the UI to the agent loop.
 //!
-//! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, flume
-//! closes the notify channel, so the receiver's `recv_notify` wakes with an
-//! `Err` and the agent loop falls out of its main loop on its own. That way
+//! Shutdown rides on `Drop`: when the last [`QueueSender`] goes away, the
+//! notify channel closes, so the receiver's `recv_notify` wakes with `None`
+//! and the agent loop falls out of its main loop on its own. That way
 //! nobody needs a separate "please stop" flag, and callers can't forget to
 //! set it.
 
@@ -11,8 +11,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{
-    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
+    AgentInput, AgentMode, CompactReason, EarlierInput, ExtractedCommand, ImageSource,
+    InterruptSource,
 };
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
@@ -77,6 +80,7 @@ impl QueuedInput {
 pub(crate) struct Compaction {
     pub(crate) run_id: u64,
     pub(crate) instructions: Option<String>,
+    pub(crate) reason: CompactReason,
     /// The session's workflow mode when it was asked for: the frame left
     /// behind must carry the tools the next run sends.
     pub(crate) workflow: bool,
@@ -164,23 +168,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     items: Items,
-    notify_tx: flume::Sender<()>,
+    notify_tx: Sender<()>,
 }
 
 pub(crate) struct QueueReceiver {
     items: Items,
-    notify_rx: flume::Receiver<()>,
+    notify_rx: AsyncMutex<Receiver<()>>,
 }
 
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
-    let (notify_tx, notify_rx) = flume::bounded(1);
+    let (notify_tx, notify_rx) = channel(1);
     let items: Items = Arc::new(Mutex::new(VecDeque::new()));
     (
         QueueSender {
             items: Arc::clone(&items),
             notify_tx,
         },
-        QueueReceiver { items, notify_rx },
+        QueueReceiver {
+            items,
+            notify_rx: AsyncMutex::new(notify_rx),
+        },
     )
 }
 
@@ -263,15 +270,18 @@ impl QueueReceiver {
         }
     }
 
-    pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
-        self.notify_rx.recv_async().await
+    pub(crate) async fn recv_notify(&self) -> Option<()> {
+        self.notify_rx.lock().await.recv().await
     }
 }
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
         Some(match self.pop_run()? {
-            QueueRun::Compact(compaction) => ExtractedCommand::Compact(compaction.instructions),
+            QueueRun::Compact(compaction) => ExtractedCommand::Compact {
+                instructions: compaction.instructions,
+                reason: compaction.reason,
+            },
             QueueRun::Messages(run) => {
                 ExtractedCommand::Interrupt(run.into_iter().map(|queued| queued.input).collect())
             }
@@ -364,6 +374,7 @@ mod tests {
         QueueItem::Compact(Compaction {
             run_id: 0,
             instructions: instructions.map(str::to_string),
+            reason: CompactReason::Manual,
             workflow: false,
         })
     }
@@ -474,7 +485,7 @@ mod tests {
         tx.push(compact(Some(GUIDANCE)));
 
         assert!(
-            matches!(rx.poll(), Some(ExtractedCommand::Compact(Some(extra))) if extra == GUIDANCE)
+            matches!(rx.poll(), Some(ExtractedCommand::Compact { instructions: Some(extra), .. }) if extra == GUIDANCE)
         );
     }
 

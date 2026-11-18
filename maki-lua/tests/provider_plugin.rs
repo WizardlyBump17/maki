@@ -12,9 +12,11 @@
 //! every test its own process.
 
 use std::fs;
+use std::iter;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
@@ -35,6 +37,7 @@ use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
@@ -60,6 +63,17 @@ const INLINE_PLUGIN: &str = "acme_inline";
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
 const RESPONSES_MARKER: &str = "responses";
+
+const OVERRIDE_SLUG: &str = "acmeoverride";
+const OVERRIDE_MODEL: &str = "acme-o1";
+/// Headers maki sets on every codec's request, each answered by the auth hook
+/// with a value of its own.
+const OVERRIDDEN_HEADERS: [(&str, &str); 2] = [
+    ("user-agent", "acme-gateway/1.0"),
+    ("content-type", "application/json; charset=utf-8"),
+];
+const REJECTED_SCRIPT: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+const NOTHING_SENT: &str = "the provider never reached the server";
 
 const PARKING_SLUG: &str = "acmeparked";
 const PARKING_HOST: &str = "api.acme.example";
@@ -281,7 +295,7 @@ fn stream(
     thinking: ThinkingConfig,
 ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
     let messages = [Message::user(PROMPT.to_owned())];
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let result = runtime().block_on(provider.stream_message(
         model,
         &messages,
@@ -295,7 +309,7 @@ fn stream(
         None,
     ));
     drop(tx);
-    (rx.drain().collect(), result)
+    (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
 }
 
 /// One turn, both ways round: the events a transcript produces in the order the
@@ -553,6 +567,58 @@ fn the_responses_codec_applies_the_body_hook_too() {
     assert_eq!(sent[0].json()["acme_marker"], json!(RESPONSES_MARKER));
 }
 
+fn overriding_plugin(codec: &str, base_url: &str) -> String {
+    let headers: String = OVERRIDDEN_HEADERS
+        .iter()
+        .map(|(name, value)| format!(r#"["{name}"] = "{value}", "#))
+        .collect();
+    format!(
+        r#"
+maki.provider.register({{
+  slug = "{OVERRIDE_SLUG}",
+  display_name = "Acme Overrides",
+  codec = "{codec}",
+  base_url = "{base_url}",
+  models = {{ {{ prefixes = {{ "{OVERRIDE_MODEL}" }} }} }},
+  auth = function()
+    return {{ headers = {{ {headers}}} }}
+  end,
+}})
+"#
+    )
+}
+
+/// A header the plugin's credentials name goes out once, with the plugin's
+/// value, whichever codec builds the request. Two copies would leave the
+/// server to guess which one counts (RFC 9110, section 5.3).
+#[test_case("openai" ; "openai")]
+#[test_case("openai-responses" ; "openai_responses")]
+#[test_case("anthropic" ; "anthropic")]
+#[test_case("google" ; "google")]
+fn a_header_the_auth_hook_sets_replaces_makis_own(codec: &str) {
+    let _home = isolated_home();
+    let (base_url, server) = serve(REJECTED_SCRIPT);
+    let host = plugin_host();
+    load_inline(
+        &host,
+        &overriding_plugin(codec, &base_url),
+        LOOPBACK_HOST,
+        &[OVERRIDE_SLUG],
+    );
+    plugin::commit_load();
+
+    let provider = plugin::create(OVERRIDE_SLUG, Timeouts::default()).expect(CREATE_FAILED);
+    let model =
+        Model::from_spec(&format!("{OVERRIDE_SLUG}/{OVERRIDE_MODEL}")).expect(UNKNOWN_MODEL);
+    let _ = stream(provider.as_ref(), &model, ThinkingConfig::Off);
+
+    let sent = server.lock().unwrap();
+    let request = sent.first().expect(NOTHING_SENT);
+    for (name, value) in OVERRIDDEN_HEADERS {
+        assert_eq!(request.headers.values(name), [value], "{name}");
+    }
+}
+
 /// One provider whose `login` runs `body`. The registration is the same every
 /// time, since what these tests vary is only what the hook does once it is
 /// called.
@@ -642,7 +708,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
     let locked = std::thread::spawn(|| runtime().block_on(plugin::login(LOCKED_SLUG)));
     wait_for(&entered);
 
-    let (served, free_login) = flume::bounded(1);
+    let (served, free_login) = sync_channel(1);
     std::thread::spawn(move || served.send(runtime().block_on(plugin::login(FREE_SLUG))));
     free_login
         .recv_timeout(STUCK_AFTER)

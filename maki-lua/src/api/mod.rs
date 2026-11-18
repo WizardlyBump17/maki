@@ -28,11 +28,13 @@ pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod util;
 pub(crate) mod uv;
+pub(crate) mod version;
 pub(crate) mod yaml;
 
 use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::options::PluginOpts;
 use crate::api::tool::{PendingRules, PendingTools};
@@ -56,7 +58,7 @@ pub(crate) fn create_maki_global(
     pending: PendingTools,
     pending_rules: PendingRules,
     owner: Owner,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
     reach: &PluginReach,
     opts: PluginOpts,
 ) -> LuaResult<Table> {
@@ -95,6 +97,7 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
+    maki.set("version", version::create_version_table(lua)?)?;
     warn_invalid_net_hosts(&plugin, reach.egress().declared());
     // One egress value shared by the two namespaces that can open a socket, so
     // a provider registered through `maki.provider` is reachable from

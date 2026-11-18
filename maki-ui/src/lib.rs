@@ -1,5 +1,5 @@
 //! Single-threaded ratatui event loop; the agent runs on tokio tasks off the UI thread.
-//! `AgentHandles` bundles all flume channels to the agent. `dispatch()` processes
+//! `AgentHandles` bundles all channels to the agent. `dispatch()` processes
 //! `Action`s returned by `App::update()`. Scroll and drag events are coalesced from
 //! the queue to avoid jank.
 
@@ -121,7 +121,7 @@ pub enum RunOutcome {
 
 pub async fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
-        let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
+        let (_guard, mut terminal) = terminal::TerminalGuard::init(params.max_log_bytes)?;
         color_compat::init();
         appearance::init(params.ui_config.theme.as_ref());
         let el = event_loop::EventLoop::new(&mut terminal, params).await?;

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
 use crate::components::input::Draft;
@@ -44,6 +45,9 @@ const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
 const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
 const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
+const COMPACT_DEFERRED_PREFIX: &str =
+    "A plugin paused an automatic compaction. The model was told:";
+const COMPACT_CONTINUED_PREFIX: &str = "A plugin told the model after the compaction:";
 pub(crate) const INBOX_DROPPED_SUFFIX: &str =
     " queued message(s) dropped: the subagent finished first";
 
@@ -93,7 +97,7 @@ pub struct Chat {
     /// Where a subagent's permission answers go. It lives until the chat
     /// finishes, not the turn, so a subagent moved off its turn can still be
     /// answered.
-    pub(crate) answer_tx: Option<flume::Sender<String>>,
+    pub(crate) answer_tx: Option<UnboundedSender<String>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
     pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
@@ -305,6 +309,8 @@ impl Chat {
                     SteerKind::MessageRewritten => REWRITTEN_PREFIX,
                     SteerKind::MessageDropped => DROPPED_PREFIX,
                     SteerKind::Continued => CONTINUED_PREFIX,
+                    SteerKind::CompactDeferred => COMPACT_DEFERRED_PREFIX,
+                    SteerKind::CompactContinued => COMPACT_CONTINUED_PREFIX,
                 };
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
@@ -1600,6 +1606,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "reasoning".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "answer".into(),
@@ -1938,6 +1945,8 @@ mod tests {
     #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
     #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
     #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
+    #[test_case(SteerKind::CompactDeferred, COMPACT_DEFERRED_PREFIX ; "compact_deferred")]
+    #[test_case(SteerKind::CompactContinued, COMPACT_CONTINUED_PREFIX ; "compact_continued")]
     fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
         let mut chat = chat();
         chat.handle_event(

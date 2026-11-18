@@ -7,8 +7,10 @@
 //! a process of its own. The golden walker gets the same guarantee by
 //! replaying each file in a child process, see [`golden`].
 
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::unbounded_channel;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::providers::{base_url_env_var, builtin_provider};
@@ -56,13 +58,19 @@ const PROMPT: &str = "hi";
 /// local gateway. The host comes back instead of being dropped, since a hook
 /// whose host has died answers nothing.
 fn load_bundled(slug: &str) -> PluginHost {
+    load_bundled_with_opts(slug, HashMap::new())
+}
+
+/// `opts` is the `plugins.<name>` table from `maki.setup`, so a golden can
+/// load its plugin the way a user who set that option would.
+fn load_bundled_with_opts(slug: &str, opts: HashMap<String, Map<String, Value>>) -> PluginHost {
     let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).expect(HOST_FAILED);
     plugin::begin_load();
     host.load_builtins(&PluginsConfig {
         enabled: true,
         names: vec![slug.to_owned()],
         packages: Vec::new(),
-        opts: HashMap::new(),
+        opts,
     })
     .expect(LOAD_FAILED);
     plugin::commit_load();
@@ -158,7 +166,7 @@ fn only_opted_in_providers_read_usage_cost(slug: &str, spec: &str, expected: Opt
 
     let provider = plugin::create(slug, Timeouts::default()).expect(NOT_BUILT);
     let model = Model::from_spec(spec).expect(UNKNOWN_MODEL);
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let resp = runtime()
         .block_on(provider.stream_message(
             &model,

@@ -4,9 +4,8 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
@@ -42,6 +41,7 @@ use mlua::{
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::spawn_blocking;
 use tracing::info;
 
@@ -53,7 +53,7 @@ use crate::api::util::command::UiAction;
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime};
+use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind};
 use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::runtime::{CANCELLED_MSG, active_task_cancel, host_ui};
 
@@ -278,7 +278,7 @@ enum Upstream {
     Chat {
         session: MakiId,
         plugin: Arc<str>,
-        ui: Option<flume::Sender<UiAction>>,
+        ui: Option<UnboundedSender<UiAction>>,
         registry: BackgroundTasks,
         id: String,
     },
@@ -288,7 +288,7 @@ enum Upstream {
 #[derive(Clone)]
 struct Adoption {
     call: Arc<CallScope>,
-    ui: Option<flume::Sender<UiAction>>,
+    ui: Option<UnboundedSender<UiAction>>,
     registry: BackgroundTasks,
     /// The session's `ui_id`.
     id: String,
@@ -309,16 +309,17 @@ impl Adoption {
 
 /// Gives a session opened under a moved call an entry of its own, so its
 /// adopted tab can be stopped by its id. It reports where the call does, so
-/// the call's caller reaches it. A top-level `task` shares the call's id, so
-/// the call's entry takes its control instead. An entry its chat refuses
-/// fires the session as it drops, and its chat ending ends the session anyway.
+/// the call's caller reaches it, by its own id or by the call's. A top-level
+/// `task` shares the call's id, so the call's entry takes its control
+/// instead. An entry its chat refuses fires the session as it drops, and its
+/// chat ending ends the session anyway.
 ///
 /// A session that already ran has a chat in the UI, under the call's row.
 /// The UI adopts it now rather than at its next event, or a quiet one would
 /// look dead once the turn that started it ends.
 pub(crate) fn adopt_session(
     registry: &BackgroundTasks,
-    ui: Option<&flume::Sender<UiAction>>,
+    ui: Option<&UnboundedSender<UiAction>>,
     home: &TaskHome,
     stub: SessionStub,
 ) {
@@ -331,13 +332,14 @@ pub(crate) fn adopt_session(
             id: stub.ui_id,
             plugin: Arc::clone(&stub.plugin),
             name: stub.name,
-            kind: Kind::Agent,
+            kind: Kind::Nested {
+                parent: home.id.clone(),
+            },
             started_at: now_epoch(),
             cost: None,
         },
         session: home.chat,
         task: None,
-        lifetime: Lifetime::Call,
         cancel: Fire::Handle(stub.control.handle()),
         stopped: None,
         control: Some(stub.control),
@@ -349,7 +351,7 @@ pub(crate) fn adopt_session(
         return;
     }
     if let (Some(ui), Some(info)) = (ui, stub.info.get()) {
-        let _ = ui.try_send(UiAction::PluginTaskOpened {
+        let _ = ui.send(UiAction::PluginTaskOpened {
             session: home.chat,
             plugin: stub.plugin,
             info: Box::new(info.clone()),
@@ -369,7 +371,7 @@ impl Upstream {
                 ui: Some(ui),
                 ..
             } => {
-                let _ = ui.try_send(UiAction::PluginTaskEvent {
+                let _ = ui.send(UiAction::PluginTaskEvent {
                     session: *session,
                     plugin: Arc::clone(plugin),
                     envelope: Box::new(envelope),
@@ -429,7 +431,7 @@ impl Upstream {
             ..
         } = self
         {
-            let _ = ui.try_send(UiAction::PluginTaskOpened {
+            let _ = ui.send(UiAction::PluginTaskOpened {
                 session: *session,
                 plugin: Arc::clone(plugin),
                 info: Box::new(info),
@@ -470,8 +472,8 @@ async fn relay_session_events(
     mut sub_events: SessionEvents,
     mut upstream: Upstream,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
-    done_tx: flume::Sender<()>,
-    live_sink: Option<flume::Sender<ToolLive>>,
+    done_tx: UnboundedSender<()>,
+    live_sink: Option<UnboundedSender<ToolLive>>,
 ) {
     let mut cost = None;
     while let Some(mut envelope) = sub_events.next().await {
@@ -666,9 +668,9 @@ async fn system_prompt(
 /// straight into `maki.agent.session()` or use it to inspect what tools are
 /// available.
 ///
-/// A session costs what its tools reach (see `maki.agent.session`). To hand
-/// over only what the plugin can pay for, check each tool's `permission`
-/// from `maki.api.get_tool`, as the second example does.
+/// A session costs what its tools reach (see `maki.agent.session`). To keep
+/// only tools the plugin can pay for, filter on each tool's `permission`
+/// from `maki.api.get_tool`, as the example does.
 ///
 /// Without a `ctx`, pass `session = id` in `opts` to get the tools a
 /// background session of that chat would have.
@@ -895,7 +897,7 @@ async fn dispatch_child(
     tctx.output_mode = ToolOutputMode::Full;
     // Open even without callbacks: when a plugin answers the child's
     // permission prompt, the user still has to see it somewhere.
-    let (live_tx, live_rx) = flume::unbounded();
+    let (live_tx, live_rx) = unbounded_channel();
     tctx.live_sink = Some(live_tx);
     let (mut on_buf, mut on_ann, mut on_usage, mut on_movable, mut on_task) =
         (None, None, None, None, None);
@@ -961,21 +963,18 @@ async fn dispatch_child(
 /// chat is in plan mode its file-write tools are denied. Its thinking never
 /// goes above the chat's current setting.
 ///
-/// With or without a ctx, the plugin must hold what its tools reach. A prompt
-/// is no gate under YOLO or an allow rule, and a background session has
-/// nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
-/// with `fs_read`) costs that one. A tool registered with `permission = {}`
-/// costs nothing. A tool declaring none, or `mcp = true` on a chat with MCP
-/// servers, costs every permission except `agent` and `input`. See each
-/// tool's `permission` in `maki.api.get_tool` and on the
-/// [Tools](/docs/tools/) page. `local_tools` cost nothing, they run as the
-/// plugin. The bundled `task` hands over the whole chat, so it holds every
-/// permission. If the plugin cannot pay, the error lists every tool it cannot
-/// pay for and the `except` list that leaves them out.
+/// With or without a ctx, the plugin must hold what its tools reach, because
+/// YOLO, allow rules and background sessions skip the prompt. Each tool costs:
 ///
-/// The `general_sub` set in the example includes tools that declare no
-/// permission (`batch`, `code_execution`), so a plugin without every
-/// permission leaves those out.
+/// - A declared permission (`bash`: `run`, `read`: `fs_read`): that one.
+/// - `permission = {}`, and `local_tools` (they run as the plugin): nothing.
+/// - No declaration (`batch`, `code_execution`), or `mcp = true` on a chat
+///   with MCP servers: every permission except `agent` and `input`.
+///
+/// Look a tool up with `maki.api.get_tool` or on the [Tools](/docs/tools/)
+/// page. If the plugin cannot pay, the error names each tool it cannot pay
+/// for and the `except` list that leaves them out. The bundled `task` plugin
+/// hands over the whole chat, so it holds every permission.
 ///
 /// `scope` sets the lifetime. `"task"`, the default, ends the session with
 /// the task that opened it: an autocmd callback when it returns, a tool
@@ -1182,17 +1181,18 @@ async fn session(
     let parent_tx = agent_ctx.event_tx.clone();
     // A subagent can only ask the user if its parent can. Under `maki -p` or
     // a background session nobody reads the subagent's chat, so a fresh
-    // channel would leave every prompt waiting until cancel. Without one,
-    // `enforce` denies the call right away.
-    let (answer_tx, answer_rx) = agent_ctx
-        .user_response_rx
-        .is_some()
-        .then(flume::unbounded::<String>)
+    // channel would leave every prompt waiting until cancel. A session opened
+    // inside another subagent has the same problem. The outer relay stamps
+    // the inner asks as its own, so the user's answer lands on the outer
+    // channel. Without a channel, `enforce` denies the call right away.
+    let can_ask = agent_ctx.user_response_rx.is_some() && agent_ctx.task_id.is_none();
+    let (answer_tx, answer_rx) = can_ask
+        .then(unbounded_channel::<String>)
         .map(|(tx, rx)| (tx, Arc::new(AsyncMutex::new(rx))))
         .unzip();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let (done_tx, done_rx) = flume::unbounded();
+    let (done_tx, done_rx) = unbounded_channel();
     // Doubles as the task id tools see. The fallback gets its own id: it keys
     // `subagent_cancels`, where two subagents sharing the session id would
     // collide.
@@ -1275,6 +1275,11 @@ async fn session(
         mailbox: SessionMailbox::register(MakiId::generate()),
         adoption,
     });
+    if let Some(session) = &agent_ctx.session_id {
+        cancellation
+            .mailbox
+            .track_task(&cancellation.ui_id, session.id());
+    }
     cancellation.end_mailbox_on_cancel();
     let background = match owner {
         Some((session, task, cancel)) => {
@@ -1289,7 +1294,6 @@ async fn session(
                 },
                 session,
                 task,
-                lifetime: Lifetime::Plugin,
                 stopped: None,
                 control: Some(Arc::clone(&cancellation.control)),
                 replied: false,
@@ -1370,7 +1374,6 @@ async fn session(
         local_tools: Arc::new(local_map),
         name,
         dones: RunDones::new(done_rx),
-        start: Instant::now(),
         background,
     };
 
@@ -1565,7 +1568,7 @@ async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
-    rx: flume::Receiver<ToolLive>,
+    mut rx: UnboundedReceiver<ToolLive>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
     let mut run = pin!(tool_dispatch::run(
@@ -1576,16 +1579,16 @@ async fn dispatch_racing_live(
         CallOrigin::Nested
     ));
     loop {
-        match select(run.as_mut(), pin!(rx.recv_async())).await {
-            Either::Left((done, _)) => {
+        tokio::select! {
+            biased;
+            done = &mut run => {
                 while let Ok(ev) = rx.try_recv() {
                     cbs.deliver(ev).await;
                 }
                 return done;
             }
-            Either::Right((Ok(ev), _)) => cbs.deliver(ev).await,
-            // The sender is gone but no result arrived: just wait for the run.
-            Either::Right((Err(_), _)) => return run.await,
+            // Once the sender is gone this arm is off and only the run is left.
+            Some(ev) = rx.recv() => cbs.deliver(ev).await,
         }
     }
 }
@@ -1613,8 +1616,8 @@ struct SessionState {
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
     /// sender disconnect. `None` once closed.
     stream_guard: Option<EventStreamGuard>,
-    answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
-    answer_tx: Option<flume::Sender<String>>,
+    answer_rx: Option<Arc<AsyncMutex<UnboundedReceiver<String>>>>,
+    answer_tx: Option<UnboundedSender<String>>,
     reauth: bool,
     cancellation: Arc<SessionCancellation>,
     upstream: Upstream,
@@ -1622,7 +1625,6 @@ struct SessionState {
     local_tools: LocalTools,
     name: String,
     dones: RunDones,
-    start: Instant,
     background: Option<Background>,
 }
 
@@ -1632,12 +1634,12 @@ struct SessionState {
 /// Events carry no prompt tag, so the next prompt can't tell a leftover from
 /// its own. It counts how many it is owed instead and reads past the old ones.
 struct RunDones {
-    rx: flume::Receiver<()>,
+    rx: UnboundedReceiver<()>,
     unread: usize,
 }
 
 impl RunDones {
-    fn new(rx: flume::Receiver<()>) -> Self {
+    fn new(rx: UnboundedReceiver<()>) -> Self {
         Self { rx, unread: 0 }
     }
 
@@ -1647,12 +1649,12 @@ impl RunDones {
 
     /// Safe to drop mid-wait, because a `Done` only stops being owed once it
     /// has been read.
-    async fn caught_up(&mut self) -> Result<(), flume::RecvError> {
+    async fn caught_up(&mut self) -> Option<()> {
         while self.unread > 0 {
-            self.rx.recv_async().await?;
+            self.rx.recv().await?;
             self.unread -= 1;
         }
-        Ok(())
+        Some(())
     }
 }
 
@@ -1734,7 +1736,7 @@ impl SessionState {
             .send_history(&self.cancellation.ui_id, messages);
         info!(
             name = %self.name,
-            duration_ms = self.start.elapsed().as_millis() as u64,
+            duration_ms = self.cancellation.control.opened().elapsed().as_millis() as u64,
             input_tokens = usage.total_input(),
             output_tokens = usage.output,
             "subagent session closed",
@@ -1857,6 +1859,7 @@ impl SessionCancellation {
     /// stop instead of reporting to nobody.
     fn end_mailbox(&self) {
         self.registry.end_mailbox(&self.mailbox);
+        self.mailbox.untrack_task(&self.ui_id);
     }
 
     /// The session's token can fire with no prompt left to notice: the task
@@ -1866,9 +1869,11 @@ impl SessionCancellation {
         let token = self.control.token();
         let registry = self.registry.clone();
         let mailbox = self.mailbox.clone();
+        let task_id = self.ui_id.clone();
         tokio::spawn(async move {
             token.cancelled().await;
             registry.end_mailbox(&mailbox);
+            mailbox.untrack_task(&task_id);
         });
     }
 }
@@ -2079,7 +2084,7 @@ async fn prompt(
     // The relay reaches `Done` only after every `TurnComplete`, so once it has,
     // all our `ToolLive::Usage` messages sit in the live channel before
     // `dispatch_racing_live` drains it for the last time.
-    if s.dones.caught_up().await.is_err() {
+    if s.dones.caught_up().await.is_none() {
         tracing::warn!(name = %s.name, "subagent event relay stopped, live usage may lag");
     }
     let usage = s.params.ledger.totals().usage;
@@ -2096,7 +2101,7 @@ async fn prompt(
 
     let tbl = lua.create_table()?;
     tbl.set("text", text)?;
-    tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
+    tbl.set("duration_ms", control.opened().elapsed().as_millis() as u64)?;
     tbl.set("input_tokens", usage.total_input())?;
     tbl.set("output_tokens", usage.output)?;
     Ok((Some(tbl), None))
@@ -2161,9 +2166,25 @@ fn send(
 /// Close cancels a running prompt before waiting to flush its history. That
 /// prompt returns `"session closed"` and any partial text.
 ///
+/// {result} tells headless clients how the subagent ended and what it found.
+///
+/// @param result table? `{ llm_output, is_error }`, the shape a tool handler returns.
 /// @return
 #[lua_fn]
-async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+async fn close(
+    _lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    result: Option<Table>,
+) -> LuaResult<()> {
+    if let Some(result) = result {
+        let text = result.opt::<String>("llm_output")?.unwrap_or_default();
+        let result = if result.opt_bool("is_error") == Some(true) {
+            Err(text)
+        } else {
+            Ok(text)
+        };
+        this.cancellation.control.report(result);
+    }
     this.cancellation.close();
     let inner = Arc::clone(&this.inner);
     drop(this);
@@ -2210,8 +2231,8 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
-    use flume::Sender;
     use futures::FutureExt;
+    use futures::future::select;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
     use maki_agent::tools::test_support::{mock_tool, stub_ctx_with, stub_seed};
     use maki_agent::tools::{ToolAudience, ToolSource};
@@ -2230,16 +2251,21 @@ mod tests {
     use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
+    use std::iter;
+    use std::sync::mpsc::{Sender, channel};
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
     use tokio::time::timeout;
 
     use super::*;
-    use crate::api::task::{NO_RUNNING_SUBAGENT, create_task_table};
+    use crate::api::task::create_task_table;
+    use crate::background::{NO_RUNNING_SUBAGENT, NONE_RUNNING};
     use crate::runtime::{TaskCell, TaskScope};
 
     const PLUGIN: &str = "monitor";
     const SESSION_PROMPT: &str = "work until closed";
     const PARTIAL_TEXT: &str = "partial response";
+    const TOOL_OUTPUT: &str = "auth lives in src/auth.rs";
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
     const THINKING_BUDGET: u32 = 2048;
@@ -2308,7 +2334,7 @@ mod tests {
         }
     }
 
-    struct PendingProvider(flume::Sender<()>);
+    struct PendingProvider(UnboundedSender<()>);
 
     impl Provider for PendingProvider {
         fn stream_message<'a>(
@@ -2317,7 +2343,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a JsonValue,
-            events: &'a flume::Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2364,17 +2390,77 @@ mod tests {
         if dispose {
             drop(first.take::<LuaSession>().unwrap());
         } else {
-            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
-            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), first.borrow().unwrap(), None)
+                .await
+                .unwrap();
+            close(lua.clone(), first.borrow().unwrap(), None)
+                .await
+                .unwrap();
         }
         let replacement = native_session(&lua, &ctx).await;
         if !dispose {
-            close(lua.clone(), first.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), first.borrow().unwrap(), None)
+                .await
+                .unwrap();
         }
         for session in [sibling, replacement] {
             assert!(!session_cancelled(&session));
-            close(lua.clone(), session.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), session.borrow().unwrap(), None)
+                .await
+                .unwrap();
         }
+    }
+
+    /// A plugin only knows a subagent by the task id its events carry, so that
+    /// is what `maki.session.notify` takes.
+    #[tokio::test]
+    async fn notify_reaches_a_subagent_by_its_task_id() {
+        let lua = Lua::new();
+        let parent = MakiId::generate();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.session_id = Some(SessionRef::from(parent));
+        let sess = native_session(&lua, &ctx).await;
+        let mailbox = sess
+            .borrow::<LuaSession>()
+            .unwrap()
+            .cancellation
+            .mailbox
+            .clone();
+
+        SessionMailbox::notify_task(parent, PARENT_ID, NUDGE.into(), None, true).unwrap();
+
+        assert_eq!(mailbox.claim_wake().len(), 1);
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(SessionMailbox::notify_task(parent, PARENT_ID, NUDGE.into(), None, true).is_err());
+    }
+
+    #[test_case(None, Ok(TOOL_OUTPUT.into()) ; "answer")]
+    #[test_case(Some(true), Err(TOOL_OUTPUT.into()) ; "error")]
+    #[tokio::test]
+    async fn close_reports_the_tool_result_to_the_host(
+        is_error: Option<bool>,
+        expected: Result<String, String>,
+    ) {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let sess = native_session(&lua, &ctx).await;
+        let result = lua.create_table().unwrap();
+        result.set("llm_output", TOOL_OUTPUT).unwrap();
+        result.set("is_error", is_error).unwrap();
+
+        close(lua.clone(), sess.borrow().unwrap(), Some(result))
+            .await
+            .unwrap();
+
+        let reported = sess
+            .borrow::<LuaSession>()
+            .unwrap()
+            .cancellation
+            .control
+            .result();
+        assert_eq!(reported, Some(expected));
     }
 
     #[test_case(false ; "close_during_prompt")]
@@ -2382,8 +2468,8 @@ mod tests {
     #[tokio::test]
     async fn session_close_does_not_wait_for_the_prompt_lock(dispose: bool) {
         let lua = Lua::new();
-        let (started_tx, started_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
+        let (started_tx, mut started_rx) = unbounded_channel();
+        let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(PendingProvider(started_tx));
@@ -2392,7 +2478,7 @@ mod tests {
                 let (result, ()) = futures::future::join(
                     prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
                     async {
-                        started_rx.recv_async().await.unwrap();
+                        started_rx.recv().await.unwrap();
                         if dispose {
                             drop(sess.take::<LuaSession>().unwrap());
                         } else {
@@ -2428,7 +2514,7 @@ mod tests {
                     if let AgentEvent::SubagentHistory {
                         tool_use_id,
                         messages,
-                    } = events.recv_async().await.unwrap().event
+                    } = events.recv().await.unwrap().event
                     {
                         assert_eq!(tool_use_id, PARENT_ID);
                         assert!(messages.iter().any(|message| {
@@ -2441,8 +2527,7 @@ mod tests {
                     }
                 }
                 assert!(
-                    !events
-                        .try_iter()
+                    !iter::from_fn(|| events.try_recv().ok())
                         .any(|event| matches!(event.event, AgentEvent::SubagentHistory { .. }))
                 );
             })
@@ -2467,7 +2552,7 @@ mod tests {
             _: &'a [Message],
             system: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2544,7 +2629,7 @@ mod tests {
         let lua = Lua::new();
         lua.set_app_data(SpawnedTasks::default());
         lua.set_app_data(Arc::new(ToolRegistry::new()));
-        let (sent, requests) = flume::unbounded();
+        let (sent, requests) = channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(PromptRecorder(sent));
         let mut prompts = ResolvedPrompts::default();
@@ -2574,7 +2659,9 @@ mod tests {
         let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
             .await
             .unwrap();
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
         assert!(error.is_none(), "{error:?}");
         assert_eq!(
             requests.recv().unwrap(),
@@ -2591,8 +2678,8 @@ mod tests {
     /// Hands the texts of each request's closing user messages to the test,
     /// then holds the reply until the test lets it go.
     struct GatedProvider {
-        requests: Sender<Vec<String>>,
-        release: flume::Receiver<()>,
+        requests: UnboundedSender<Vec<String>>,
+        release: AsyncMutex<UnboundedReceiver<()>>,
     }
 
     impl Provider for GatedProvider {
@@ -2602,7 +2689,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2615,7 +2702,7 @@ mod tests {
                     .collect();
                 user_turn.reverse();
                 self.requests.send(user_turn).unwrap();
-                self.release.recv_async().await.unwrap();
+                self.release.lock().await.recv().await.unwrap();
                 Ok(StreamResponse {
                     message: Message {
                         role: Role::Assistant,
@@ -2644,14 +2731,14 @@ mod tests {
     #[tokio::test]
     async fn send_reaches_the_child(mid_prompt: bool) {
         let lua = Lua::new();
-        let (requests_tx, requests) = flume::unbounded();
-        let (release, release_rx) = flume::unbounded();
-        let (event_tx, events) = flume::unbounded();
+        let (requests_tx, mut requests) = unbounded_channel();
+        let (release, release_rx) = unbounded_channel();
+        let (event_tx, mut events) = unbounded_channel();
         let event_tx = EventSender::new(event_tx, RUN_ID);
         let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(PARENT_ID));
         ctx.provider = Arc::new(GatedProvider {
             requests: requests_tx,
-            release: release_rx,
+            release: AsyncMutex::new(release_rx),
         });
         let nudge = |sess: &AnyUserData| {
             let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), None).unwrap();
@@ -2665,18 +2752,20 @@ mod tests {
             let (result, requests_seen) = futures::future::join(
                 prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into()),
                 async {
-                    let mut seen = vec![requests.recv_async().await.unwrap()];
+                    let mut seen = vec![requests.recv().await.unwrap()];
                     if mid_prompt {
                         nudge(&sess);
                         release.send(()).unwrap();
-                        seen.push(requests.recv_async().await.unwrap());
+                        seen.push(requests.recv().await.unwrap());
                     }
                     release.send(()).unwrap();
                     seen
                 },
             )
             .await;
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            close(lua.clone(), sess.borrow().unwrap(), None)
+                .await
+                .unwrap();
             assert!(result.unwrap().1.is_none());
             if mid_prompt {
                 assert_eq!(requests_seen[0], [SESSION_PROMPT]);
@@ -2692,7 +2781,7 @@ mod tests {
             .await
             .expect("the prompt never finished");
         assert!(requests.is_empty());
-        assert!(events.drain().any(|envelope| {
+        assert!(iter::from_fn(|| events.try_recv().ok()).any(|envelope| {
             matches!(&envelope.event, AgentEvent::QueueItemConsumed { text, .. } if text == NUDGE)
                 && envelope
                     .subagent
@@ -2712,7 +2801,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2743,7 +2832,7 @@ mod tests {
         }
     }
 
-    fn hang_tool(started: Sender<()>) -> LocalTool {
+    fn hang_tool(started: UnboundedSender<()>) -> LocalTool {
         maki_agent::tools::local_tool(ToolAudience::all(), move |_, ctx| {
             let started = started.clone();
             Box::pin(async move {
@@ -2760,8 +2849,8 @@ mod tests {
     #[tokio::test]
     async fn an_interrupting_send_cuts_a_running_tool_and_the_prompt_goes_on() {
         let lua = Lua::new();
-        let (started_tx, started) = flume::unbounded();
-        let (requests_tx, requests) = flume::unbounded();
+        let (started_tx, mut started) = unbounded_channel();
+        let (requests_tx, requests) = channel();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.provider = Arc::new(HangingToolProvider {
             requests: requests_tx,
@@ -2778,16 +2867,18 @@ mod tests {
         )]));
 
         let (result, ()) = futures::future::join(prompt_text(&lua, &sess), async {
-            started.recv_async().await.unwrap();
+            started.recv().await.unwrap();
             let opts = lua.create_table_from([(INTERRUPT_OPT, true)]).unwrap();
             let sent = send(&lua, &sess.borrow().unwrap(), NUDGE.into(), Some(opts)).unwrap();
             assert_eq!(sent, (Some(true), None));
         })
         .await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
 
         assert_eq!(result, (Some(CHILD_RESPONSE.to_owned()), None));
-        let [first, second] = &requests.drain().collect::<Vec<_>>()[..] else {
+        let [first, second] = &requests.try_iter().collect::<Vec<_>>()[..] else {
             panic!("expected the cut request and the one after it");
         };
         assert!(second.starts_with(first), "earlier messages were edited");
@@ -2861,7 +2952,7 @@ mod tests {
     /// halfway and asked again.
     #[tokio::test]
     async fn next_prompt_waits_past_a_leftover_done() {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = unbounded_channel();
         let mut dones = RunDones::new(rx);
         dones.expect_one();
         tx.send(()).unwrap();
@@ -2869,8 +2960,8 @@ mod tests {
         assert!(dones.caught_up().now_or_never().is_none());
 
         tx.send(()).unwrap();
-        assert_eq!(dones.caught_up().await, Ok(()));
-        assert!(tx.is_empty());
+        assert_eq!(dones.caught_up().await, Some(()));
+        assert!(dones.rx.is_empty());
     }
 
     const RUN_ID: u64 = 7;
@@ -2957,8 +3048,8 @@ mod tests {
         sub_events
     }
 
-    fn live_usages(rx: &flume::Receiver<ToolLive>) -> Vec<String> {
-        rx.drain()
+    fn live_usages(rx: &mut UnboundedReceiver<ToolLive>) -> Vec<String> {
+        iter::from_fn(|| rx.try_recv().ok())
             .map(|event| match event {
                 ToolLive::Usage(usage) => usage,
                 _ => panic!("relay must only publish usage"),
@@ -2978,8 +3069,8 @@ mod tests {
             .collect()
     }
 
-    fn parent_upstream() -> (Upstream, flume::Receiver<Envelope>) {
-        let (parent_raw_tx, parent_rx) = flume::unbounded();
+    fn parent_upstream() -> (Upstream, UnboundedReceiver<Envelope>) {
+        let (parent_raw_tx, parent_rx) = unbounded_channel();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_raw_tx, RUN_ID),
             adoption: None,
@@ -2987,7 +3078,7 @@ mod tests {
         (upstream, parent_rx)
     }
 
-    fn chat_upstream(session: MakiId, ui_tx: Sender<UiAction>) -> Upstream {
+    fn chat_upstream(session: MakiId, ui_tx: UnboundedSender<UiAction>) -> Upstream {
         Upstream::Chat {
             session,
             plugin: Arc::from(PLUGIN),
@@ -3024,7 +3115,7 @@ mod tests {
         unattended: String,
         watched: bool,
     ) {
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let (answer_tx, mut answer_rx) = unbounded_channel();
         let info = Arc::new(OnceLock::new());
         info.set(SubagentInfo {
             answer_tx: Some(answer_tx),
@@ -3032,7 +3123,7 @@ mod tests {
         })
         .unwrap();
         let session = MakiId::generate();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         let upstream = Upstream::Chat {
             session,
             plugin: Arc::from(PLUGIN),
@@ -3044,15 +3135,18 @@ mod tests {
         guard.sender(RUN_ID).send(ask()).unwrap();
         drop(guard);
 
-        relay_session_events(sub_events, upstream, info, flume::unbounded().0, None).await;
+        relay_session_events(sub_events, upstream, info, unbounded_channel().0, None).await;
 
         let (answers, shown) = if watched {
             (Vec::new(), event_names(&[ask(), AgentEvent::StreamClosed]))
         } else {
             (vec![unattended], Vec::new())
         };
-        assert_eq!(answer_rx.drain().collect::<Vec<_>>(), answers);
-        assert_eq!(event_names(&chat_events(&ui_rx, session)), shown);
+        assert_eq!(
+            iter::from_fn(|| answer_rx.try_recv().ok()).collect::<Vec<_>>(),
+            answers
+        );
+        assert_eq!(event_names(&chat_events(&mut ui_rx, session)), shown);
     }
 
     /// Dropping the guard is what ends the relay: a Lua tool context keeps a
@@ -3063,9 +3157,9 @@ mod tests {
     /// tool result.
     #[tokio::test]
     async fn relay_to_parent_reports_each_turn_and_keeps_run_ends_behind() {
-        let (upstream, parent_rx) = parent_upstream();
-        let (done_tx, done_rx) = flume::unbounded();
-        let (live_tx, live_rx) = flume::unbounded();
+        let (upstream, mut parent_rx) = parent_upstream();
+        let (done_tx, mut done_rx) = unbounded_channel();
+        let (live_tx, mut live_rx) = unbounded_channel();
 
         relay_session_events(
             relayed_run(),
@@ -3080,10 +3174,10 @@ mod tests {
             tokens(100, 20).format_sum_cost(Some(0.25)),
             tokens(50, 10).format_sum_cost(Some(0.75)),
         ];
-        assert_eq!(live_usages(&live_rx), expected_live);
+        assert_eq!(live_usages(&mut live_rx), expected_live);
         assert_eq!(done_rx.try_recv(), Ok(()));
 
-        let forwarded = parent_rx.drain().collect::<Vec<_>>();
+        let forwarded = iter::from_fn(|| parent_rx.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(forwarded.len(), expected_live.len());
         assert!(forwarded.iter().all(|envelope| {
             matches!(envelope.event, AgentEvent::TurnComplete(_))
@@ -3098,7 +3192,7 @@ mod tests {
     /// close sends has to carry the parent's run like the relayed events do.
     #[test]
     fn history_sent_to_the_parent_carries_its_run() {
-        let (upstream, parent_rx) = parent_upstream();
+        let (upstream, mut parent_rx) = parent_upstream();
         upstream.send_history(PARENT_ID, Vec::new());
         let envelope = parent_rx.try_recv().unwrap();
         assert_eq!(envelope.run_id, RUN_ID);
@@ -3110,9 +3204,8 @@ mod tests {
 
     /// What reached the tab of this chat, each event checked to name the
     /// owning plugin and the subagent.
-    fn chat_events(ui_rx: &flume::Receiver<UiAction>, session: MakiId) -> Vec<AgentEvent> {
-        ui_rx
-            .drain()
+    fn chat_events(ui_rx: &mut UnboundedReceiver<UiAction>, session: MakiId) -> Vec<AgentEvent> {
+        iter::from_fn(|| ui_rx.try_recv().ok())
             .map(|action| match action {
                 UiAction::PluginTaskEvent {
                     session: owner,
@@ -3140,8 +3233,8 @@ mod tests {
     #[tokio::test]
     async fn relay_to_chat_forwards_run_ends_and_closes_the_task() {
         let session = MakiId::generate();
-        let (done_tx, done_rx) = flume::unbounded();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
 
         relay_session_events(
             relayed_run(),
@@ -3154,7 +3247,7 @@ mod tests {
 
         assert_eq!(done_rx.try_recv(), Ok(()));
         assert_eq!(
-            event_names(&chat_events(&ui_rx, session)),
+            event_names(&chat_events(&mut ui_rx, session)),
             [
                 "turn_complete",
                 "turn_complete",
@@ -3176,8 +3269,8 @@ mod tests {
         let call = Arc::new(CallScope::new(PARENT_ID.into(), &run));
         let registry = BackgroundTasks::default();
         registry.register(call_entry(chat, PARENT_ID)).unwrap();
-        let (parent_tx, parent_rx) = flume::unbounded();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (parent_tx, mut parent_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
         let upstream = Upstream::Parent {
             tx: EventSender::new(parent_tx, RUN_ID),
             adoption: Some(Adoption {
@@ -3190,12 +3283,12 @@ mod tests {
         };
         let (guard, sub_events) = event_stream();
         let sub_tx = guard.sender(RUN_ID);
-        let (done_tx, done_rx) = flume::unbounded();
+        let (done_tx, mut done_rx) = unbounded_channel();
         let moving = async {
             sub_tx
                 .send(turn(SESSION_MODEL, tokens(100, 20), 0.25))
                 .unwrap();
-            let before = parent_rx.recv_async().await.unwrap();
+            let before = parent_rx.recv().await.unwrap();
             let trigger = call.move_to(home(chat, PARENT_ID)).unwrap();
             let [error, done] = run_end();
             for event in [turn(SESSION_MODEL, tokens(50, 10), 0.5), error, done] {
@@ -3216,7 +3309,7 @@ mod tests {
         assert!(parent_rx.is_empty());
         assert_eq!(done_rx.try_recv(), Ok(()));
         assert_eq!(
-            event_names(&chat_events(&ui_rx, chat)),
+            event_names(&chat_events(&mut ui_rx, chat)),
             ["turn_complete", "error", "done", "stream_closed"]
         );
         let costs = registry
@@ -3239,8 +3332,8 @@ mod tests {
         ledger.add(DONE_USAGE, None, None);
         drop(settle);
         drop(guard);
-        let (done_tx, done_rx) = flume::unbounded();
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (done_tx, done_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
 
         relay_session_events(
             sub_events,
@@ -3252,8 +3345,7 @@ mod tests {
         .await;
 
         assert!(done_rx.is_empty());
-        let events = ui_rx
-            .drain()
+        let events = iter::from_fn(|| ui_rx.try_recv().ok())
             .map(|action| match action {
                 UiAction::PluginTaskEvent { envelope, .. } => envelope.event,
                 _ => panic!("relay must only send task events"),
@@ -3336,7 +3428,6 @@ mod tests {
             },
             session: chat,
             task: None,
-            lifetime: Lifetime::Call,
             stopped: None,
             control: None,
             replied: false,
@@ -3359,7 +3450,7 @@ mod tests {
         lua: &Lua,
         call: &CallScope,
         chat: MakiId,
-        ui: Option<&Sender<UiAction>>,
+        ui: Option<&UnboundedSender<UiAction>>,
     ) -> MovedTrigger {
         let home = home(chat, CALL_ID);
         let trigger = call.move_to(home.clone()).unwrap();
@@ -3487,7 +3578,15 @@ mod tests {
             .into_iter()
             .map(|info| (info.id, info.kind))
             .collect::<Vec<_>>();
-        assert_eq!(kinds, [(id.clone(), Kind::Agent)]);
+        assert_eq!(
+            kinds,
+            [(
+                id.clone(),
+                Kind::Nested {
+                    parent: CALL_ID.into()
+                }
+            )]
+        );
 
         registry.stop(&id, Cutter::User);
         assert!(session_cancelled(&sess));
@@ -3517,7 +3616,9 @@ mod tests {
         registry.register(call_entry(chat, CALL_ID)).unwrap();
         let (sess, _call_trigger) = open_under_moved_call(&lua, &ctx, &call, chat, opened).await;
         assert_eq!(registry.list(chat).len(), while_open);
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
         let kinds = registry
             .list(chat)
             .into_iter()
@@ -3547,12 +3648,11 @@ mod tests {
             let info = subagent_info().get().cloned().unwrap();
             session_state(&sess, |state| state.subagent_info.set(info).unwrap());
         }
-        let (ui_tx, ui_rx) = flume::unbounded();
+        let (ui_tx, mut ui_rx) = unbounded_channel();
 
         let _call_trigger = move_call(&lua, &call, chat, Some(&ui_tx));
 
-        let opened = ui_rx
-            .drain()
+        let opened = iter::from_fn(|| ui_rx.try_recv().ok())
             .filter_map(|action| match action {
                 UiAction::PluginTaskOpened {
                     session,
@@ -3577,8 +3677,8 @@ mod tests {
     /// A request waits for its reply while the sender lives, and fails once
     /// it is gone.
     struct ScriptedProvider {
-        requests: Sender<ScriptedRequest>,
-        replies: flume::Receiver<&'static str>,
+        requests: UnboundedSender<ScriptedRequest>,
+        replies: AsyncMutex<UnboundedReceiver<&'static str>>,
     }
 
     impl Provider for ScriptedProvider {
@@ -3588,7 +3688,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a JsonValue,
-            _: &'a Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -3604,7 +3704,7 @@ mod tests {
                     message: Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::Text {
-                            text: self.replies.recv_async().await.unwrap().into(),
+                            text: self.replies.lock().await.recv().await.unwrap().into(),
                         }],
                         ..Default::default()
                     },
@@ -3621,17 +3721,20 @@ mod tests {
 
     fn scripted_provider(
         ctx: &mut ToolContext,
-    ) -> (flume::Receiver<ScriptedRequest>, Sender<&'static str>) {
-        let (requests_tx, requests) = flume::unbounded();
-        let (replies_tx, replies) = flume::unbounded();
+    ) -> (
+        UnboundedReceiver<ScriptedRequest>,
+        UnboundedSender<&'static str>,
+    ) {
+        let (requests_tx, requests) = unbounded_channel();
+        let (replies_tx, replies) = unbounded_channel();
         ctx.provider = Arc::new(ScriptedProvider {
             requests: requests_tx,
-            replies,
+            replies: AsyncMutex::new(replies),
         });
         (requests, replies_tx)
     }
 
-    fn scripted_ctx() -> (ToolContext, flume::Receiver<ScriptedRequest>) {
+    fn scripted_ctx() -> (ToolContext, UnboundedReceiver<ScriptedRequest>) {
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         let (requests, replies) = scripted_provider(&mut ctx);
         for reply in [FIRST_REPLY, WOKEN_REPLY] {
@@ -3694,24 +3797,26 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_waits_for_the_calls_its_session_moved(moved: bool, wake: bool) {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let sess = native_session(&lua, &ctx).await;
         let mailbox = session_mailbox(&sess);
         if moved {
             mailbox.track(MOVED_CALL_ID);
         }
         let ((text, error), first) = futures::future::join(prompt_text(&lua, &sess), async {
-            let first = requests.recv_async().await.unwrap();
+            let first = requests.recv().await.unwrap();
             if moved {
                 mailbox.settle(MOVED_CALL_ID, Some(moved_call_notice(wake)));
             }
             first
         })
         .await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
 
         assert!(error.is_none(), "{error:?}");
-        let later = requests.drain().collect::<Vec<_>>();
+        let later = iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
         if !moved {
             assert_eq!(text.as_deref(), Some(FIRST_REPLY));
             assert!(later.is_empty());
@@ -3737,21 +3842,23 @@ mod tests {
     #[tokio::test]
     async fn a_message_sent_while_waiting_for_moved_calls_wakes_the_prompt() {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let sess = native_session(&lua, &ctx).await;
         let mailbox = session_mailbox(&sess);
         mailbox.track(MOVED_CALL_ID);
         let ((text, error), woken) = futures::future::join(prompt_text(&lua, &sess), async {
-            requests.recv_async().await.unwrap();
+            requests.recv().await.unwrap();
             let session = sess.borrow::<LuaSession>().unwrap();
             let (sent, _) = send(&lua, &session, SENT_MESSAGE.into(), None).unwrap();
             assert_eq!(sent, Some(true));
-            let woken = requests.recv_async().await.unwrap();
+            let woken = requests.recv().await.unwrap();
             mailbox.settle(MOVED_CALL_ID, None);
             woken
         })
         .await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
 
         assert!(error.is_none(), "{error:?}");
         assert_eq!(text.as_deref(), Some(WOKEN_REPLY));
@@ -3769,7 +3876,7 @@ mod tests {
     #[tokio::test]
     async fn a_fired_session_token_stops_its_moved_calls(prompted: bool) {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let (chat, _chat_mailbox, _seed) = live_chat();
         let sess = native_session(&lua, &ctx).await;
         let (work_trigger, work) = CancelToken::new();
@@ -3782,29 +3889,33 @@ mod tests {
             .unwrap();
         if prompted {
             let prompt = pin!(prompt_text(&lua, &sess));
-            let first_request = pin!(requests.recv_async());
+            let first_request = pin!(requests.recv());
             let _ = select(prompt, first_request).await;
         }
 
         ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
         work.cancelled().await;
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn cancelling_a_session_ends_its_prompt_waiting_for_moved_calls() {
         let lua = Lua::new();
-        let (ctx, requests) = scripted_ctx();
+        let (ctx, mut requests) = scripted_ctx();
         let sess = native_session(&lua, &ctx).await;
         session_mailbox(&sess).track(MOVED_CALL_ID);
         let ((_, error), ()) = futures::future::join(prompt_text(&lua, &sess), async {
-            requests.recv_async().await.unwrap();
+            requests.recv().await.unwrap();
             ctx.subagent_cancels.cancel(PARENT_ID.to_owned());
         })
         .await;
         assert_eq!(error.as_deref(), Some(CANCELLED_MSG));
         assert!(requests.is_empty());
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
     }
 
     /// A coordinator reads a moved subagent while its run holds the session
@@ -3819,7 +3930,7 @@ mod tests {
         install_task_table(&lua, &chat_mailbox);
         let (_run_trigger, run) = CancelToken::new();
         let (mut ctx, call) = call_ctx(&run, tool_use_id);
-        let (requests, replies) = scripted_provider(&mut ctx);
+        let (mut requests, replies) = scripted_provider(&mut ctx);
         BackgroundTasks::of(&lua)
             .register(BackgroundTask {
                 mailbox: Some(chat_mailbox.clone()),
@@ -3831,9 +3942,9 @@ mod tests {
         let id = session_ui_id(&sess);
         replies.send(FIRST_REPLY).unwrap();
         prompt_text(&lua, &sess).await;
-        requests.drain();
+        while requests.try_recv().is_ok() {}
         let (_, peeked) = futures::future::join(prompt_text(&lua, &sess), async {
-            requests.recv_async().await.unwrap();
+            requests.recv().await.unwrap();
             let peeked = [peek(&lua, &id, None).await, peek(&lua, &id, Some(2)).await];
             replies.send(WOKEN_REPLY).unwrap();
             peeked
@@ -3845,10 +3956,15 @@ mod tests {
             [(Some(all.to_vec()), None), (Some(all[1..].to_vec()), None)]
         );
 
-        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        close(lua.clone(), sess.borrow().unwrap(), None)
+            .await
+            .unwrap();
         for gone in [id.as_str(), UNKNOWN_TASK_ID] {
             let (_, error) = peek(&lua, gone, None).await.unwrap();
-            assert_eq!(error, Some(format!("{NO_RUNNING_SUBAGENT} {gone}")));
+            assert_eq!(
+                error,
+                Some(format!("{NO_RUNNING_SUBAGENT} {gone}; {NONE_RUNNING}"))
+            );
         }
     }
 

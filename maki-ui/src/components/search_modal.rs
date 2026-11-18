@@ -12,7 +12,6 @@ use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -314,10 +313,11 @@ fn build_highlighted_line<'a>(
     t: &'a theme::Theme,
 ) -> Line<'a> {
     let index_set: std::collections::HashSet<u32> = indices.iter().copied().collect();
-    let base_style = if is_selected { t.item_selected } else { t.item };
-    let match_style = base_style
-        .fg(t.accent.fg.unwrap_or_default())
-        .add_modifier(Modifier::BOLD);
+    let (base_style, match_style) = if is_selected {
+        (t.item_selected, t.item_match_selected)
+    } else {
+        (t.item, t.item_match)
+    };
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base_style)];
     let mut current_highlighted = false;
@@ -453,9 +453,9 @@ mod tests {
         );
     }
 
-    #[test_case("maki>", &["you> hello", "maki> world", "thinking> hmm"], 1 ; "maki_prefix")]
-    #[test_case("you>",  &["you> request", "maki> response", "bash> output"], 0 ; "you_prefix")]
-    fn search_role_prefix_matches(query: &str, texts: &[&str], expected_idx: usize) {
+    #[test_case("thinking>", &["❯ hello", "● world", "● thinking> hmm"], 2 ; "thinking_label")]
+    #[test_case("❯",  &["❯ request", "● response", "bash> output"], 0 ; "user_marker")]
+    fn search_role_marker_matches(query: &str, texts: &[&str], expected_idx: usize) {
         let modal = modal_with_query(query, texts);
         assert_eq!(modal.matches.len(), 1);
         assert_eq!(modal.matches[0].segment_index, expected_idx);

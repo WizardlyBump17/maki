@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flume::Sender;
 use maki_agent::agent::{AgentCall, AgentHook, AgentSlot};
 use maki_agent::permissions::LayerAnswer;
 use maki_agent::tools::ToolContext;
 use maki_agent::tools::hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 use maki_agent::tools::registry::BoxFuture;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::api::slot::{ANY_TOOL, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, host_slot_name};
@@ -20,10 +20,19 @@ use crate::api::util::ctx::LuaCtx;
 use crate::plugin_permissions::Permission;
 use crate::runtime::{HookRun, KILL_GRACE, PromptRun, Request, SLICE_KILL, WATCHDOG_POLL_INTERVAL};
 
-/// Every `agent.*` slot steers what the agent does next: the prompt it
-/// answers, whether it stops, what it remembers after a compaction. No
-/// narrower price would be honest.
-const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
+/// What a layer on any agent slot pays, all of it content. Every slot can
+/// hand it text the user or the model wrote (`request_instructions` on
+/// `agent.compact.before`, `last_message` on `agent.stop`), and steering the
+/// agent costs what sending a prompt does (`SENDS_PROMPT`) plus
+/// `session_read`. No tool call is steered, so the authority is `Inert`.
+const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::Host {
+    authority: Authority::Inert,
+    content: &[
+        Permission::Agent,
+        Permission::SessionRead,
+        Permission::SessionWrite,
+    ],
+};
 
 /// Conversation content, both ways, on every stage. A layer that sees the
 /// call reads what the model wrote (the file `write` puts on disk, the page
@@ -54,7 +63,7 @@ fn tool_layer_cost(authority: Authority) -> LayerCost<'static> {
 }
 
 pub(crate) struct SlotHook {
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) layered: Arc<LayeredTools>,
 }
 
@@ -72,7 +81,7 @@ impl SlotHook {
         let (reply, answer) = oneshot::channel();
         let request = Request::RunHook { run, reply };
         Box::pin(async move {
-            if self.tx.send_async(request).await.is_err() {
+            if self.tx.send(request).is_err() {
                 return Verdict::Unchanged;
             }
             answer.await.unwrap_or(Verdict::Unchanged)
@@ -144,10 +153,7 @@ impl ToolHook for SlotHook {
                 }),
                 ctx: Box::new(LuaCtx::handler(ctx)),
             };
-            self.tx
-                .send_async(Request::RunPrompt { run, reply })
-                .await
-                .ok()?;
+            self.tx.send(Request::RunPrompt { run, reply }).ok()?;
             answer.await.ok().flatten()
         })
     }

@@ -1,20 +1,22 @@
 use std::future::Future;
+use std::iter;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use flume::{Receiver, Sender};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_providers::{Message, RequestOptions, Timeouts};
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
+use maki_storage::{StateDir, blocking};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
@@ -226,8 +228,8 @@ impl Next {
 
 /// Where an interactive session's turns come from.
 struct Inputs {
-    prompts: Receiver<AgentInput>,
-    modes: Receiver<AgentMode>,
+    prompts: UnboundedReceiver<AgentInput>,
+    modes: UnboundedReceiver<AgentMode>,
     keep_alive: KeepAlive,
     /// Ends the session at once, whatever is still out.
     stop: CancelToken,
@@ -244,10 +246,10 @@ impl Inputs {
     async fn next(&mut self) -> Option<Next> {
         let stop = self.stop.clone();
         let next = async {
-            if let Ok(input) = self.prompts.recv_async().await {
+            if let Some(input) = self.prompts.recv().await {
                 return Some(Next::Prompt(input));
             }
-            if let Some(mode) = self.modes.try_iter().last() {
+            if let Some(mode) = iter::from_fn(|| self.modes.try_recv().ok()).last() {
                 self.keep_alive.switch_mode(mode);
             }
             self.keep_alive.next_input().await.map(Next::Woken)
@@ -448,12 +450,12 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: Sender<AgentInput>,
-    pub answer_tx: Sender<String>,
-    pub cancel_tx: Sender<()>,
-    pub model_tx: Sender<Model>,
+    pub input_tx: UnboundedSender<AgentInput>,
+    pub answer_tx: UnboundedSender<String>,
+    pub cancel_tx: watch::Sender<()>,
+    pub model_tx: UnboundedSender<Model>,
     /// Send through [`Self::switch_mode`], which also tells background work.
-    pub mode_tx: Sender<AgentMode>,
+    pub mode_tx: UnboundedSender<AgentMode>,
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: SessionTask,
@@ -474,9 +476,11 @@ impl InteractiveHandle {
     }
 }
 
-pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
+pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
     let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
+    let cwd = vars.apply("{cwd}").into_owned();
+    let config = params.config.instructions.clone();
+    let instructions = blocking(move || agent::load_instructions(&cwd, &config)).await;
     let spec = ContextSpec {
         host_prompt: params.host_prompt,
         background: params.background.seeded(),
@@ -500,11 +504,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-    let (model_tx, model_rx) = flume::unbounded::<Model>();
-    let (mode_tx, mode_rx) = flume::unbounded::<AgentMode>();
+    let (input_tx, input_rx) = unbounded_channel::<AgentInput>();
+    let (answer_tx, answer_rx) = unbounded_channel::<String>();
+    let (cancel_tx, cancel_rx) = watch::channel(());
+    let (model_tx, mut model_rx) = unbounded_channel::<Model>();
+    let (mode_tx, mode_rx) = unbounded_channel::<AgentMode>();
 
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
@@ -577,8 +581,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let event_tx = base_tx.with_run_id(run_id);
             let error_tx = event_tx.clone();
 
-            if let Some(mut new_model) = model_rx
-                .try_iter()
+            if let Some(mut new_model) = iter::from_fn(|| model_rx.try_recv().ok())
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
@@ -616,7 +619,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             // taker. A call moved to the background can still be parked on
             // it after its run ended: then whatever is queued may be its
             // answer, and the new run must not wait for it to arrive.
-            if let Ok(answers) = answer_rx.try_lock() {
+            if let Ok(mut answers) = answer_rx.try_lock() {
                 while answers.try_recv().is_ok() {}
             }
 
@@ -694,11 +697,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 /// meant for the turn before. Prompt and cancel ride separate channels, so a
 /// cancel sent right after a prompt, before the loop picked that prompt up,
 /// is dropped with it.
-fn relay_cancel(cancel_rx: &Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
-    while cancel_rx.try_recv().is_ok() {}
-    let cancel_rx = cancel_rx.clone();
+fn relay_cancel(cancel_rx: &watch::Receiver<()>, trigger: CancelTrigger) -> AbortOnDropHandle<()> {
+    let mut cancel_rx = cancel_rx.clone();
+    cancel_rx.mark_unchanged();
     AbortOnDropHandle::new(tokio::spawn(async move {
-        if cancel_rx.recv_async().await.is_ok() {
+        if cancel_rx.changed().await.is_ok() {
             trigger.cancel();
         }
     }))
@@ -763,6 +766,10 @@ mod tests {
     use maki_storage::id::MakiId;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
+    use tokio::task::yield_now;
 
     use super::*;
     use crate::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -835,7 +842,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -885,7 +892,7 @@ mod tests {
     }
 
     struct CalledListing {
-        called: Sender<()>,
+        called: UnboundedSender<()>,
         listing: fn() -> Listed,
     }
 
@@ -896,8 +903,8 @@ mod tests {
         }
     }
 
-    fn register_listed(slug: &str, listing: fn() -> Listed) -> Receiver<()> {
-        let (called, calls) = flume::unbounded();
+    fn register_listed(slug: &str, listing: fn() -> Listed) -> UnboundedReceiver<()> {
+        let (called, calls) = unbounded_channel();
         plugin::register(
             Registration {
                 decl: ProviderDecl {
@@ -944,7 +951,7 @@ mod tests {
     }
 
     /// A `max_turns` of zero ends every run before it would reach the provider.
-    fn spawn_listing_session(
+    async fn spawn_listing_session(
         tmp: &TempDir,
         model: Model,
         background: BackgroundMode,
@@ -978,18 +985,20 @@ mod tests {
             background,
             stop: CancelToken::none(),
         })
+        .await
     }
 
     #[tokio::test]
     async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
         plugin::begin_load();
         let answered = register_listed(ANSWERING_SLUG, lists_window);
-        let hung = register_listed(HANGING_SLUG, hangs);
+        let mut hung = register_listed(HANGING_SLUG, hangs);
         plugin::commit_load();
 
         let tmp = TempDir::new().unwrap();
         let (handle, mut events) =
-            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking);
+            spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking)
+                .await;
 
         for _ in 0..2 {
             handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
@@ -1000,11 +1009,11 @@ mod tests {
         handle.model_tx.send(plugin_model(HANGING_SLUG)).unwrap();
         for _ in 0..2 {
             handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
-            timeout(RELAY_WAIT, hung.recv_async())
+            timeout(RELAY_WAIT, hung.recv())
                 .await
                 .expect(LISTING_DUE)
                 .unwrap();
-            handle.cancel_tx.try_send(()).unwrap();
+            handle.cancel_tx.send(()).unwrap();
             next_done(&mut events).await;
         }
     }
@@ -1020,7 +1029,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let (handle, mut events) =
-            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached);
+            spawn_listing_session(&tmp, plugin_model(FAILING_SLUG), BackgroundMode::Detached).await;
         let slot_window = || {
             AgentSeed::live(handle.session_id.id())
                 .expect(SEED_PUBLISHED)
@@ -1164,7 +1173,7 @@ mod tests {
         let (guard, mut events) = event_stream();
         let retained = guard.sender(RUN_ID);
         let event_tx = retained.clone();
-        let (cmd_tx, cmd_rx) = flume::unbounded();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
 
         let ended = run_session(guard, Some(McpHandle::for_test(cmd_tx)), async move {
             let _ = event_tx.send(AgentEvent::Error {
@@ -1202,14 +1211,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancel_sent_between_turns_does_not_end_the_next_one() {
-        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
-        cancel_tx.try_send(()).unwrap();
+        let (cancel_tx, cancel_rx) = watch::channel(());
+        cancel_tx.send(()).unwrap();
         let (trigger, cancel) = CancelToken::none().child();
         let relay = relay_cancel(&cancel_rx, trigger);
-        assert!(cancel_rx.is_empty(), "{STALE_CANCEL_IGNORED}");
+        yield_now().await;
         assert!(!cancel.is_cancelled(), "{STALE_CANCEL_IGNORED}");
 
-        cancel_tx.send_async(()).await.unwrap();
+        cancel_tx.send(()).unwrap();
         relay.await.unwrap();
         assert!(cancel.is_cancelled(), "{LIVE_CANCEL_ENDS_TURN}");
     }
@@ -1217,13 +1226,13 @@ mod tests {
     /// A turn skipped by a failed model switch drops its relay unawaited.
     #[tokio::test]
     async fn a_dropped_relay_does_not_take_the_next_turns_cancel() {
-        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+        let (cancel_tx, cancel_rx) = watch::channel(());
         let (stale_trigger, _stale) = CancelToken::none().child();
         drop(relay_cancel(&cancel_rx, stale_trigger));
         let (trigger, cancel) = CancelToken::none().child();
         let relay = relay_cancel(&cancel_rx, trigger);
 
-        cancel_tx.send_async(()).await.unwrap();
+        cancel_tx.send(()).unwrap();
         assert!(
             timeout(RELAY_WAIT, relay).await.is_ok(),
             "{DROPPED_RELAY_FREES_CHANNEL}"
@@ -1266,9 +1275,13 @@ mod tests {
         mailbox: &SessionMailbox,
         background: BackgroundMode,
         stop: CancelToken,
-    ) -> (Inputs, Sender<AgentInput>, Sender<AgentMode>) {
-        let (prompt_tx, prompts) = flume::unbounded();
-        let (mode_tx, modes) = flume::unbounded();
+    ) -> (
+        Inputs,
+        UnboundedSender<AgentInput>,
+        UnboundedSender<AgentMode>,
+    ) {
+        let (prompt_tx, prompts) = unbounded_channel();
+        let (mode_tx, modes) = unbounded_channel();
         let inputs = Inputs {
             prompts,
             modes,
@@ -1503,12 +1516,12 @@ mod tests {
     /// queued.
     #[tokio::test]
     async fn await_shutdown_waits_for_a_task_that_still_works() {
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
         let finished = Arc::new(AtomicBool::new(false));
         let task = AbortOnDropHandle::new(tokio::spawn({
             let finished = Arc::clone(&finished);
             async move {
-                let _ = release_rx.recv_async().await;
+                let _ = release_rx.await;
                 finished.store(true, Ordering::SeqCst);
                 SessionEnd::default()
             }

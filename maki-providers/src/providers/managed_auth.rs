@@ -3,9 +3,8 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, load_tokens};
-use tokio::task::spawn_blocking;
+use maki_storage::auth::{OAuthTokens, load_tokens_async};
+use maki_storage::{StateDir, blocking, joined};
 use tracing::debug;
 
 use super::{ResolvedAuth, UNAUTHORIZED_STATUS, needs_refresh, refreshed_tokens};
@@ -56,14 +55,16 @@ impl ManagedAuth {
         self.auth.lock().unwrap().clone()
     }
 
-    pub fn storage(&self) -> Option<&StateDir> {
-        self.storage.as_ref()
+    /// The tokens `current` was built from, as of the last catch-up with the
+    /// stored ones.
+    pub fn held_tokens(&self) -> Option<OAuthTokens> {
+        self.tokens.lock().unwrap().clone()
     }
 
-    pub fn is_oauth(&self) -> bool {
-        self.storage
-            .as_ref()
-            .is_some_and(|dir| load_tokens(dir, self.flow.provider).is_some())
+    /// The tokens on disk now, which a peer may have rotated, cleared or
+    /// logged in since this process last looked.
+    pub async fn stored_tokens(&self) -> Option<OAuthTokens> {
+        load_tokens_async(self.storage.as_ref()?, self.flow.provider).await
     }
 
     /// Installs the result inside a task of its own, so a dropped caller still
@@ -76,7 +77,7 @@ impl ManagedAuth {
         let shared = Arc::clone(&self.auth);
         let held = Arc::clone(&self.tokens);
         let flow = self.flow;
-        tokio::spawn(async move {
+        joined(tokio::spawn(async move {
             match refreshed_tokens(
                 &storage,
                 flow.provider,
@@ -100,36 +101,44 @@ impl ManagedAuth {
                     Err(e)
                 }
             }
-        })
-        .await??;
+        }))
+        .await?;
         debug!(provider = self.flow.provider, "refreshed OAuth token");
         Ok(())
     }
 
     pub async fn refresh_if_oauth(&self) -> Result<(), AgentError> {
-        if self.is_oauth() {
+        if self.stored_tokens().await.is_some() {
             self.refresh().await
         } else {
             Ok(())
         }
     }
 
+    /// Catches up with the stored tokens when the held ones expired or a peer
+    /// changed them.
     pub async fn refresh_if_stale(&self) -> Result<(), AgentError> {
-        let Some(storage) = self.storage.as_ref().filter(|dir| {
-            needs_refresh(
-                dir,
-                self.flow.provider,
-                self.tokens.lock().unwrap().as_ref(),
-            )
-        }) else {
-            return Ok(());
+        self.uses_oauth().await.map(drop)
+    }
+
+    /// Whether the provider is on OAuth tokens. Catches up with the stored
+    /// tokens first, like [`Self::refresh_if_stale`].
+    pub async fn uses_oauth(&self) -> Result<bool, AgentError> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(false);
         };
-        match self.refresh().await {
-            Err(e) if !e.is_retryable() => (self.flow.resolve)(storage)
-                .map(drop)
-                .map_err(|e| AgentError::api(UNAUTHORIZED_STATUS, e.to_string())),
-            result => result,
+        let stored = self.stored_tokens().await;
+        if !needs_refresh(stored.as_ref(), self.tokens.lock().unwrap().as_ref()) {
+            return Ok(stored.is_some());
         }
+        match self.refresh().await {
+            Err(e) if !e.is_retryable() => {
+                (self.flow.resolve)(storage)
+                    .map_err(|e| AgentError::api(UNAUTHORIZED_STATUS, e.to_string()))?;
+            }
+            result => result?,
+        }
+        Ok(self.stored_tokens().await.is_some())
     }
 
     pub async fn with_retry<T, F, Fut>(&self, f: F) -> Result<T, AgentError>
@@ -138,7 +147,9 @@ impl ManagedAuth {
         Fut: Future<Output = Result<T, AgentError>>,
     {
         let result = f().await;
-        if self.is_oauth() && matches!(&result, Err(e) if e.is_auth_error()) {
+        if result.as_ref().is_err_and(AgentError::is_auth_error)
+            && self.stored_tokens().await.is_some()
+        {
             match self.refresh().await {
                 Ok(()) => return f().await,
                 Err(e) if e.is_retryable() => return Err(e),
@@ -153,7 +164,7 @@ impl ManagedAuth {
             return Ok(());
         };
         let resolve = self.flow.resolve;
-        let (resolved, tokens) = spawn_blocking(move || resolve(&storage)).await??;
+        let (resolved, tokens) = blocking(move || resolve(&storage)).await?;
         *self.auth.lock().unwrap() = resolved;
         *self.tokens.lock().unwrap() = tokens;
         debug!(provider = self.flow.provider, "reloaded auth from storage");
@@ -237,6 +248,26 @@ mod tests {
         assert!(!TRANSIENT_HOOK_RAN.load(Ordering::Relaxed));
         assert_eq!(auth.current().access_token(), Some(STORED));
         assert!(auth.tokens.lock().unwrap().is_some());
-        assert!(auth.is_oauth());
+        assert!(auth.stored_tokens().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn fresh_stored_tokens_are_oauth() {
+        let (_dir, auth) = stored_auth(&TRANSIENT_FLOW);
+        assert!(auth.uses_oauth().await.expect("nothing to refresh"));
+    }
+
+    #[tokio::test]
+    async fn an_api_key_without_stored_tokens_is_not_oauth() {
+        let dir = TempDir::new().expect("temp dir");
+        let auth = ManagedAuth {
+            flow: &TRANSIENT_FLOW,
+            auth: Arc::new(Mutex::new(
+                ResolvedAuth::bearer(PROVIDER, API_KEY).expect("auth"),
+            )),
+            tokens: Arc::default(),
+            storage: Some(StateDir::from_path(dir.path().to_path_buf())),
+        };
+        assert!(!auth.uses_oauth().await.expect("nothing to refresh"));
     }
 }

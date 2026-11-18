@@ -1,13 +1,16 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
+use maki_storage::auth::OAuthTokens;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ThinkingConfig;
+use crate::headers::HeaderError;
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
@@ -217,10 +220,7 @@ fn parse_plan_models(
 }
 
 fn plan_account_id(auth: &ResolvedAuth) -> Option<&str> {
-    auth.headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(ACCOUNT_ID_HEADER))
-        .map(|(_, value)| value.as_str())
+    auth.header(ACCOUNT_ID_HEADER)
         .filter(|value| !value.is_empty())
 }
 
@@ -270,10 +270,15 @@ fn apply_plan_fast(
     }
 }
 
-fn apply_session_affinity(body: &mut Value, auth: &mut ResolvedAuth, session: &SessionRef) {
+fn apply_session_affinity(
+    body: &mut Value,
+    auth: &mut ResolvedAuth,
+    session: &SessionRef,
+) -> Result<(), HeaderError> {
     if is_coding_plan(auth) {
-        SESSION_AFFINITY.apply(session, body, auth);
+        SESSION_AFFINITY.apply(session, body, auth)?;
     }
+    Ok(())
 }
 
 #[derive(Deserialize, Default)]
@@ -335,12 +340,14 @@ impl OpenAi {
         self
     }
 
-    fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+    async fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+        self.codex_auth_from(self.auth.stored_tokens().await.as_ref())
+    }
+
+    fn codex_auth_from(&self, tokens: Option<&OAuthTokens>) -> Result<ResolvedAuth, AgentError> {
         // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
-        if let Some(storage) = self.auth.storage()
-            && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
-        {
-            return auth::build_coding_plan_resolved(&tokens);
+        if let Some(tokens) = tokens {
+            return auth::build_coding_plan_resolved(tokens);
         }
         // Fall back to standard API key via the Responses API. Env /
         // providers.toml base_url overrides the platform API only, never the
@@ -356,7 +363,7 @@ impl OpenAi {
     }
 
     async fn fetch_plan_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        let auth = self.codex_auth()?;
+        let auth = self.codex_auth().await?;
         let url = format!(
             "{}{PLAN_MODELS_PATH}{CODEX_CLIENT_VERSION}",
             auth::CODING_PLAN_BASE_URL
@@ -486,7 +493,7 @@ impl Provider for OpenAi {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -502,10 +509,11 @@ impl Provider for OpenAi {
                 return self
                     .auth
                     .with_retry(|| async {
-                        let mut codex_auth = self.codex_auth()?;
-                        let mut body = super::responses::build_body(model, messages, system, tools);
+                        let mut codex_auth = self.codex_auth().await?;
+                        let mut body =
+                            super::responses::build_body(model, messages, system, tools, false);
                         if let Some(session) = session_id {
-                            apply_session_affinity(&mut body, &mut codex_auth, session);
+                            apply_session_affinity(&mut body, &mut codex_auth, session)?;
                         }
                         super::responses::apply_responses_reasoning(
                             &mut body,
@@ -517,6 +525,7 @@ impl Provider for OpenAi {
                         super::responses::do_stream(
                             self.compat.client(),
                             model,
+                            &HeaderMap::new(),
                             &body,
                             event_tx,
                             &codex_auth,
@@ -537,7 +546,7 @@ impl Provider for OpenAi {
                 .with_retry(|| async {
                     let auth = self.auth.current();
                     self.compat
-                        .do_stream(model, &[], &body, event_tx, &auth)
+                        .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                         .await
                 })
                 .await
@@ -546,8 +555,7 @@ impl Provider for OpenAi {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if self.auth.is_oauth() {
+            if self.auth.uses_oauth().await? {
                 return self.auth.with_retry(|| self.fetch_plan_models()).await;
             }
             self.auth
@@ -561,13 +569,12 @@ impl Provider for OpenAi {
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if !self.auth.is_oauth() {
+            if !self.auth.uses_oauth().await? {
                 return Ok(None);
             }
             self.auth
                 .with_retry(|| async {
-                    let auth = self.codex_auth()?;
+                    let auth = self.codex_auth().await?;
                     let response = self.compat.get_text(&auth, USAGE_URL).await?;
                     Ok(Some(parse_usage(&response)?))
                 })
@@ -587,10 +594,10 @@ impl Provider for OpenAi {
     /// would shadow the pricing gate in `Model::supports_fast` for good, and
     /// that gate is not ours to close.
     fn adjust_model(&self, model: &mut Model) {
-        if !self.auth.is_oauth() {
+        let Some(tokens) = self.auth.held_tokens() else {
             return;
-        }
-        let auth = self.codex_auth().ok();
+        };
+        let auth = self.codex_auth_from(Some(&tokens)).ok();
         let info = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
         model.supports_fast_override = Some(supports_plan_fast(
             auth.as_ref(),
@@ -952,7 +959,7 @@ mod tests {
             fast,
         };
         assert_eq!(opts.clamped(&model).fast, expected);
-        let mut body = responses::build_body(&model, &[], "", &json!([]));
+        let mut body = responses::build_body(&model, &[], "", &json!([]), false);
         responses::apply_responses_reasoning(
             &mut body,
             opts.thinking,
@@ -976,16 +983,10 @@ mod tests {
         let expected = oauth.then_some(session.as_str());
         let mut auth = plan_auth(oauth, Some(ACCOUNT_ID));
         let mut body = json!({});
-        apply_session_affinity(&mut body, &mut auth, &session);
+        apply_session_affinity(&mut body, &mut auth, &session).unwrap();
         assert_eq!(body[PROMPT_CACHE_KEY_FIELD].as_str(), expected);
         for header in SESSION_AFFINITY_HEADERS {
-            let values: Vec<&str> = auth
-                .headers
-                .iter()
-                .filter(|(name, _)| name == header)
-                .map(|(_, value)| value.as_str())
-                .collect();
-            assert_eq!(values, Vec::from_iter(expected), "{header}");
+            assert_eq!(auth.header(header), expected, "{header}");
         }
     }
 

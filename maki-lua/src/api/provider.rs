@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io::{BufRead, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use futures::StreamExt;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
@@ -15,6 +16,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
 };
+use maki_storage::stdin;
 use mlua::{
     Function, Lua, LuaSerdeExt, LuaString, MetaMethod, MultiValue, RegistryKey,
     Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
@@ -22,9 +24,11 @@ use mlua::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
@@ -186,8 +190,8 @@ pub struct LuaHookKeys {
     keys: HashMap<HookSlot, RegistryKey>,
     /// The registering plugin's reach, which `ctx.get_json` goes out under.
     egress: NetEgress,
-    requests: flume::Sender<Request>,
-    release: flume::Sender<DeferredCallback>,
+    requests: UnboundedSender<Request>,
+    release: UnboundedSender<DeferredCallback>,
 }
 
 impl Drop for LuaHookKeys {
@@ -196,12 +200,14 @@ impl Drop for LuaHookKeys {
     /// the existing way back there; a callback handed over already cancelled is
     /// the dispatcher's path for releasing a key without running it.
     fn drop(&mut self) {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
         for (_, func) in std::mem::take(&mut self.keys) {
             let _ = self.release.send(DeferredCallback {
                 func,
                 delay: Duration::ZERO,
                 plugin: Arc::clone(&self.plugin),
-                cancel: Arc::new(AtomicBool::new(true)),
+                cancel: cancelled.clone(),
                 ceiling: None,
             });
         }
@@ -420,8 +426,12 @@ fn hook_ctx(lua: &Lua, keys: &LuaHookKeys, terminal: bool) -> LuaResult<Table> {
         add_stdio(lua, &ctx)?;
     }
     let base_url = plugin::effective_base_url(&keys.slug);
-    let headers = plugin::resolved_auth(&keys.slug)
-        .map(|auth| auth.headers)
+    let headers: Vec<(String, String)> = plugin::resolved_auth(&keys.slug)
+        .map(|auth| {
+            auth.headers()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        })
         .unwrap_or_default();
     ctx.set(SLUG, keys.slug.as_str())?;
     ctx.set(BASE_URL, base_url.as_deref())?;
@@ -527,9 +537,7 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
         lua.create_async_function(|_, opts: Table| async move {
             let label: String = opts.get("label").unwrap_or_default();
             let secret = opts.opt::<bool>("secret")?.unwrap_or(false);
-            spawn_blocking(move || read_answer(&label, secret))
-                .await
-                .map_err(mlua::Error::external)
+            Ok(read_answer(&label, secret).await)
         })?,
     )?;
     ctx.set(
@@ -541,58 +549,79 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
     )
 }
 
-/// Reads one line of an answer from the terminal, off the Lua thread so a slow
+/// Reads one line of an answer from the terminal. The read yields, so a slow
 /// typist does not trip the 5s watchdog.
 ///
-/// A secret is read with the terminal in raw mode so the characters never reach
-/// the scrollback, and echoed as mask characters so there is still feedback
-/// that a key landed. Raw mode is given back whatever the read did.
-fn read_answer(label: &str, secret: bool) -> Pair<String> {
+/// A typed secret is read with the terminal in raw mode so the characters
+/// never reach the scrollback, and echoed as mask characters so there is still
+/// feedback that a key landed. Raw mode is given back whatever the read did. A
+/// piped secret is read as a line, from the same buffer as every other answer.
+async fn read_answer(label: &str, secret: bool) -> Pair<String> {
     print!("{label}");
-    if std::io::stdout().flush().is_err() {
+    if io::stdout().flush().is_err() {
         return (None, Some("cannot write to the terminal".to_owned()));
     }
-    if !secret {
-        let mut line = String::new();
-        return match std::io::stdin().lock().read_line(&mut line) {
-            Ok(_) => (Some(line.trim_end().to_owned()), None),
+    if !secret || !io::stdin().is_terminal() {
+        return match stdin::read_line().await {
+            Ok(line) => (Some(line.unwrap_or_default().trim_end().to_owned()), None),
             Err(e) => (None, Some(e.to_string())),
         };
     }
-    if let Err(e) = crossterm::terminal::enable_raw_mode() {
-        return (None, Some(e.to_string()));
-    }
-    let answer = read_masked();
-    let _ = crossterm::terminal::disable_raw_mode();
+    let answer = match RawMode::enable() {
+        Ok(_raw) => read_masked().await,
+        Err(e) => return (None, Some(e.to_string())),
+    };
     println!();
     answer
 }
 
-/// Raw mode hands over bytes, so the answer is gathered as bytes and decoded
-/// once at the end. Taking each one for a char would turn a typed accented
-/// letter into two wrong ones.
-fn read_masked() -> Pair<String> {
-    const BACKSPACE: u8 = 0x7f;
-    const CTRL_C: u8 = 0x03;
-    let mut answer = Vec::new();
-    for byte in std::io::stdin().lock().bytes() {
-        match byte {
-            Ok(b'\r' | b'\n') => break,
-            Ok(CTRL_C) => return (None, Some("cancelled".to_owned())),
-            Ok(BACKSPACE) => {
+/// Raw mode until dropped, so a prompt dropped mid-answer still gives the
+/// terminal back.
+struct RawMode;
+
+impl RawMode {
+    fn enable() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Key events rather than raw bytes, so an accented letter, a paste and a
+/// backspace each count as whole characters.
+async fn read_masked() -> Pair<String> {
+    let mut keys = EventStream::new();
+    let mut answer = String::new();
+    while let Some(event) = keys.next().await {
+        let key = match event {
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => key,
+            Ok(_) => continue,
+            Err(e) => return (None, Some(e.to_string())),
+        };
+        match key.code {
+            KeyCode::Enter => break,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return (None, Some("cancelled".to_owned()));
+            }
+            KeyCode::Backspace => {
                 if answer.pop().is_some() {
                     print!("\u{8} \u{8}");
                 }
             }
-            Ok(byte) => {
-                answer.push(byte);
+            KeyCode::Char(c) => {
+                answer.push(c);
                 print!("{SECRET_MASK}");
             }
-            Err(e) => return (None, Some(e.to_string())),
+            _ => continue,
         }
-        let _ = std::io::stdout().flush();
+        let _ = io::stdout().flush();
     }
-    (Some(String::from_utf8_lossy(&answer).into_owned()), None)
+    (Some(answer), None)
 }
 
 fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
@@ -645,7 +674,8 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           then the declared `base_url`, nil when none is set. Build URLs
 ///           from it so side calls follow a user who points the slug at a
 ///           gateway.
-///   `ctx.headers` (table) The headers every request to the slug carries.
+///   `ctx.headers` (table) The headers every request to the slug carries,
+///           under lowercase names.
 ///   `ctx.get_json(target)` (function) A GET with `ctx.headers`. A `target`
 ///           starting with `/` is appended to `ctx.base_url`, an absolute URL
 ///           is used as is. Never retried. Returns the decoded body, or nil
@@ -702,7 +732,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           the model table when `models` is empty.
 ///   `system_prefix` (string) Text prepended to the system prompt. The
 ///           `google` codec refuses it.
-///   `openai` (table) Options for `codec = "openai"`, all optional:
+///   `openai` (table) Options for the `"openai"` and `"openai-responses"`
+///           codecs, all optional. The responses codec takes only
+///           thinking options (without `field`) and `thinking_overrides`,
+///           and refuses the rest:
 ///     `max_tokens_field` (string) Body field carrying the output cap.
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
@@ -716,21 +749,30 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///               `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
 ///               `"anthropic-adaptive"`, `"gemini"`, `"tensorx"`, `"grok"`
 ///               or `"ollama"`.
+///       `effort` (table) Replaces `dialect`'s levels and off switch for
+///               every model, with the same fields as a model row's
+///               `effort`. A row's own `effort` wins over it.
 ///       `field` (string) Body path for the effort. Dots nest, e.g.
 ///               `"reasoning.effort"`. Defaults to `reasoning_effort`.
 ///       `requires_support` (boolean) Send effort only to models that
 ///               support thinking. Defaults to `false`.
-///     `headers` (table) Sent with every request. A header the credentials
-///             set wins. `host`, `content-length`, `transfer-encoding` and
-///             `connection` are refused.
+///     `headers` (table) Sent with every request. They replace headers
+///             maki sets, and a header the credentials set wins. `host`,
+///             `content-length`, `transfer-encoding` and `connection` are
+///             refused.
 ///     `extra_body` (table) Merged into every request body.
 ///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
 ///             `"required"`, overriding the model table. Longest prefix wins.
 ///   `session_id` (table) Sends the session id with every request, as
 ///           `{ headers = { "x-affinity" } }`,
-///           `{ body_field = "prompt_cache_key" }`, or both at once. A
+///           `{ body_field = "prompt_cache_key" }`, or both. A
 ///           listed header replaces one the credentials set. The `google`
 ///           codec refuses it.
+///   `replay_reasoning` (boolean) Sends past assistant reasoning back as
+///           `reasoning` input items, so a follow-up keeps what the model
+///           worked out earlier. Only `codec = "openai-responses"` accepts
+///           it, and only a provider that takes plaintext reasoning back
+///           should set it. Defaults to `false`.
 ///   `models` (table) Static model rows, read once at registration. They
 ///            describe models and add to the runtime list. See
 ///            [model rows](/docs/providers/#model-rows).
@@ -740,17 +782,19 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///            on the newest credentials, or `"reload"` to re-read stored
 ///            credentials after a login or another maki process changed them.
 ///            Spend a refresh token only on `"refresh"`.
-///            Omitting `base_url` keeps the current one.
+///            Omitting `base_url` keeps the current one. A returned header
+///            replaces one maki or `openai.headers` sets.
 ///   `list_models` (function) `function(ctx)` returning model rows for a
 ///            catalogue only known at runtime. Without it, the provider
 ///            lists what its codec or base lists. Rows carry `id`,
 ///            `context_window`, `max_output_tokens`, `pricing`,
 ///            `supports_thinking`, `supports_vision` and `tier`, plus two
 ///            optional fields. `extra` is any JSON value, handed back to
-///            `build_body` as `opts.model_info`. `effort` narrows the
-///            `openai.thinking` dialect for this model: `supported` lists the
-///            effort names the provider accepts, and `send_off` is `true` to
-///            send `"none"` for off or `false` to send nothing.
+///            `build_body` as `opts.model_info`. `effort` replaces the
+///            `openai.thinking` levels and off switch for this model:
+///            `supported` lists the effort names the provider accepts, and
+///            `send_off` is `true` to send `"none"` for off or `false` to send
+///            nothing.
 ///   `build_body` (function) `function(ctx, body, model, opts)` returning
 ///            the body to send. `opts.thinking` is the rendered effort level,
 ///            nil when thinking is off. `openai` codecs only.
@@ -1090,6 +1134,7 @@ mod tests {
     use maki_providers::plugin::DeclAuthority;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use mlua::AnyUserData;
 
@@ -1131,8 +1176,8 @@ mod tests {
                 .map(|(slot, func)| (slot, lua.create_registry_value(func).unwrap()))
                 .collect(),
             egress: NetEgress::default(),
-            requests: flume::unbounded().0,
-            release: flume::unbounded().0,
+            requests: unbounded_channel().0,
+            release: unbounded_channel().0,
         }
     }
 
@@ -1314,7 +1359,7 @@ mod tests {
     async fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
         let lua = provider_lua(true);
         let func: Function = lua.load(source).eval().unwrap();
-        let (requests, served) = flume::unbounded();
+        let (requests, mut served) = unbounded_channel();
         let mut keys = keys_from(&lua, [(HookSlot::FetchUsage, func)]);
         keys.requests = requests;
         let bridge: LuaHook<(), Option<ProviderUsage>> = LuaHook {
@@ -1324,13 +1369,13 @@ mod tests {
             _types: PhantomData,
         };
         let host = async {
-            let Ok(Request::CallProviderHook {
+            let Some(Request::CallProviderHook {
                 hook,
                 slot,
                 payload,
                 answer,
                 ..
-            }) = served.recv_async().await
+            }) = served.recv().await
             else {
                 panic!("{HOOK_NEVER_CALLED}");
             };

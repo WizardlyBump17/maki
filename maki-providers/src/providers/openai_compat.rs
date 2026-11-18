@@ -1,20 +1,19 @@
 use std::borrow::Cow;
-use std::fmt::Display;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use flume::Sender;
+use futures::TryStreamExt;
 use maki_storage::id::MakiId;
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
-use super::ResolvedAuth;
 use super::copilot::copilot_usd;
+use super::{ResolvedAuth, SseBody};
 use crate::model::ModelFamily;
 use crate::types::rejects_sampling;
 use crate::{
@@ -120,13 +119,7 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
         url: &str,
     ) -> Result<String, AgentError> {
-        let request = auth
-            .configure_request(
-                self.client
-                    .get(url)
-                    .header("user-agent", super::user_agent()),
-            )
-            .build()?;
+        let request = auth.finish(self.client.get(url))?;
         super::ok_text(&self.client, request).await
     }
 
@@ -137,17 +130,12 @@ impl OpenAiCompatProvider {
         content_type: &str,
         body: &[u8],
     ) -> Result<String, AgentError> {
-        let mut builder = self
-            .client
-            .post(url)
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let request = builder
-            .header("content-type", content_type)
-            .body(body.to_vec())
-            .build()?;
+        let request = auth.finish(
+            self.client
+                .post(url)
+                .header("content-type", content_type)
+                .body(body.to_vec()),
+        )?;
         super::ok_text(&self.client, request).await
     }
 
@@ -204,39 +192,29 @@ impl OpenAiCompatProvider {
 
     fn build_request(&self, method: Method, path: &str, auth: &ResolvedAuth) -> RequestBuilder {
         let base = self.base_url(auth);
-        auth.configure_request(
-            self.client
-                .request(method, format!("{base}{path}"))
-                .header("user-agent", super::user_agent()),
-        )
+        self.client.request(method, format!("{base}{path}"))
     }
 
-    /// Where a provider's own headers meet the credentials. A header already on
-    /// the request wins: no denylist could say which headers carry a
-    /// credential (`x-api-key`, `api-key`, `x-goog-api-key`, ...), so whatever
-    /// the auth layer wrote stays, key rotation included.
+    /// Where a declaration's static headers meet maki's and the credentials.
+    /// They go over maki's own and under the credentials: no denylist could
+    /// say which headers carry a credential (`x-api-key`, `api-key`,
+    /// `x-goog-api-key`, ...), so whatever the auth layer wrote stays, key
+    /// rotation included.
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
-        extra_headers: &[(&str, &str)],
+        declared_headers: &HeaderMap,
         body: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let mut request = self
-            .build_request(Method::POST, "/chat/completions", auth)
-            .header("content-type", "application/json")
-            .body(json_body)
-            .build()?;
-        for &(key, value) in extra_headers {
-            if request.headers().contains_key(key) {
-                debug!(header = key, "kept the header already on the request");
-                continue;
-            }
-            let (name, value) = extra_header(key, value)?;
-            request.headers_mut().append(name, value);
-        }
+        let request = auth.finish(
+            self.build_request(Method::POST, "/chat/completions", auth)
+                .header("content-type", "application/json")
+                .headers(declared_headers.clone())
+                .body(json_body),
+        )?;
 
         debug!(
             model = %model.id,
@@ -244,8 +222,8 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        super::ok_sse(&self.client, request, |body| {
-            parse_sse(body, event_tx, self.stream_timeout, self.config.usage_cost)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx, self.config.usage_cost)
         })
         .await
     }
@@ -322,18 +300,6 @@ impl OpenAiCompatProvider {
         self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
-}
-
-/// The codec validated declared headers when it built the provider, so this
-/// cannot fail in practice; it keeps a stray one a config error, not a panic.
-fn extra_header(key: &str, value: &str) -> Result<(HeaderName, HeaderValue), AgentError> {
-    let invalid = |e: &dyn Display| AgentError::Config {
-        message: format!("request error: invalid header {key}: {e}"),
-    };
-    Ok((
-        HeaderName::from_bytes(key.as_bytes()).map_err(|e| invalid(&e))?,
-        HeaderValue::from_str(value).map_err(|e| invalid(&e))?,
-    ))
 }
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
@@ -443,7 +409,7 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
 pub(crate) fn tool_parameters(tool: &Value) -> Value {
     match tool.get("input_schema") {
         Some(schema) if schema.is_object() => schema.clone(),
-        _ => json!({ "type": "object", "properties": {} }),
+        _ => json!({"type": "object", "properties": {}, "additionalProperties": true}),
     }
 }
 
@@ -602,14 +568,15 @@ impl ToolAccumulator {
 pub(crate) struct StreamedText {
     text: String,
     pub(crate) reasoning: String,
+    pub(crate) reasoning_id: Option<String>,
     text_started: bool,
 }
 
 impl StreamedText {
-    pub(crate) async fn push_text(
+    pub(crate) fn push_text(
         &mut self,
         delta: String,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<(), AgentError> {
         if delta.is_empty() {
             return Ok(());
@@ -622,23 +589,19 @@ impl StreamedText {
         };
         if !delta.is_empty() {
             self.text.push_str(&delta);
-            event_tx
-                .send_async(ProviderEvent::TextDelta { text: delta })
-                .await?;
+            event_tx.send(ProviderEvent::TextDelta { text: delta })?;
         }
         Ok(())
     }
 
-    pub(crate) async fn push_reasoning(
+    pub(crate) fn push_reasoning(
         &mut self,
         delta: String,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<(), AgentError> {
         if !delta.is_empty() {
             self.reasoning.push_str(&delta);
-            event_tx
-                .send_async(ProviderEvent::ThinkingDelta { text: delta })
-                .await?;
+            event_tx.send(ProviderEvent::ThinkingDelta { text: delta })?;
         }
         Ok(())
     }
@@ -649,6 +612,7 @@ impl StreamedText {
             blocks.push(ContentBlock::Thinking {
                 thinking: self.reasoning,
                 signature: None,
+                reasoning_id: self.reasoning_id,
             });
         }
         if !self.text.is_empty() {
@@ -689,23 +653,18 @@ pub(crate) fn assistant_response(
 }
 
 pub async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
     usage_cost: bool,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data.as_deref().map(str::trim) else {
+            continue;
         };
 
         if data == STREAM_DONE {
@@ -761,11 +720,11 @@ pub async fn parse_sse(
             .flatten()
             .find(|s| !s.is_empty())
         {
-            streamed.push_reasoning(reasoning, event_tx).await?;
+            streamed.push_reasoning(reasoning, event_tx)?;
         }
 
         match delta.content {
-            Some(ContentDelta::String(content)) => streamed.push_text(content, event_tx).await?,
+            Some(ContentDelta::String(content)) => streamed.push_text(content, event_tx)?,
             Some(ContentDelta::Array(content_array)) => {
                 for part in content_array {
                     match part {
@@ -777,11 +736,11 @@ pub async fn parse_sse(
                                     }) => content_str,
                                     ThinkingDelta::String(content_str) => content_str,
                                 };
-                                streamed.push_reasoning(content, event_tx).await?;
+                                streamed.push_reasoning(content, event_tx)?;
                             }
                         }
                         ContentDeltaPart::Text { text } => {
-                            streamed.push_text(text, event_tx).await?;
+                            streamed.push_text(text, event_tx)?;
                         }
                     }
                 }
@@ -816,12 +775,10 @@ pub async fn parse_sse(
                     }
                 }
                 if was_unnamed && !acc.name.is_empty() {
-                    event_tx
-                        .send_async(ProviderEvent::ToolUseStart {
-                            id: acc.id.clone(),
-                            name: acc.name.clone(),
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::ToolUseStart {
+                        id: acc.id.clone(),
+                        name: acc.name.clone(),
+                    })?;
                 }
             }
         }
@@ -846,12 +803,14 @@ pub async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::iter;
     use std::sync::Arc;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
+    use crate::headers::parse_headers;
     use crate::model::{Model, ModelPricing, ModelTier};
-    use crate::test_support::{Canned, serve};
+    use crate::test_support::{Canned, serve, sse_body};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const FIREWORKS_BASE: &str = "https://api.fireworks.ai/inference/v1";
@@ -872,6 +831,9 @@ mod tests {
         MODELS_URL_PATH,
         Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
     )];
+    const REJECTED_SCRIPT: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+    const DECLARED_AGENT: &str = "declared-agent";
+    const CREDENTIAL_AGENT: &str = "credential-agent";
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -884,7 +846,7 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"nam
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
     const IDS_MUST_DIFFER: &str =
         "two turns streaming at once must not land on the same synthetic id";
     const PENDING_ID_MUST_MATCH: &str =
@@ -900,7 +862,7 @@ data: [DONE]\n";
         assert_eq!(function["name"], json!(TOOL_NAME), "{TOOL_MUST_SURVIVE}");
         assert_eq!(
             function["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 
@@ -935,10 +897,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\
 \n\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -965,10 +927,10 @@ data: [DONE]\n";
         let sse = "\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -991,17 +953,12 @@ data: [DONE]\n";
             "choices": [{"finish_reason": "stop", "delta": {}}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "cost": cost},
         });
-        let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(
-            Cursor::new(sse.as_bytes()),
-            &tx,
-            TEST_STREAM_TIMEOUT,
-            usage_cost,
-        )
-        .await
-        .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, usage_cost)
+            .await
+            .unwrap();
 
         assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
         assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
@@ -1023,10 +980,10 @@ data: [DONE]\n";
             "usage": {"prompt_tokens": 100, "completion_tokens": 10},
             "copilot_usage": copilot_usage,
         });
-        let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1054,10 +1011,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 \n\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1085,10 +1042,10 @@ data: [DONE]\n";
     #[test_case(r#"{"reasoning_content":"","reasoning":"think"}"#; "empty_reasoning_content_falls_back")]
     #[tokio::test]
     async fn parse_sse_proxy_reasoning_variants(delta: &str) {
-        let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n");
+        let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n\n");
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1119,18 +1076,17 @@ data: [DONE]\n";
         sent: &[(Kind, &str)],
         blocks: &[(Kind, &str)],
     ) {
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let mut streamed = StreamedText::default();
         for &(kind, delta) in pushed {
             match kind {
-                Kind::Text => streamed.push_text(delta.into(), &tx).await,
-                Kind::Reasoning => streamed.push_reasoning(delta.into(), &tx).await,
+                Kind::Text => streamed.push_text(delta.into(), &tx),
+                Kind::Reasoning => streamed.push_reasoning(delta.into(), &tx),
             }
             .unwrap();
         }
 
-        let events: Vec<_> = rx
-            .try_iter()
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .map(|event| match event {
                 ProviderEvent::TextDelta { text } => (Kind::Text, text),
                 ProviderEvent::ThinkingDelta { text } => (Kind::Reasoning, text),
@@ -1245,10 +1201,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arg
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1262,8 +1218,7 @@ data: [DONE]\n";
         assert_eq!(tools[1].2["path"], "/tmp");
         assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
 
-        let starts: Vec<_> = rx
-            .drain()
+        let starts: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e {
                 ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
                 _ => None,
@@ -1278,10 +1233,10 @@ data: [DONE]\n";
     #[tokio::test]
     async fn parse_sse_error_payload_returns_err() {
         let sse = "\
-data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n";
+data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let err = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap_err();
 
@@ -1303,10 +1258,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arg
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1320,15 +1275,10 @@ data: [DONE]\n";
     async fn parse_sse_unnamed_tool_ids_never_repeat() {
         let mut minted = Vec::new();
         for _ in 0..RESPONSES {
-            let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(
-                Cursor::new(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()),
-                &tx,
-                TEST_STREAM_TIMEOUT,
-                false,
-            )
-            .await
-            .unwrap();
+            let (tx, mut rx) = unbounded_channel();
+            let resp = parse_sse(sse_body(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()), &tx, false)
+                .await
+                .unwrap();
 
             let ids: Vec<String> = resp
                 .message
@@ -1336,8 +1286,7 @@ data: [DONE]\n";
                 .map(|(id, _, _)| id.to_owned())
                 .collect();
             assert_eq!(ids.len(), TOOLS_PER_RESPONSE);
-            let started: Vec<String> = rx
-                .drain()
+            let started: Vec<String> = iter::from_fn(|| rx.try_recv().ok())
                 .filter_map(|e| match e {
                     ProviderEvent::ToolUseStart { id, .. } => Some(id),
                     _ => None,
@@ -1379,10 +1328,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arg
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1405,10 +1354,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"nam
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1488,6 +1437,7 @@ data: [DONE]\n";
                 ContentBlock::Thinking {
                     thinking: "Let me think...".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "Hello".into(),
@@ -1509,6 +1459,7 @@ data: [DONE]\n";
             content: vec![ContentBlock::Thinking {
                 thinking: "Just thinking...".into(),
                 signature: None,
+                reasoning_id: None,
             }],
             ..Default::default()
         }];
@@ -1521,9 +1472,9 @@ data: [DONE]\n";
 
     #[tokio::test]
     async fn parse_sse_empty_stream() {
-        let sse = "data: [DONE]\n";
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let sse = "data: [DONE]\n\n";
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
         assert!(resp.message.content.is_empty());
@@ -1541,10 +1492,10 @@ data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\"
 \n\
 data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1666,6 +1617,35 @@ data: [DONE]\n";
             "{ENCODINGS_ARE_RECORDED}: {encodings}"
         );
         assert_eq!(headers[USER_AGENT_HEADER], super::super::user_agent());
+    }
+
+    /// maki's own user agent, then the declaration's, then the credentials':
+    /// each replaces the one below it, and only one ever goes out.
+    #[test_case(None, DECLARED_AGENT ; "declared_over_makis")]
+    #[test_case(Some(CREDENTIAL_AGENT), CREDENTIAL_AGENT ; "credentials_over_declared")]
+    #[tokio::test]
+    async fn each_header_layer_replaces_the_one_below(credential: Option<&str>, expected: &str) {
+        let (base_url, requests) = serve(REJECTED_SCRIPT);
+        let credentials = credential
+            .map(|agent| (USER_AGENT_HEADER.to_owned(), agent.to_owned()))
+            .into_iter()
+            .collect();
+        let auth = ResolvedAuth::for_test(Some(base_url), credentials);
+        let declared = parse_headers([(USER_AGENT_HEADER, DECLARED_AGENT)]).unwrap();
+        let (tx, _rx) = unbounded_channel();
+
+        let _ = test_provider()
+            .do_stream(
+                &test_model(ModelFamily::Generic),
+                &declared,
+                &json!({}),
+                &tx,
+                &auth,
+            )
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].headers.values(USER_AGENT_HEADER), [expected]);
     }
 
     #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]

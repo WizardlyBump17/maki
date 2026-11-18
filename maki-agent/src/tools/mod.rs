@@ -13,6 +13,7 @@ pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
+use crate::Envelope;
 pub use deadline::Deadline;
 pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
@@ -21,6 +22,9 @@ pub use registry::{
     PermissionScopes, RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult,
     ToolInvocation, ToolReach, ToolRegistry, ToolSource,
 };
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use std::collections::HashMap;
 use std::env;
@@ -374,7 +378,7 @@ pub struct ToolContext {
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
-    pub user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
     /// offers a re-login only where its parent does.
     pub reauth: bool,
@@ -415,7 +419,7 @@ pub struct ToolContext {
     /// Streams a dispatched child's live bufs and annotations back to its
     /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
     /// clears it, and each caller sets it for its own call only.
-    pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub live_sink: Option<UnboundedSender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
 }
 
@@ -482,13 +486,12 @@ pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
     }
 }
 
-static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 
 pub(crate) fn relative_path(path: &str) -> String {
     let p = Path::new(path);
-    if let Some(cwd) = CWD.as_deref()
-        && let Ok(rel) = p.strip_prefix(cwd)
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(rel) = p.strip_prefix(&cwd)
     {
         return format_rel("", ".", rel);
     }
@@ -619,7 +622,7 @@ impl Provider for NullProvider {
         _: &'a [Message],
         _: &'a str,
         _: &'a Value,
-        _: &'a flume::Sender<ProviderEvent>,
+        _: &'a UnboundedSender<ProviderEvent>,
         _: RequestOptions,
         _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
@@ -639,7 +642,7 @@ pub fn interpreter_ctx(
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
-    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
     static PROVIDER: LazyLock<Arc<dyn Provider>> = LazyLock::new(|| Arc::new(NullProvider));
@@ -687,7 +690,7 @@ pub fn interpreter_ctx(
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
 pub fn cli_tool_ctx() -> ToolContext {
-    let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+    let (tx, _rx) = unbounded_channel::<Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     interpreter_ctx(
@@ -716,6 +719,7 @@ pub mod test_support {
     use arc_swap::ArcSwap;
     use maki_providers::Timeouts;
     use maki_storage::id::MakiId;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::live_session::AgentSeed;
     use crate::{Envelope, EventSender, ModelSlot, ToolOutput};
@@ -844,7 +848,7 @@ pub mod test_support {
         let event_tx = match event_tx {
             Some(tx) => tx,
             None => {
-                fallback_tx = EventSender::new(flume::unbounded::<Envelope>().0, 0);
+                fallback_tx = EventSender::new(unbounded_channel::<Envelope>().0, 0);
                 &fallback_tx
             }
         };
@@ -889,7 +893,7 @@ pub mod test_support {
         mode: &AgentMode,
         permissions: Arc<PermissionManager>,
     ) -> ToolContext {
-        let (tx, _rx) = flume::unbounded::<crate::Envelope>();
+        let (tx, _rx) = unbounded_channel::<Envelope>();
         let event_tx = EventSender::new(tx, 0);
         let mut ctx = interpreter_ctx(
             mode,

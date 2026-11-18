@@ -10,16 +10,28 @@
 //! to decide for itself what counts as a difference.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::ops::Index;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::Duration;
+
+#[cfg(test)]
+use futures::stream;
 
 use maki_config::providers::BASE_URL_ENV_SUFFIX;
 use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::providers::plugin::{self, DeclAuthority, ProviderDecl, ProviderHooks, Registration};
+#[cfg(test)]
+use crate::providers::{SseBody, sse_events};
 
+#[cfg(test)]
+const SSE_BODY_TIMEOUT: Duration = Duration::from_secs(300);
 const LOOPBACK: &str = "127.0.0.1:0";
 const REASON_PHRASE: &str = "Recorded";
 const CONTENT_LENGTH: &str = "content-length";
@@ -27,6 +39,8 @@ const AUTHORIZATION: &str = "authorization";
 const BIND_FAILED: &str = "cannot bind loopback";
 const IO_FAILED: &str = "the recorded connection broke";
 const QUERY_START: char = '?';
+const HEADER_REPEATED: &str = "the client sent a header more than once";
+const HEADER_NOT_SENT: &str = "the client did not send the header";
 const BAD_DECLARATION: &str = "the test declaration must register";
 const TEMPDIR_FAILED: &str = "cannot create the isolated home";
 const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
@@ -108,10 +122,53 @@ pub fn is_routed(script: &[Canned]) -> bool {
 pub struct Recorded {
     pub method: String,
     pub path: String,
-    /// Lowercased names, in name order, so a comparison reads the same on
-    /// every run whatever order the client emitted them in.
-    pub headers: BTreeMap<String, String>,
+    pub headers: RecordedHeaders,
     pub body: Vec<u8>,
+}
+
+/// Every value the client sent, under lowercased names in name order, so a
+/// comparison reads the same on every run whatever order the client emitted
+/// them in. A repeated header is kept rather than collapsed, and reading it
+/// as one value panics: RFC 9110 leaves two copies of a singleton header to
+/// the receiver's guess, so no test may pass on one.
+#[derive(Default)]
+pub struct RecordedHeaders(BTreeMap<String, Vec<String>>);
+
+impl RecordedHeaders {
+    pub fn get(&self, name: &str) -> Option<&String> {
+        self.0.get(name).map(|values| single(name, values))
+    }
+
+    /// What went out under `name`, repeats included.
+    pub fn values(&self, name: &str) -> &[String] {
+        self.0.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0
+            .iter()
+            .map(|(name, values)| (name, single(name, values)))
+    }
+
+    fn push(&mut self, name: String, value: String) {
+        self.0.entry(name).or_default().push(value);
+    }
+}
+
+impl Index<&str> for RecordedHeaders {
+    type Output = String;
+
+    fn index(&self, name: &str) -> &String {
+        self.get(name)
+            .unwrap_or_else(|| panic!("{HEADER_NOT_SENT}: {name}"))
+    }
+}
+
+fn single<'a>(name: &str, values: &'a [String]) -> &'a String {
+    match values {
+        [value] => value,
+        _ => panic!("{HEADER_REPEATED}: {name}: {values:?}"),
+    }
 }
 
 impl Recorded {
@@ -188,7 +245,7 @@ fn read_request(stream: &TcpStream) -> Recorded {
     let method = start.next().unwrap_or_default().to_owned();
     let path = start.next().unwrap_or_default().to_owned();
 
-    let mut headers = BTreeMap::new();
+    let mut headers = RecordedHeaders::default();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).expect(IO_FAILED);
@@ -197,7 +254,7 @@ fn read_request(stream: &TcpStream) -> Recorded {
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+            headers.push(name.trim().to_ascii_lowercase(), value.trim().to_owned());
         }
     }
 
@@ -251,6 +308,13 @@ pub fn sse_event(event: &str, data: &Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+/// A whole body in one chunk, as the events a parser test reads.
+#[cfg(test)]
+pub(crate) fn sse_body(body: impl AsRef<[u8]>) -> SseBody {
+    let chunk = Cursor::new(body.as_ref().to_vec());
+    sse_events(stream::iter([Ok(chunk)]), SSE_BODY_TIMEOUT)
+}
+
 /// What the transport tests in `http` and `error` fail against: a port that
 /// refuses, a port that cannot complete a TLS handshake, a name that cannot
 /// resolve, and a secret that must never reach a message.
@@ -288,6 +352,14 @@ pub(crate) mod transport {
             let (mut conn, _) = listener.accept().unwrap();
             let _ = conn.write_all(PLAIN_HTTP_RESPONSE);
         });
+        port
+    }
+
+    /// A loopback port that takes the connection and hangs up without an
+    /// answer.
+    pub(crate) fn hangup_port() -> u16 {
+        let (listener, port) = loopback_listener();
+        thread::spawn(move || drop(listener.accept()));
         port
     }
 }

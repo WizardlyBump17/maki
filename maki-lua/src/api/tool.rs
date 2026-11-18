@@ -1,12 +1,12 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use flume::Sender;
 use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
@@ -29,6 +29,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
@@ -276,7 +277,7 @@ pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) meta: ToolMeta,
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
@@ -300,7 +301,7 @@ impl Tool for LuaTool {
                 None => Cow::Borrowed(&self.meta.description),
             };
         }
-        let (reply_tx, reply_rx) = flume::bounded(1);
+        let (reply_tx, reply_rx) = sync_channel(1);
         let sent = self
             .tx
             .send(Request::Describe {
@@ -405,7 +406,7 @@ struct LuaToolInvocation {
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
-    tx: Sender<Request>,
+    tx: UnboundedSender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
@@ -426,14 +427,12 @@ impl ToolInvocation for LuaToolInvocation {
         HeaderFuture::Pending {
             fallback: fallback.clone(),
             fut: Box::pin(async move {
-                let sent = tx
-                    .send_async(Request::ComputeHeader {
-                        plugin: Arc::clone(&plugin),
-                        tool: Arc::clone(&tool),
-                        input,
-                        reply: reply_tx,
-                    })
-                    .await;
+                let sent = tx.send(Request::ComputeHeader {
+                    plugin: Arc::clone(&plugin),
+                    tool: Arc::clone(&tool),
+                    input,
+                    reply: reply_tx,
+                });
                 if sent.is_err() {
                     return HeaderResult::plain(fallback);
                 }
@@ -484,7 +483,7 @@ impl ToolInvocation for LuaToolInvocation {
         };
         let tx = self.tx.clone();
         Box::pin(async move {
-            if tx.send_async(req).await.is_ok() {
+            if tx.send(req).is_ok() {
                 let _ = reply_rx.await;
             }
         })
@@ -502,13 +501,12 @@ impl ToolInvocation for LuaToolInvocation {
                 let fallback = input.to_string();
                 Box::pin(async move {
                     if tx
-                        .send_async(Request::ComputePermissionScopes {
+                        .send(Request::ComputePermissionScopes {
                             plugin,
                             tool,
                             input,
                             reply: reply_tx,
                         })
-                        .await
                         .is_err()
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
@@ -559,7 +557,7 @@ impl ToolInvocation for LuaToolInvocation {
             let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
-                .send_async(Request::CallTool {
+                .send(Request::CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
                     input,
@@ -569,7 +567,6 @@ impl ToolInvocation for LuaToolInvocation {
                     live,
                     nested,
                 })
-                .await
                 .is_err()
             {
                 return Err("lua thread disconnected".to_string()).into();
@@ -817,7 +814,7 @@ fn register_prompt(
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-///   permission      (string|table) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the tool reaches nothing past the conversation it runs in: its handler calls no guarded `maki` function and no other tool. `{}` is the tool form of `capability = {}` on slots and actions, needs no grant, makes the tool free to hand to a session, and cannot go with `permission_scopes` or `mutable_path`. Older maki versions refuse `{}`, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
+///   permission      (string|table) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the handler calls no guarded `maki` function and no other tool. Such a tool needs no grant and is free to hand to a session. It cannot have `permission_scopes` or `mutable_path`, and older maki versions refuse it, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
@@ -1098,7 +1095,7 @@ fn register_command(
 #[lua_fn]
 async fn run_command(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
@@ -1127,11 +1124,15 @@ async fn run_command(
 ///
 /// A function `content` is called before every run. Its first value goes in
 /// the system prompt, and later changes reach the model as a context update
-/// until the next compaction.
+/// until the next compaction. `maki -p`, the SDK and ACP call it once, at
+/// startup.
 ///
 /// @param spec table Hint specification:
 ///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "conventions").
-///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
+///   content (string|function) Required. Static text, or a `function(ctx)` that
+///                            returns a string. Max 1 MiB. `ctx.session_id` is
+///                            the session whose prompt is being built. `ctx` is
+///                            nil with no session (startup, ACP).
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
 /// @example
@@ -1171,8 +1172,9 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 ///
 /// Identity and tone are available in system, research, and general prompts.
 /// Sections target the main agent when `prompt` is omitted. Only identity and
-/// tone accept a function called before every run. Its first value goes in the
-/// system prompt. Later changes reach the main agent as a context update.
+/// tone accept a function, called before every run with `ctx` as in
+/// `register_prompt_hint`. Its first value goes in the system prompt. Later
+/// changes reach the main agent as a context update.
 /// Other replacements require static strings.
 /// A known section missing from the resolved template is ignored, with a warning
 /// for explicit prompt targets.
@@ -1219,10 +1221,7 @@ fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> 
 /// Each entry has the tool's name, schema, audiences, and an `enabled` flag.
 /// Describe callbacks are not invoked (the static description is used).
 ///
-/// `permission` is what the tool reaches, as a list like `get_slots`
-/// `capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
-/// it declared none, which costs every permission. A tool registered with
-/// `permission = "fs_read"` reads back as `{ "fs_read" }`.
+/// `permission` is as in `get_tool`.
 ///
 /// @param opts table? Options:
 ///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
@@ -1271,10 +1270,9 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// `background_params` lists the parameters marked `needs_background`,
 /// which only a session that can move calls to the background sees.
 ///
-/// `permission` is what the tool reaches, as a list like `get_slots`
-/// `capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
-/// it declared none, which costs every permission. MCP tools and
-/// `tool_search` declare none.
+/// `permission` lists what the tool reaches, shaped like `capability` from
+/// `get_slots`: `{ "fs_read" }`, `{}` for nothing, or nil when the tool
+/// declared none (MCP tools and `tool_search` included).
 ///
 /// @param name string Exact tool name.
 /// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, permission?, background_params?, header?, restore?, format? }, or nil if not found.
@@ -1330,7 +1328,7 @@ pub(crate) fn create_api_table(
     reach: PluginReach,
     plugin: Arc<str>,
     opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     run_command__register(&t, lua, ui_action_tx, reach.clone())?;
@@ -2133,10 +2131,12 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::yield_now;
+
     use super::*;
     use crate::runtime::test_support::{call_scope, moved_home};
     use crate::runtime::wake_or_fail;
-    use tokio::task::yield_now;
 
     const BACKGROUND_PARAM: &str = "background";
 
@@ -2231,7 +2231,7 @@ mod tests {
     }
 
     fn invocation(input: Value) -> LuaToolInvocation {
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
@@ -2282,7 +2282,7 @@ mod tests {
             "required": ["url"],
         }))
         .unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaTool {
             meta: ToolMeta {
                 name: Arc::from("test_tool"),
@@ -2411,7 +2411,7 @@ mod tests {
     #[tokio::test]
     async fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
-        let (tx, rx) = flume::bounded(0);
+        let (tx, rx) = unbounded_channel();
         drop(rx);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
@@ -2430,7 +2430,7 @@ mod tests {
         assert!(!scopes.scopes.is_empty());
 
         // Callback returns None → fallback to force_prompt
-        let (tx2, rx2) = flume::bounded(1);
+        let (tx2, mut rx2) = unbounded_channel();
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2444,7 +2444,7 @@ mod tests {
             has_start_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx2.blocking_recv() {
                 let _ = reply.send(None);
             }
         });
@@ -2454,7 +2454,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_compute_returns_callback_result() {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, mut rx) = unbounded_channel();
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2468,7 +2468,7 @@ mod tests {
             has_start_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx.blocking_recv() {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,

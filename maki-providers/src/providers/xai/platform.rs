@@ -1,10 +1,12 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
 use maki_storage::id::SessionRef;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 
+use crate::headers::parse_headers;
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::ResolvedAuth;
@@ -108,17 +110,17 @@ impl Provider for Xai {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.auth.refresh_if_stale().await?;
+            let oauth = self.auth.uses_oauth().await?;
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
-            if self.auth.is_oauth() {
-                let mut body = responses::build_body(model, messages, system, tools);
+            if oauth {
+                let mut body = responses::build_body(model, messages, system, tools, false);
                 apply_grok_reasoning(&mut body, &opts, model);
                 if let Some(session) = session_id {
                     body["prompt_cache_key"] = json!(session.as_str());
@@ -127,12 +129,11 @@ impl Provider for Xai {
                 return self
                     .auth
                     .with_retry(|| async {
-                        let mut auth = self.auth.current();
-                        auth.headers
-                            .extend(proxy_request_headers(model, session_id));
+                        let auth = self.auth.current();
                         responses::do_stream(
                             self.compat.client(),
                             model,
+                            &parse_headers(proxy_request_headers(model, session_id))?,
                             &body,
                             event_tx,
                             &auth,
@@ -153,7 +154,7 @@ impl Provider for Xai {
                 .with_retry(|| async {
                     let auth = self.auth.current();
                     self.compat
-                        .do_stream(model, &[], &body, event_tx, &auth)
+                        .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                         .await
                 })
                 .await
@@ -162,8 +163,7 @@ impl Provider for Xai {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if self.auth.is_oauth() {
+            if self.auth.uses_oauth().await? {
                 return self
                     .auth
                     .with_retry(|| async {
@@ -218,15 +218,11 @@ impl Provider for Xai {
 }
 
 fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
-    auth.headers.iter().find_map(|(key, value)| {
-        if !key.eq_ignore_ascii_case("authorization") {
-            return None;
-        }
-        value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-            .map(ToOwned::to_owned)
-    })
+    let value = auth.header("authorization")?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]

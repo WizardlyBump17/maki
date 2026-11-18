@@ -15,17 +15,19 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use flume::Sender;
 use maki_config::providers::ProvidersConfig;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 use tokio::sync::OnceCell;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
 use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
+use crate::headers::HeaderError;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::{self, shared};
@@ -35,7 +37,6 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{
     ResolvedAuth, Timeouts, http_client, ok_sse, ok_text, opencode, plugin, status_and_text,
-    user_agent,
 };
 use crate::spec::ProviderRegistry;
 use crate::{
@@ -44,7 +45,6 @@ use crate::{
 };
 
 const MESSAGES_PATH: &str = "/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Priced per subscription, so every model in it reads as free. The `zai` entry
 /// carries the pay as you go rates for the same models.
@@ -216,11 +216,11 @@ impl ProviderData {
         &self,
         mut auth: ResolvedAuth,
         session_id: Option<&SessionRef>,
-    ) -> ResolvedAuth {
+    ) -> Result<ResolvedAuth, HeaderError> {
         if let Some(session) = session_id {
-            self.quirks.session_id.apply_headers(session, &mut auth);
+            self.quirks.session_id.apply_headers(session, &mut auth)?;
         }
-        auth
+        Ok(auth)
     }
 
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
@@ -643,10 +643,7 @@ async fn save_cached_catalog(index: &schema::CatalogIndex) {
 }
 
 async fn fetch_remote_catalog_async(client: &Client) -> Result<schema::CatalogIndex, AgentError> {
-    let request = client
-        .get(CATALOG_URL)
-        .header("user-agent", user_agent())
-        .build()?;
+    let request = client.get(CATALOG_URL).build()?;
 
     let (status, text) = status_and_text(client, request).await.map_err(|e| {
         warn!(error = %e, CATALOG_URL, "failed to fetch catalog");
@@ -792,7 +789,7 @@ impl CatalogTransport {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
         opts: &RequestOptions,
     ) -> Result<StreamResponse, AgentError> {
@@ -809,7 +806,7 @@ impl CatalogTransport {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &CHAT_DIALECT, model);
                 self.chat_compat
-                    .do_stream(model, &[], &body, event_tx, auth)
+                    .do_stream(model, &HeaderMap::new(), &body, event_tx, auth)
                     .await
             }
             EndpointType::Messages => {
@@ -828,23 +825,20 @@ impl CatalogTransport {
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
-                let request = auth
-                    .configure_request(
-                        self.client
-                            .post(format!(
-                                "{}{}",
-                                auth.base_url.as_deref().unwrap_or(""),
-                                MESSAGES_PATH
-                            ))
-                            .header("user-agent", user_agent())
-                            .header("content-type", "application/json")
-                            .header("anthropic-version", ANTHROPIC_VERSION),
-                    )
-                    .body(serde_json::to_vec(&body)?)
-                    .build()?;
+                let request = auth.finish(
+                    self.client
+                        .post(format!(
+                            "{}{}",
+                            auth.base_url.as_deref().unwrap_or(""),
+                            MESSAGES_PATH
+                        ))
+                        .header("content-type", "application/json")
+                        .header("anthropic-version", anthropic::API_VERSION)
+                        .body(serde_json::to_vec(&body)?),
+                )?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                ok_sse(&self.client, request, |body| {
-                    anthropic::parse_sse(body, event_tx, self.stream_timeout)
+                ok_sse(&self.client, request, self.stream_timeout, |body| {
+                    anthropic::parse_sse(body, event_tx)
                 })
                 .await
             }
@@ -906,13 +900,13 @@ impl Provider for CatalogProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.unlocked(&self.data.slug)?.clone();
-            let auth = self.data.request_auth(auth, session_id);
+            let auth = self.data.request_auth(auth, session_id)?;
             let meta = self
                 .data
                 .models
@@ -972,14 +966,7 @@ impl Provider for CatalogProvider {
                 return Ok(None);
             }
             let auth = self.auth.unlocked(&self.data.slug)?.clone();
-            let request = auth
-                .configure_request(
-                    self.transport
-                        .client
-                        .get(endpoint.url)
-                        .header("user-agent", super::user_agent()),
-                )
-                .build()?;
+            let request = auth.finish(self.transport.client.get(endpoint.url))?;
             let body = ok_text(&self.transport.client, request).await?;
             (endpoint.parse)(&body).map(Some)
         })
@@ -1031,7 +1018,7 @@ impl Provider for LazyCatalogProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1108,6 +1095,7 @@ pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use tokio::sync::OnceCell;
 
@@ -1187,16 +1175,16 @@ mod tests {
             ..opencode_go_provider_data("UNUSED")
         };
         let session = SessionRef::generate();
-        let auth = data.request_auth(
-            ResolvedAuth::for_test(None, Vec::new()),
-            with_session.then_some(&session),
+        let auth = data
+            .request_auth(
+                ResolvedAuth::for_test(None, Vec::new()),
+                with_session.then_some(&session),
+            )
+            .unwrap();
+        assert_eq!(
+            auth.header(SESSION_HEADER),
+            expected.then(|| session.as_str())
         );
-        let header = auth
-            .headers
-            .iter()
-            .find(|(key, _)| key == SESSION_HEADER)
-            .map(|(_, value)| value.as_str());
-        assert_eq!(header, expected.then(|| session.to_string()).as_deref());
     }
 
     /// Limits are published so nothing under test reads a default; only the
@@ -1288,7 +1276,7 @@ mod tests {
             context_window: 0,
             thinking_fields: None,
         };
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = provider
             .stream_message(
                 &model,
@@ -1540,8 +1528,8 @@ mod tests {
         let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::FreeKey(resolved, _) => {
-                assert_eq!(resolved.headers[0].0, "authorization");
-                assert_eq!(resolved.headers[0].1, "Bearer public");
+                assert_eq!(resolved.header_list()[0].0, "authorization");
+                assert_eq!(resolved.header_list()[0].1, "Bearer public");
             }
             _ => panic!("expected FreeKey"),
         }
@@ -1570,8 +1558,8 @@ mod tests {
         let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::KeyBased(resolved) => {
-                assert_eq!(resolved.headers[0].0, "authorization");
-                assert_eq!(resolved.headers[0].1, "Bearer sk-real-key");
+                assert_eq!(resolved.header_list()[0].0, "authorization");
+                assert_eq!(resolved.header_list()[0].1, "Bearer sk-real-key");
             }
             _ => panic!("expected KeyBased"),
         }
@@ -1601,8 +1589,8 @@ mod tests {
         let auth = provider_data.build_auth(&state_dir).unwrap();
         match auth {
             Authentication::KeyBased(resolved) => {
-                assert_eq!(resolved.headers[0].0, "x-api-key");
-                assert_eq!(resolved.headers[0].1, "sk-ant-key");
+                assert_eq!(resolved.header_list()[0].0, "x-api-key");
+                assert_eq!(resolved.header_list()[0].1, "sk-ant-key");
             }
             _ => panic!("expected KeyBased"),
         }

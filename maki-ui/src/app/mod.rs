@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::OpenSession;
 use crate::app::tasks::{BackgroundMoves, TaskOutcome, TaskStatus, count_phrase};
@@ -85,6 +86,7 @@ use maki_storage::model::persist_thinking;
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
 use strum::{EnumIter, IntoEnumIterator};
+use tokio::sync::oneshot;
 
 pub(crate) use crate::agent::QueuedMessage;
 use image_paste::PastedContent;
@@ -165,8 +167,6 @@ pub(crate) const ALREADY_TRUSTED_MSG: &str = "this folder is already trusted";
 pub(crate) const TRUSTED_VACANT_MSG: &str =
     "Trusted this folder, project answers are saved from now on";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
-const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
-const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 pub(crate) const HELD_KEYS_DROPPED: &str =
     "Dropped the keys typed before a prompt opened, so they could not answer it";
@@ -541,7 +541,7 @@ pub struct App {
     background_deadline: Option<Instant>,
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answer_tx: Option<UnboundedSender<String>>,
     /// Bumped whenever the host opens a prompt, see [`Self::open_prompt`].
     /// The plugin windows that need input count their own, see
     /// [`Self::prompts`].
@@ -574,8 +574,8 @@ pub struct App {
     pub(crate) trust: TrustState,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) paste_rx: Vec<flume::Receiver<Result<PastedContent, String>>>,
-    pub(crate) mouse_paste_rx: Vec<flume::Receiver<Option<String>>>,
+    pub(crate) paste_rx: Vec<oneshot::Receiver<Result<PastedContent, String>>>,
+    pub(crate) mouse_paste_rx: Vec<oneshot::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
@@ -743,7 +743,7 @@ impl App {
                 .collect(),
         );
         app.model_picker
-            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
+            .set_expanded(maki_storage::model::read_expanded_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -1314,7 +1314,7 @@ impl App {
             .and_then(|id| self.chat_of_task(id).ok())
             .unwrap_or(MAIN_CHAT);
         if let Some(tx) = self.answer_channel(idx) {
-            let _ = tx.try_send(answer);
+            let _ = tx.send(answer);
         }
     }
 
@@ -1323,7 +1323,7 @@ impl App {
     /// nobody to ask, so its run fails rather than park, and its caller hears.
     /// A finished chat has no run left to answer, and the turn's channel is
     /// not its to borrow.
-    fn answer_channel(&self, idx: usize) -> Option<&flume::Sender<String>> {
+    fn answer_channel(&self, idx: usize) -> Option<&UnboundedSender<String>> {
         let chat = &self.chats[idx];
         if chat.is_finished() {
             return None;
@@ -1350,7 +1350,7 @@ impl App {
             if mem::take(&mut self.chats[idx].auth_parked)
                 && let Some(tx) = self.answer_channel(idx)
             {
-                let _ = tx.try_send(String::new());
+                let _ = tx.send(String::new());
             }
         }
     }
@@ -1594,31 +1594,24 @@ impl App {
                 }
                 // Saved right here instead of going through an `Action`. A fold
                 // only changes how the picker looks, and the state dir lives here.
-                ModelPickerAction::Collapse(slug, folded) => {
-                    maki_storage::model::persist_collapsed_providers(
+                ModelPickerAction::Folded => {
+                    maki_storage::model::persist_expanded_providers(
                         &self.storage,
-                        self.model_picker.collapsed_providers(),
+                        self.model_picker.expanded_providers(),
                     );
-                    let suffix = if folded {
-                        PROVIDER_FOLDED_SUFFIX
-                    } else {
-                        PROVIDER_UNFOLDED_SUFFIX
-                    };
-                    self.flash(format!("{slug}{suffix}"));
                     vec![]
+                }
+                ModelPickerAction::Login(slug) => {
+                    self.model_picker.close();
+                    let action = self.login_picker.open_for(self.storage.clone(), &slug);
+                    self.handle_login_picker_action(action)
                 }
                 ModelPickerAction::Close => vec![],
             }),
-            KeyboardOwner::LoginPicker => Some(match self.login_picker.handle_key(key) {
-                LoginPickerAction::Consumed => vec![],
-                LoginPickerAction::Close => vec![],
-                LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
-                }
-                LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
-                }
-            }),
+            KeyboardOwner::LoginPicker => {
+                let action = self.login_picker.handle_key(key);
+                Some(self.handle_login_picker_action(action))
+            }
             KeyboardOwner::McpPicker => Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
                 McpPickerAction::Toggle {
@@ -1647,6 +1640,22 @@ impl App {
                         Some(vec![])
                     }
                 }
+            }
+        }
+    }
+
+    /// Both ways into the login picker — its own keys, and Enter on a model
+    /// picker row — land here, so the keys page always leaves as an `Action`.
+    fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
+        match action {
+            LoginPickerAction::Consumed => vec![],
+            LoginPickerAction::Close => vec![],
+            LoginPickerAction::OpenUrl(url) => vec![Action::OpenUrl(url)],
+            LoginPickerAction::Authenticated { model_spec } => {
+                vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+            }
+            LoginPickerAction::Configured { slug } => {
+                vec![Action::RefreshProvider { slug }, Action::RefreshModels]
             }
         }
     }

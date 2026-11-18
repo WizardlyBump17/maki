@@ -4,18 +4,18 @@ use std::future::Future;
 use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use tokio::sync::mpsc::unbounded_channel;
 
-use flume::Sender;
+use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
-use maki_storage::StateDir;
 use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
 use maki_storage::id::SessionRef;
+use maki_storage::{StateDir, blocking, joined};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::oneshot;
-use tokio::task::spawn_blocking;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
@@ -40,6 +40,7 @@ const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
 const SESSION_ID_OPTION: &str = "session_id";
+const REPLAY_REASONING_OPTION: &str = "replay_reasoning";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -191,6 +192,11 @@ pub struct ProviderDecl {
     pub openai: Option<OpenAiWire>,
     /// Above the codec tables, because every codec but google carries it.
     pub session_id: Option<SessionCarrier>,
+    /// Send past assistant reasoning back as `reasoning` input items. Only
+    /// `codec = "openai-responses"` reads it, and only some providers take
+    /// plaintext reasoning back.
+    #[serde(default)]
+    pub replay_reasoning: bool,
     /// This and the next three describe a model no row or listing covers.
     /// Each falls back to the native provider behind the codec or base. The
     /// two limits also fill in any row that leaves its own out.
@@ -403,13 +409,14 @@ fn honours_build_body(target: Target) -> bool {
 }
 
 /// The `openai` table is the chat codec's own vocabulary. The responses codec
-/// spells neither effort nor extra body the same way, so it is refused there
-/// rather than half honoured.
-fn honours_openai_wire(target: Target) -> bool {
+/// honours only its `thinking` (rendered as the standard `reasoning` block)
+/// and `thinking_overrides`, and refuses a table that sets anything else
+/// rather than half honour it.
+fn honours_openai_wire(target: Target, wire: &OpenAiWire) -> bool {
     match target {
         Target::Codec(Protocol::Openai) => true,
-        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
-        | Target::Base(_) => false,
+        Target::Codec(Protocol::OpenaiResponses) => wire.responses_compatible(),
+        Target::Codec(Protocol::Anthropic | Protocol::Google) | Target::Base(_) => false,
     }
 }
 
@@ -428,6 +435,16 @@ fn honours_session_id(target: Target) -> bool {
     match target {
         Target::Codec(Protocol::Anthropic | Protocol::Openai | Protocol::OpenaiResponses) => true,
         Target::Codec(Protocol::Google) | Target::Base(_) => false,
+    }
+}
+
+/// Only the responses wire takes a `reasoning` input item, and only some
+/// providers accept one in plaintext.
+fn honours_replay_reasoning(target: Target) -> bool {
+    match target {
+        Target::Codec(Protocol::OpenaiResponses) => true,
+        Target::Codec(Protocol::Openai | Protocol::Anthropic | Protocol::Google)
+        | Target::Base(_) => false,
     }
 }
 
@@ -474,16 +491,13 @@ type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
 /// a load the previous generation is still the published one.
-static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::default);
+static PROVIDERS: LazyLock<ArcSwap<Registry>> = LazyLock::new(ArcSwap::default);
 /// The load in progress. `Some` between [`begin_load`] and [`commit_load`],
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
-static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::new())));
-/// One cell of credentials per slug, for the life of the process: see
-/// [`shared_auth`].
+static STAGING: Mutex<Option<Registry>> = Mutex::new(Some(Registry::new()));
 /// The current owner and auth state of each slug: see [`shared_auth`].
-static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
+static AUTH: LazyLock<Mutex<HashMap<Box<str>, AuthCell>>> = LazyLock::new(Mutex::default);
 /// Slugs granted to enabled packages, kept even when their load fails so the
 /// catalog client cannot take over the slug and receive the saved key. Maps
 /// the package name to its granted slugs, so unloading the package releases
@@ -552,7 +566,7 @@ pub fn commit_load() {
     }
     let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
-    *PROVIDERS.write().unwrap() = Arc::new(staged);
+    PROVIDERS.store(Arc::new(staged));
 }
 
 /// Takes back everything `plugin` staged in the load in progress, for a plugin
@@ -729,11 +743,16 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     if decl.system_prefix.is_some() && !honours_system_prefix(target) {
         return Err(unsupported(SYSTEM_PREFIX_OPTION));
     }
-    if decl.openai.is_some() && !honours_openai_wire(target) {
+    if let Some(wire) = &decl.openai
+        && !honours_openai_wire(target, wire)
+    {
         return Err(unsupported(OPENAI_OPTION));
     }
     if decl.session_id.is_some() && !honours_session_id(target) {
         return Err(unsupported(SESSION_ID_OPTION));
+    }
+    if decl.replay_reasoning && !honours_replay_reasoning(target) {
+        return Err(unsupported(REPLAY_REASONING_OPTION));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -749,7 +768,7 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
 /// Reusing stops at the owner, though: a slug another package took over gets
 /// a fresh cell, so a token one of them minted never serves the other.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
-    let mut states = AUTH.write().unwrap();
+    let mut states = AUTH.lock().unwrap();
     let (current_owner, state) = states
         .entry(slug.into())
         .or_insert_with(|| (owner.clone(), Arc::new(AuthState::new())));
@@ -761,7 +780,7 @@ fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
 }
 
 fn entries() -> Arc<Registry> {
-    Arc::clone(&PROVIDERS.read().unwrap())
+    PROVIDERS.load_full()
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
@@ -973,14 +992,14 @@ impl AuthState {
         purpose: AuthPurpose,
     ) -> Result<Recovery, AgentError> {
         let owned = slug.to_owned();
-        let (_lock, stored) = spawn_blocking(move || match StateDir::resolve() {
+        let (_lock, stored) = blocking(move || match StateDir::resolve() {
             Ok(dir) => (
                 Some(lock_credentials(&dir, &owned)),
                 plugin_auth_stamp(&dir, &owned),
             ),
             Err(_) => (None, None),
         })
-        .await?;
+        .await;
         let purpose = match purpose {
             AuthPurpose::Refresh
                 if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
@@ -1010,8 +1029,7 @@ impl AuthState {
             .await?
             .into_resolved(slug, &self.hosts())?;
         let owned = slug.to_owned();
-        let stamp =
-            spawn_blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await?;
+        let stamp = blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
         let mut current = self.current.lock().unwrap();
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
@@ -1077,15 +1095,12 @@ impl PluginEntry {
         // that timed out, must neither release the gate and the lock while the
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
-        let (done, outcome) = oneshot::channel();
-        tokio::spawn(async move {
-            let minted = auth
-                .gate
+        joined(tokio::spawn(async move {
+            auth.gate
                 .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))
-                .await;
-            let _ = done.send(minted);
-        });
-        outcome.await.map_err(|_| AgentError::Channel)?
+                .await
+        }))
+        .await
     }
 }
 
@@ -1246,7 +1261,7 @@ impl Provider for PluginProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1262,7 +1277,7 @@ impl Provider for PluginProvider {
                     // channel that already delivered part of the answer would
                     // duplicate text in the UI and, after a cancel, in the
                     // history.
-                    let (tx, rx) = flume::unbounded();
+                    let (tx, mut rx) = unbounded_channel();
                     let attempt = async {
                         let result = self
                             .inner
@@ -1273,9 +1288,9 @@ impl Provider for PluginProvider {
                     };
                     let forward = async move {
                         let mut forwarded = false;
-                        while let Ok(ev) = rx.recv_async().await {
+                        while let Some(ev) = rx.recv().await {
                             forwarded = true;
-                            if event_tx.send_async(ev).await.is_err() {
+                            if event_tx.send(ev).is_err() {
                                 break;
                             }
                         }
@@ -1424,6 +1439,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
         session_id: decl.session_id.clone().unwrap_or_default(),
+        replay_reasoning: decl.replay_reasoning,
         build_body: entry
             .hooks
             .build_body
@@ -1657,6 +1673,8 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use futures::FutureExt;
     use maki_config::PROVIDER_BUILTINS;
@@ -1834,16 +1852,16 @@ mod tests {
     /// Says when it has started, then holds on until released, so a test can
     /// drop the caller while the hook is known to be mid-flight.
     struct ParkedAuth {
-        entered: flume::Sender<()>,
-        released: flume::Receiver<()>,
+        entered: Notify,
+        released: Notify,
         calls: AtomicUsize,
     }
 
     impl Hook<AuthPurpose, PluginAuth> for ParkedAuth {
         fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
-                let _ = self.entered.send(());
-                let _ = self.released.recv_async().await;
+                self.entered.notify_one();
+                self.released.notified().await;
                 self.calls.fetch_add(1, Ordering::AcqRel);
                 Ok(PluginAuth {
                     base_url: None,
@@ -1879,7 +1897,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1926,7 +1944,9 @@ mod tests {
     }
 
     fn token(entry: &PluginEntry) -> String {
-        entry.auth.current.lock().unwrap().headers[0].1.clone()
+        entry.auth.current.lock().unwrap().header_list()[0]
+            .1
+            .clone()
     }
 
     fn base_url(slug: &str) -> Option<String> {
@@ -2141,7 +2161,7 @@ mod tests {
 
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
-            AUTH.read().unwrap().contains_key(SLUG),
+            AUTH.lock().unwrap().contains_key(SLUG),
             "{CREDENTIALS_DROPPED}"
         );
     }
@@ -2246,7 +2266,7 @@ mod tests {
         };
         let entry = entry(SLUG).unwrap();
         let auth = entry.auth.current.lock().unwrap();
-        assert_eq!(auth.headers, [(header.to_string(), value)]);
+        assert_eq!(auth.header_list(), [(header.to_string(), value)]);
     }
 
     /// Tier defaults are looked up through `default`, like in a curated table.
@@ -2400,11 +2420,9 @@ mod tests {
     #[tokio::test]
     async fn a_refresh_outlives_the_caller_that_started_it() {
         const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
-        let (entered_tx, entered) = flume::bounded(1);
-        let (release, released) = flume::bounded(1);
         let hook = Arc::new(ParkedAuth {
-            entered: entered_tx,
-            released,
+            entered: Notify::new(),
+            released: Notify::new(),
             calls: AtomicUsize::new(0),
         });
         let entry = entry_with(ProviderHooks {
@@ -2414,8 +2432,8 @@ mod tests {
 
         let abandoned = entry.run_auth(AuthPurpose::Refresh).now_or_never();
         assert!(abandoned.is_none());
-        entered.recv_async().await.unwrap();
-        release.send(()).unwrap();
+        hook.entered.notified().await;
+        hook.released.notify_one();
         let _gate = entry.auth.gate.lock.lock().await;
 
         assert_eq!(hook.calls.load(Ordering::Acquire), 1, "{ONE_HOOK_CALL}");
@@ -2461,7 +2479,7 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = provider
             .stream_message(
                 &model,
@@ -2509,7 +2527,7 @@ mod tests {
 
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let _ = provider
             .stream_message(
                 &model,
@@ -2561,7 +2579,7 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let session = SessionRef::generate();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let _ = provider
             .stream_message(
                 &model,
@@ -3163,9 +3181,47 @@ mod tests {
         reg.decl.openai = Some(OpenAiWire::default());
     }
 
+    /// A chat-only field of the `openai` table, on the responses codec, which
+    /// honours only `thinking` and `thinking_overrides`.
+    fn openai_wire_chat_field_on_responses(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinking": { "dialect": "high-only" },
+                "max_tokens_field": "max_output_tokens",
+            }))
+            .unwrap(),
+        );
+    }
+
+    /// The responses pass writes the standard `reasoning` block, so a custom
+    /// effort field would be dropped there.
+    fn openai_wire_custom_effort_field_on_responses(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinking": { "dialect": "high-only", "field": "custom_effort" },
+            }))
+            .unwrap(),
+        );
+    }
+
     fn session_id_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.session_id = Some(SessionCarrier::default());
+    }
+
+    fn replay_reasoning_on_chat(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::Openai);
+        reg.decl.replay_reasoning = true;
+    }
+
+    #[test]
+    fn replay_reasoning_registers_on_the_responses_codec() {
+        let mut reg = registration("replay-reasoning-plugin");
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.replay_reasoning = true;
+        register_loaded(reg).unwrap();
     }
 
     fn system_prefix_on_google(reg: &mut Registration) {
@@ -3209,7 +3265,10 @@ mod tests {
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
+    #[test_case(openai_wire_chat_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_chat_only_fields")]
+    #[test_case(openai_wire_custom_effort_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_a_custom_effort_field")]
     #[test_case(session_id_on_google, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == SESSION_ID_OPTION) ; "google_carries_no_session_id")]
+    #[test_case(replay_reasoning_on_chat, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == REPLAY_REASONING_OPTION) ; "replay_reasoning_needs_the_responses_codec")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]

@@ -37,6 +37,7 @@ use serde_json::Value;
 
 use crate::interrupt::Interrupt;
 use crate::sdk_mode::NOTICE_SUBTYPE;
+use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -134,6 +135,27 @@ struct NoticeEvent<'a> {
 }
 
 #[derive(Serialize)]
+struct TaskEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    subtype: &'static str,
+    #[serde(flatten)]
+    task: TaskMessage,
+    session_id: &'a SessionRef,
+}
+
+impl<'a> TaskEvent<'a> {
+    fn new(task: TaskMessage, session_id: &'a SessionRef) -> Self {
+        Self {
+            event_type: "system",
+            subtype: task.subtype(),
+            task,
+            session_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct RetryEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
@@ -207,6 +229,12 @@ impl VerboseOutput {
         }
         Ok(())
     }
+
+    fn emit_tasks(&mut self, tasks: Vec<TaskMessage>, session_id: &SessionRef) -> Result<()> {
+        tasks
+            .into_iter()
+            .try_for_each(|task| self.emit(&TaskEvent::new(task, session_id)))
+    }
 }
 
 pub struct PrintParams {
@@ -273,7 +301,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     // After the prompt is read, so a signal still ends a stdin read at once.
     let interrupt = Interrupt::install();
 
-    let prompt_slots = lua_handle.collect_prompt_slots();
+    let prompt_slots = lua_handle
+        .collect_prompt_slots(Some(resumed.id.as_str()))
+        .await;
 
     let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let cwd = initial_wd.to_string_lossy().into_owned();
@@ -305,7 +335,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(background_wait),
         stop: interrupt.stop(),
-    });
+    })
+    .await;
 
     let InteractiveHandle {
         tool_names,
@@ -348,6 +379,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     }
 
     let mut totals = Totals::default();
+    // The stream shows Maki's own tool names, so a task message does too.
+    let mut tasks = SubagentTasks::new(|name| name);
 
     let snapshot = HeadlessSnapshot::default();
     snapshot.install(
@@ -365,12 +398,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
-        maki_lua::agent_autocmd::dispatch(
-            &lua_handle,
-            &session_id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
+        maki_lua::agent_autocmd::dispatch(&lua_handle, &session_id, &envelope);
         let Envelope {
             ref event,
             ref subagent,
@@ -380,6 +408,10 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
 
         if !totals.fold(event, parent_tool_use_id) {
             break;
+        }
+        let task_messages = tasks.observe(&envelope);
+        if let Some(out) = &mut verbose_out {
+            out.emit_tasks(task_messages.before, &session_id)?;
         }
         match event {
             AgentEvent::TextDelta { .. }
@@ -469,9 +501,17 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
                 }
             }
         }
+        if let Some(out) = &mut verbose_out {
+            out.emit_tasks(task_messages.after, &session_id)?;
+        }
     }
     let track = headless::await_shutdown(task).await;
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_handle
+        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .await;
+    if let Some(out) = &mut verbose_out {
+        out.emit_tasks(tasks.finish(), &session_id)?;
+    }
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no turn
     // was left to report.

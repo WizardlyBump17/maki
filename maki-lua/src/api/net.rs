@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use maki_config::split_host_port;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use maki_providers::headers::parse_headers;
 use maki_providers::http::{
     DNS_ATTEMPTS, HTTP_SCHEME, HTTPS_SCHEME, ProxyEnv, error_chain, extract_host_port, proxy_env,
     resolve,
@@ -17,7 +18,7 @@ use maki_providers::http::{
 use maki_providers::{Timeouts, client_builder};
 use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef, Value as LuaValue};
 use regex::bytes::Regex;
-use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue, USER_AGENT as USER_AGENT_NAME};
 use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
 use socket2::SockRef;
 use thiserror::Error;
@@ -49,7 +50,6 @@ const GET: &str = "GET";
 const NO_ATTEMPT: &str = "no request was attempted";
 const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-const USER_AGENT_HEADER: &str = "User-Agent";
 const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = "maki";
@@ -719,10 +719,8 @@ fn close(_lua: &Lua, this: &Conn) -> LuaResult<()> {
 }
 
 lua_class! {
-    /// A TCP or Unix socket connection.
-    ///
-    /// `maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
-    /// socket one.
+    /// A TCP or Unix socket connection, from `maki.net.connect`,
+    /// `maki.net.connect_unix` or `Listener:accept`.
     ///
     /// `read` and `write` yield until done and can run at the same time.
     /// The connection closes on `:close()`, when the handle is garbage
@@ -743,8 +741,11 @@ lua_table! {
     /// keep-alive connection rather than pay a fresh handshake each time.
     ///
     /// `connect` follows the same rules, but only reaches hosts the plugin
-    /// lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
-    /// local sockets, and need the `run` permission instead.
+    /// lists in `net_hosts`.
+    ///
+    /// `connect_unix` and `listen_unix` exist on Unix only. They need the
+    /// `run` permission rather than `net`, because a plugin that can run
+    /// `socat` already reaches every local socket.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
@@ -871,18 +872,13 @@ fn build_request(
 ) -> Result<Request, String> {
     let build_error = |e: &dyn StdError| format!("request build error: {e}");
     let parsed_method = Method::from_bytes(method.as_bytes()).map_err(|e| build_error(&e))?;
-    let default_agent = (!headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case(USER_AGENT_HEADER)))
-    .then_some((USER_AGENT_HEADER, user_agent));
-    let mut header_map = HeaderMap::new();
-    for (k, v) in default_agent
-        .into_iter()
-        .chain(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-    {
-        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| build_error(&e))?;
-        let value = HeaderValue::from_str(v).map_err(|e| build_error(&e))?;
-        header_map.append(name, value);
+    // `User-Agent` and `user-agent` in one table are refused: which one won
+    // would come down to the table's iteration order.
+    let mut header_map =
+        parse_headers(headers.iter().map(|(k, v)| (k, v))).map_err(|e| build_error(&e))?;
+    if !header_map.contains_key(USER_AGENT_NAME) {
+        let value = HeaderValue::from_str(user_agent).map_err(|e| build_error(&e))?;
+        header_map.insert(USER_AGENT_NAME, value);
     }
 
     // hyper sends no `content-length` for an empty body, whatever the method.
@@ -989,7 +985,7 @@ fn redirect_location(response: &Response) -> Option<String> {
 /// redirect, so the client has to as well.
 fn build_client(key: &ClientKey) -> Result<Client, String> {
     // The providers' base, so a plugin's side requests trust the same CA
-    // bundle and go through the same proxy and DNS rules as its chat requests.
+    // bundle and go through the same proxy as its chat requests.
     // Redirects stay off there too, which here means every hop goes through
     // the SSRF check instead of bouncing into 169.254.169.254.
     //
@@ -1416,7 +1412,9 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
+    use maki_providers::headers::HeaderError;
     use reqwest::Body;
+    use reqwest::header::HeaderName;
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{Ipv6Addr, TcpListener, TcpStream as StdTcpStream};
@@ -1915,8 +1913,28 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let agents: Vec<_> = req.headers().get_all(USER_AGENT_HEADER).iter().collect();
+        let agents: Vec<_> = req.headers().get_all(USER_AGENT_NAME).iter().collect();
         assert_eq!(agents, ["plugin"]);
+    }
+
+    #[test]
+    fn one_header_in_two_cases_is_refused() {
+        const SPELLINGS: [&str; 2] = ["User-Agent", "user-agent"];
+        let headers: Vec<_> = SPELLINGS
+            .iter()
+            .map(|name| (name.to_string(), "plugin".to_string()))
+            .collect();
+        let error = build_request(
+            &Client::new(),
+            EXAMPLE_URL,
+            "agent",
+            "GET",
+            &headers,
+            vec![],
+        )
+        .unwrap_err();
+        let expected = HeaderError::Duplicate(SPELLINGS[1].into()).to_string();
+        assert!(error.contains(&expected), "{error}");
     }
 
     #[test]
@@ -2091,7 +2109,6 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains(UNRESOLVABLE_HOST), "{error}");
         assert!(!error.contains(QUERY_SECRET), "{error}");
     }
 

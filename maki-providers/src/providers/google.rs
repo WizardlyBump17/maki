@@ -1,12 +1,13 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use flume::Sender;
+use futures::TryStreamExt;
+use maki_storage::blocking;
 use maki_storage::id::{MakiId, SessionRef};
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, Request, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use maki_config::providers::Protocol;
@@ -25,9 +26,7 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{
-    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line, ok_sse, ok_text,
-};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseBody, http_client, ok_sse, ok_text};
 
 pub(crate) const SLUG: &str = "google";
 const DISPLAY_NAME: &str = "Google";
@@ -174,22 +173,13 @@ impl Google {
             .to_string()
     }
 
-    fn build_request(&self, method: Method, url: &str) -> RequestBuilder {
-        let auth = self.auth.lock().unwrap();
-        auth.configure_request(
-            self.client
-                .request(method, url)
-                .header("user-agent", super::user_agent()),
-        )
+    fn finish(&self, builder: RequestBuilder) -> Result<Request, AgentError> {
+        self.auth.lock().unwrap().finish(builder)
     }
 
     fn api_key(&self) -> String {
         let auth = self.auth.lock().unwrap();
-        auth.headers
-            .iter()
-            .find(|(k, _)| k == API_KEY_HEADER)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
+        auth.header(API_KEY_HEADER).unwrap_or_default().to_owned()
     }
 
     fn stream_url(&self, model_id: &str) -> String {
@@ -247,7 +237,7 @@ impl Google {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let top_p = self.auth.lock().unwrap().top_p;
@@ -255,14 +245,15 @@ impl Google {
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
-        let request = self
-            .build_request(Method::POST, &url)
-            .header("content-type", "application/json")
-            .body(json_body)
-            .build()?;
+        let request = self.finish(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(json_body),
+        )?;
 
-        ok_sse(&self.client, request, |body| {
-            parse_sse(body, event_tx, self.stream_timeout)
+        ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx)
         })
         .await
     }
@@ -275,7 +266,7 @@ impl Provider for Google {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -284,7 +275,7 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request(Method::GET, &url).build();
+        let request = self.finish(self.client.get(&url));
         let client = self.client.clone();
         Box::pin(async move {
             let body_text = ok_text(&client, request?).await?;
@@ -318,7 +309,7 @@ impl Provider for Google {
             if self.key_pool.is_none() {
                 return Ok(());
             }
-            let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
+            let pool = blocking(|| KeyPool::resolve(SLUG, ENV_VAR)).await?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
@@ -366,6 +357,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
+                    ..
                 } => {
                     let mut part = json!({"text": thinking, "thought": true});
                     if let Some(sig) = signature {
@@ -576,6 +568,7 @@ fn push_or_extend_thinking(
     if let Some(ContentBlock::Thinking {
         thinking: prev,
         signature: prev_sig,
+        ..
     }) = blocks.last_mut()
     {
         prev.push_str(&text);
@@ -586,29 +579,25 @@ fn push_or_extend_thinking(
         blocks.push(ContentBlock::Thinking {
             thinking: text,
             signature,
+            reasoning_id: None,
         });
     }
 }
 
 async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.strip_prefix(' ').unwrap_or(d),
-            _ => continue,
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data else {
+            continue;
         };
 
-        let chunk: SseResponse = match serde_json::from_str(data) {
+        let chunk: SseResponse = match serde_json::from_str(&data) {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "failed to parse Gemini SSE chunk");
@@ -648,12 +637,10 @@ async fn parse_sse(
                     let id = format!("call_{}_{}", func_call.name, MakiId::generate());
                     let input = func_call.args.unwrap_or_default();
                     let thought_signature = func_call.thought_signature.or(part.thought_signature);
-                    event_tx
-                        .send_async(ProviderEvent::ToolUseStart {
-                            id: id.clone(),
-                            name: func_call.name.clone(),
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: func_call.name.clone(),
+                    })?;
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name: func_call.name,
@@ -664,16 +651,12 @@ async fn parse_sse(
                 } else if let Some(text) = part.text {
                     if part.thought.unwrap_or(false) {
                         if !text.is_empty() {
-                            event_tx
-                                .send_async(ProviderEvent::ThinkingDelta { text: text.clone() })
-                                .await?;
+                            event_tx.send(ProviderEvent::ThinkingDelta { text: text.clone() })?;
                         }
                         push_or_extend_thinking(&mut content_blocks, text, part.thought_signature);
                     } else if !text.is_empty() {
                         // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
-                        event_tx
-                            .send_async(ProviderEvent::TextDelta { text: text.clone() })
-                            .await?;
+                        event_tx.send(ProviderEvent::TextDelta { text: text.clone() })?;
                         push_or_extend_text(&mut content_blocks, text);
                     }
                 }
@@ -689,11 +672,11 @@ mod tests {
     use super::*;
     use crate::error::ErrorProjection;
     use crate::model::{ModelPricing, ModelTier};
-    use std::io::Cursor;
+    use crate::test_support::sse_body;
     use std::sync::Arc;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
     const GEMINI_API_KEY: &str = "test-key";
     const MALFORMED_BASE_URL: &str = "http://[";
     const TOOL_NAME: &str = "word_count";
@@ -904,6 +887,7 @@ mod tests {
             content: vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig123".into()),
+                reasoning_id: None,
             }],
             ..Default::default()
         }];
@@ -1059,9 +1043,9 @@ mod tests {
     #[tokio::test]
     async fn parse_sse_plain_text() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":10}}\n\n";
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(result.usage.input, 5);
         assert_eq!(result.usage.output, 10);
@@ -1082,9 +1066,9 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("Hello, "));
         data.push_str(&event("world."));
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(
             result.message.content.len(),
             1,
@@ -1111,13 +1095,13 @@ mod tests {
         let mut data = String::new();
         data.push_str(&event("reasoning... ", None));
         data.push_str(&event("more.", Some("sig-final")));
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
-            ContentBlock::Thinking { thinking, signature }
+            ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "reasoning... more." && signature.as_deref() == Some("sig-final")
         ));
     }
@@ -1127,9 +1111,9 @@ mod tests {
         let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
         let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
         let data = format!("data: {payload}\n\n");
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         let ids: Vec<&str> = result
             .message
             .content
@@ -1146,13 +1130,13 @@ mod tests {
     #[tokio::test]
     async fn parse_sse_thinking_part() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
-            ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
+            ContentBlock::Thinking { thinking, signature, .. } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
         ));
         assert!(matches!(
             &result.message.content[1],
@@ -1163,9 +1147,9 @@ mod tests {
     #[tokio::test]
     async fn parse_sse_tool_call() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"cmd\":\"ls\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":15}}\n\n";
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert!(matches!(
             &result.message.content[0],
@@ -1188,9 +1172,9 @@ mod tests {
             r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
         );
         let data = format!("data: {payload}\n\n");
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
@@ -1209,9 +1193,9 @@ mod tests {
             metadata["cachedContentTokenCount"] = json!(cached);
         }
         let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
@@ -1240,9 +1224,9 @@ mod tests {
             json!({"usageMetadata": initial_metadata}),
             json!({"usageMetadata": metadata}),
         );
-        let response = Cursor::new(data);
-        let (tx, _rx) = flume::unbounded();
-        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        let response = sse_body(data);
+        let (tx, _rx) = unbounded_channel();
+        let result = parse_sse(response, &tx).await.unwrap();
         assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
         assert_eq!(result.usage.cache_read, expected_cache_read);

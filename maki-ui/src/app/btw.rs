@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use flume::Sender;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionTools;
 use serde_json::Value;
+use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
 
 use crate::components::btw_modal::BtwEvent;
 
@@ -21,6 +21,7 @@ const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer co
 from the conversation context.";
 
 const NO_TOOLS: Value = Value::Array(Vec::new());
+const BTW_EVENT_CAPACITY: usize = 64;
 
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
 fn btw_question(question: &str) -> Message {
@@ -81,7 +82,7 @@ impl App {
             }
         };
 
-        let (tx, rx) = flume::bounded(64);
+        let (tx, rx) = channel(BTW_EVENT_CAPACITY);
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
         let request = BtwRequest {
             opts: opts.clamped(&model),
@@ -108,7 +109,7 @@ struct BtwRequest {
 
 impl BtwRequest {
     async fn run(self, btw_tx: Sender<BtwEvent>) {
-        let (event_tx, event_rx) = flume::unbounded();
+        let (event_tx, mut event_rx) = unbounded_channel();
         let messages = maki_providers::adapt_images_for_model(&self.model, &self.messages).await;
 
         // The pinned future outlives the stream, so the sender is dropped by
@@ -133,17 +134,17 @@ impl BtwRequest {
         // False when it stopped early, on a tool call or a closed modal, so the
         // stream's outcome never reaches the modal.
         let forward = async {
-            while let Ok(event) = event_rx.recv_async().await {
+            while let Some(event) = event_rx.recv().await {
                 let event = match event {
                     ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
                     ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
                     ProviderEvent::ToolUseStart { name, .. } => {
-                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name)));
+                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name))).await;
                         return false;
                     }
                     ProviderEvent::PromptProgress { .. } => continue,
                 };
-                if btw_tx.send(event).is_err() {
+                if btw_tx.send(event).await.is_err() {
                     return false;
                 }
             }
@@ -160,10 +161,12 @@ impl BtwRequest {
             _ = &mut forward => return,
         };
         if forward.await {
-            let _ = btw_tx.send(match result {
-                Ok(_) => BtwEvent::Done,
-                Err(e) => BtwEvent::Error(e.to_string()),
-            });
+            let _ = btw_tx
+                .send(match result {
+                    Ok(_) => BtwEvent::Done,
+                    Err(e) => BtwEvent::Error(e.to_string()),
+                })
+                .await;
         }
     }
 }
@@ -185,7 +188,9 @@ mod tests {
     };
     use maki_storage::frame::{PromptFacts, StoredFrame};
     use serde_json::json;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
 
     const Q: &str = "why sqlite?";
     const FRAME_POLICY: &str = "Use the active conversation policy.";
@@ -202,7 +207,7 @@ mod tests {
     }
 
     struct FakeProvider {
-        sent: Sender<Recorded>,
+        sent: UnboundedSender<Recorded>,
         script: Vec<ProviderEvent>,
     }
 
@@ -213,7 +218,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            events: &'a Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -253,6 +258,7 @@ mod tests {
         ContentBlock::Thinking {
             thinking: THOUGHT.into(),
             signature: signature.map(Into::into),
+            reasoning_id: None,
         }
     }
 
@@ -271,13 +277,13 @@ mod tests {
     }
 
     async fn ask(app: &mut App) -> Recorded {
-        let (sent, requests) = flume::unbounded();
+        let (sent, mut requests) = unbounded_channel();
         let provider = FakeProvider {
             sent,
             script: Vec::new(),
         };
         app.start_btw(Q.into(), Arc::new(provider), test_model());
-        requests.recv_async().await.unwrap()
+        requests.recv().await.unwrap()
     }
 
     /// An imported session holds a frame with facts and no prompt until its
@@ -305,7 +311,7 @@ mod tests {
             share_history(&mut app, frame, None);
         }
         assert_eq!(ask(&mut app).await.system, expected);
-        let prompts = host.event_handle().collect_prompt_slots();
+        let prompts = host.event_handle().collect_prompt_slots(None).await;
         assert_eq!(
             prompts.get(PromptId::System, Slot::Identity)[0].content,
             "1"
@@ -339,7 +345,7 @@ mod tests {
     #[test_case(Some("read"), BtwEvent::Error(reached_for_tool("read")) ; "tool_call_is_a_note")]
     #[tokio::test]
     async fn forwards_every_delta_then_stops_the_modal(tool: Option<&str>, last: BtwEvent) {
-        let (tx, rx) = flume::bounded(64);
+        let (tx, mut rx) = channel(BTW_EVENT_CAPACITY);
         let mut script = vec![ProviderEvent::TextDelta {
             text: ANSWER.into(),
         }];
@@ -348,7 +354,7 @@ mod tests {
             name: name.into(),
         }));
         let provider = FakeProvider {
-            sent: flume::unbounded().0,
+            sent: unbounded_channel().0,
             script,
         };
         BtwRequest {
@@ -362,7 +368,7 @@ mod tests {
         }
         .run(tx)
         .await;
-        let events: Vec<BtwEvent> = rx.drain().collect();
+        let events: Vec<BtwEvent> = iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(events, [BtwEvent::TextDelta(ANSWER.into()), last]);
     }
 

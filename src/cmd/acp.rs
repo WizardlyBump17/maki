@@ -95,7 +95,7 @@ pub async fn run(
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
+    let prompt_slots = plugin_host.event_handle().collect_prompt_slots(None).await;
 
     let event_handle = plugin_host.event_handle();
     let interrupt = Interrupt::install();
@@ -113,7 +113,7 @@ pub async fn run(
         trust_policy: Arc::new(config.trust),
         on_session_end: Some(Arc::new(move |id, reason| {
             let handle = event_handle.clone();
-            Box::pin(async move { handle.end_session_async(id, reason).await })
+            Box::pin(async move { handle.end_sessions([id], reason).await })
         })),
         storage,
         background: cli.background_wait().is_some(),
