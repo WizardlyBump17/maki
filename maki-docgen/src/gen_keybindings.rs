@@ -199,7 +199,8 @@ fn write_overrides(out: &mut String) {
         "Some keys stay out of reach (the full order is in \
          [Key resolution](/docs/lua-api/#key-resolution)):\n\n\
          - `Ctrl+C` and `Ctrl+Z`, so quit and suspend always work.\n\
-         - `Esc` while the agent runs, so `Esc Esc` can cancel the turn.\n\
+         - `Esc` while the agent runs, so the presses that stop the turn \
+         stay the host's.\n\
          - The keys of an open modal, picker or prompt, which it handles \
          first.\n\
          - Keys a plugin binds while it loads, like `Ctrl+P`. Plugins load \

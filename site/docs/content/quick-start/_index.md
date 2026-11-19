@@ -94,7 +94,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Sessions.** `Ctrl+N` in `/sessions` starts a second session while the first keeps working, and `/sessions` jumps between them. `/new` replaces the current one. Tomorrow, `maki --continue` resumes where you left off.
 - **Slow commands.** `Ctrl+B` moves a running build or subagent to the background and the agent carries on. See [Background Tasks](/docs/background-tasks/).
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
-- **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
+- **Escape hatch.** Five `Esc` presses within a second cancel a streaming response, and five `Ctrl+C` presses do the same. When idle, `Esc Esc` rewinds instead.
 - **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
 ## Default model (optional)

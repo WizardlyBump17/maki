@@ -1,5 +1,7 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
-//! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
+//! Stopping a running turn takes `STOP_PRESSES` presses of `Esc` or `Ctrl+C` inside
+//! `STOP_PRESS_WINDOW`; the earlier ones only flash how many are left. Idle, `Esc`
+//! still rewinds on two presses.
 //! `run_id` invalidates in-flight agent events. It bumps in exactly three
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
@@ -112,8 +114,18 @@ const EXIT_COMMAND: &str = "/exit";
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
-const FLASH_CANCEL: &str = "Press esc again to stop...";
-const FLASH_REWIND: &str = "Press esc again to rewind...";
+/// Presses of `Esc` or `Ctrl+C` it takes to stop a running turn, and how long
+/// they have to land in. One press is a keystroke anyone can make by accident;
+/// a burst of five inside a second is the user asking for it.
+const STOP_PRESSES: u8 = 5;
+const STOP_PRESS_WINDOW: Duration = Duration::from_secs(1);
+/// Idle `Esc` opens the rewind picker, which needs no such confirmation: it
+/// answers with a picker the user still has to pick a row in.
+const REWIND_PRESSES: u8 = 2;
+const ESC_HINT: &str = "esc";
+const CTRL_C_HINT: &str = "ctrl+c";
+const STOP_HINT_TAIL: &str = "to stop...";
+const REWIND_HINT_TAIL: &str = "to rewind...";
 // Short, because the flash shares the status bar with the model and cost.
 const ESC_ONE_RUNNING: &str = "1 task in background";
 const ESC_MANY_RUNNING_SUFFIX: &str = " tasks in background";
@@ -318,6 +330,51 @@ impl Sending {
     fn runs(&self) -> bool {
         matches!(self, Self::Exit | Self::Shell(_))
     }
+}
+
+/// Presses of one key, counted from the first one of the burst, so a burst of
+/// {needed} has to land inside {window}. A burst that filled stays spent until
+/// the window passes, so the key repeat right after the press that fired it
+/// does not fire a second action.
+#[derive(Default)]
+struct Burst {
+    first: Option<Instant>,
+    count: u8,
+}
+
+impl Burst {
+    /// `Some(left)` for a press with {left} of {needed} still to go, `Some(0)`
+    /// for the press that fills the burst, `None` for a press it already spent.
+    fn press(&mut self, window: Duration, needed: u8) -> Option<u8> {
+        if self.first.is_none_or(|first| first.elapsed() >= window) {
+            self.first = Some(Instant::now());
+            self.count = 0;
+        }
+        if self.count >= needed {
+            return None;
+        }
+        self.count += 1;
+        Some(needed - self.count)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether a burst already filled and has not aged out yet, so every press
+    /// on the key repeat after it is still spent.
+    fn spent(&self, window: Duration, needed: u8) -> bool {
+        self.count >= needed && self.first.is_some_and(|first| first.elapsed() < window)
+    }
+}
+
+/// What a burst still needs, in the words the flash shows. The last press is
+/// the one the user is reaching for, so that one says `again`.
+fn presses_hint(key: &str, left: u8, action: &str) -> String {
+    if left == 1 {
+        return format!("Press {key} again {action}");
+    }
+    format!("Press {key} {left} more times {action}")
 }
 
 /// Why a send may not go out. A key typed blind to what it would send sends
@@ -551,7 +608,10 @@ pub struct App {
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
-    pub(super) last_esc: Option<Instant>,
+    /// The `Esc` burst, see [`Self::handle_esc`].
+    pub(super) esc_presses: Burst,
+    /// The `Ctrl+C` burst that stops a turn, see [`Self::handle_ctrl_cancel`].
+    pub(super) ctrl_presses: Burst,
     /// The last key was a `Ctrl+C` that copied, see [`Self::handle_ctrl`].
     quit_copied: bool,
     pub(super) last_quit: Option<Instant>,
@@ -700,7 +760,8 @@ impl App {
             zones: ZoneRegistry::new(),
             selection_state: None,
             clipboard: ClipboardState::new(),
-            last_esc: None,
+            esc_presses: Burst::default(),
+            ctrl_presses: Burst::default(),
             quit_copied: false,
             last_quit: None,
             background_elsewhere: 0,
@@ -1397,27 +1458,34 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
-            // Copying lets go of the selection, so the next press clears the
-            // input and the one after quits, just like without one. A press
-            // right after a copy never copies, or a plugin that selects again
-            // after every change could keep the user from leaving.
+            // Copying lets go of the selection, so the next press clears the input
+            // and the ladder goes on from there. A press right after a copy never
+            // copies, or a plugin that selects again after every change could keep
+            // the user from leaving.
             if !mem::take(&mut self.quit_copied)
                 && self.chat_accepts_input()
                 && let Some(text) = self.input_box.take_selected_text()
             {
                 self.copy(&text);
                 self.quit_copied = true;
+                self.ctrl_presses.reset();
                 return Some(vec![]);
             }
-            return Some(if !self.chat_accepts_input() || self.input_box.is_empty() {
-                if self.status == Status::Streaming {
-                    return Some(self.handle_cancel());
-                }
-                self.quit()
-            } else {
+            if self.chat_accepts_input() && !self.input_box.is_empty() {
                 self.input_box.discard();
+                self.ctrl_presses.reset();
+                return Some(vec![]);
+            }
+            Some(if self.status == Status::Streaming {
+                self.handle_ctrl_cancel()
+            } else if self.ctrl_presses.spent(STOP_PRESS_WINDOW, STOP_PRESSES) {
+                // The key repeat right after the burst that stopped a turn. The run
+                // is gone, so this press has nothing left to stop, and quitting on
+                // it is the accident the burst exists to prevent.
                 vec![]
-            });
+            } else {
+                self.quit()
+            })
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
@@ -1440,6 +1508,22 @@ impl App {
             return Some(vec![]);
         }
         None
+    }
+
+    /// `Ctrl+C` stops the turn only once it lands [`STOP_PRESSES`] times inside
+    /// [`STOP_PRESS_WINDOW`]. A press before that says how many are left and
+    /// leaves the run alone, so the one meant for something else cannot end a
+    /// turn by accident. The presses after the one that fired are spent, see
+    /// [`Burst`], which is also what keeps that key repeat from quitting.
+    fn handle_ctrl_cancel(&mut self) -> Vec<Action> {
+        match self.ctrl_presses.press(STOP_PRESS_WINDOW, STOP_PRESSES) {
+            Some(0) => self.handle_cancel(),
+            Some(left) => {
+                self.flash(presses_hint(CTRL_C_HINT, left, STOP_HINT_TAIL));
+                vec![]
+            }
+            None => vec![],
+        }
     }
 
     /// The first holder of the keyboard, in [`KeyboardOwner`] order, answers
@@ -1967,8 +2051,8 @@ impl App {
     /// start a handler of its own. A popup that put
     /// `Esc close` in its own footer is already past this: an unfocused window
     /// takes its keys in [`Self::dispatch_on_screen_windows`], which runs
-    /// above, so the popup takes the first `Esc` and the next one, with the
-    /// popup gone, arms the cancel.
+    /// above, so the popup takes the `Esc`s until it closes, and only the ones
+    /// after that count towards the cancel.
     fn reserved_by_host(&self, key: KeyEvent) -> bool {
         is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
     }
@@ -2130,15 +2214,15 @@ impl App {
 
     /// A message typed while watching a running subagent is for that
     /// subagent, see [`Self::queue_for_subagent`]. `Esc` follows the chat in front
-    /// too: armed twice in a running subagent's chat it cancels that subagent
+    /// too: a full burst in a running subagent's chat cancels that subagent
     /// alone. A chat without an input box, see [`Self::chat_accepts_input`],
     /// answers only the mode toggle, and Esc goes back to the main chat.
     ///
-    /// While the agent in front works, `Esc` drops a selection and arms the
-    /// cancel in the same press, for the reason [`Self::reserved_by_host`]
-    /// gives: a plugin that keeps setting a selection must not be able to
-    /// keep the user from stopping. Idle, it only drops the selection, so it
-    /// never arms the rewind.
+    /// While the agent in front works, `Esc` drops a selection and counts
+    /// towards the cancel in the same press, for the reason
+    /// [`Self::reserved_by_host`] gives: a plugin that keeps setting a selection
+    /// must not be able to keep the user from stopping. Idle, it only drops the
+    /// selection, so it never fills the rewind burst.
     ///
     /// {mode} is the one the key was pressed in. A fallback must not type in
     /// insert mode a key a plugin matched in normal mode.
@@ -2147,7 +2231,7 @@ impl App {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
                 KeyCode::Esc => {
-                    self.last_esc = None;
+                    self.esc_presses.reset();
                     self.set_active_chat(MAIN_CHAT);
                     vec![]
                 }
@@ -2160,7 +2244,7 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    self.last_esc = None;
+                    self.esc_presses.reset();
                     self.set_active_chat(MAIN_CHAT);
                     let mode = self.sync_input_mode();
                     self.handle_chat_key(key, sight, mode)
@@ -2215,7 +2299,7 @@ impl App {
             }
             InputAction::Passthrough(key) => {
                 if key.code != KeyCode::Esc {
-                    self.last_esc = None;
+                    self.esc_presses.reset();
                 }
                 match key.code {
                     KeyCode::Up if working => {
@@ -2235,38 +2319,44 @@ impl App {
         }
     }
 
+    /// `Esc` stops what the chat in front is doing on [`STOP_PRESSES`] presses
+    /// inside [`STOP_PRESS_WINDOW`], and rewinds, with nothing running, on
+    /// [`REWIND_PRESSES`]. A press that does not fill its burst only flashes how
+    /// many are left.
     fn handle_esc(&mut self, working: bool) -> Vec<Action> {
         let in_subagent = !self.is_main_chat();
-        let armed = self
-            .last_esc
-            .take()
-            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
-        if armed {
-            return if in_subagent {
-                self.handle_subagent_cancel()
-            } else if working {
-                self.handle_cancel()
-            } else {
-                self.open_rewind_picker()
-            };
+        let stopping = in_subagent || working;
+        let needed = if stopping { STOP_PRESSES } else { REWIND_PRESSES };
+        match self.esc_presses.press(STOP_PRESS_WINDOW, needed) {
+            Some(0) => {
+                if in_subagent {
+                    self.handle_subagent_cancel()
+                } else if working {
+                    self.handle_cancel()
+                } else {
+                    self.open_rewind_picker()
+                }
+            }
+            Some(left) => {
+                let hint = presses_hint(
+                    ESC_HINT,
+                    left,
+                    if stopping { STOP_HINT_TAIL } else { REWIND_HINT_TAIL },
+                );
+                // Esc never reaches background work, which a flash about stopping
+                // would otherwise suggest.
+                let running = self.running_background_tasks().count();
+                let flash = if in_subagent || running == 0 {
+                    hint
+                } else {
+                    let still = count_phrase(running, ESC_ONE_RUNNING, ESC_MANY_RUNNING_SUFFIX);
+                    format!("{hint} {still}")
+                };
+                self.status_bar.flash(flash);
+                vec![]
+            }
+            None => vec![],
         }
-        self.last_esc = Some(Instant::now());
-        let hint = if in_subagent || working {
-            FLASH_CANCEL
-        } else {
-            FLASH_REWIND
-        };
-        // Esc never reaches background work, which a flash about stopping
-        // would otherwise suggest.
-        let running = self.running_background_tasks().count();
-        let flash = if in_subagent || running == 0 {
-            hint.to_owned()
-        } else {
-            let still = count_phrase(running, ESC_ONE_RUNNING, ESC_MANY_RUNNING_SUFFIX);
-            format!("{hint} {still}")
-        };
-        self.status_bar.flash(flash);
-        vec![]
     }
 
     /// True while something goes on without the user. Once it turns false
@@ -2333,8 +2423,7 @@ impl App {
         true
     }
 
-    /// With background tasks running, quitting takes a second press, the way
-    /// Esc does.
+    /// With background tasks running, quitting takes a second press.
     fn quit(&mut self) -> Vec<Action> {
         let running = self.background_everywhere();
         let armed = self

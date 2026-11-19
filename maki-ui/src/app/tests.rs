@@ -685,13 +685,15 @@ fn copied_keeping_the_text() -> CtrlC {
 }
 
 /// Each press does the first thing that applies: copy a selection, clear
-/// the input, then cancel a running turn or, idle, quit.
+/// the input, then, idle, quit. A running turn is stopped only by a full
+/// `Ctrl+C` burst, see [`ctrl_c_burst_stops_the_turn`], so a press aimed at
+/// the copy or the draft never ends it.
 #[test_case(with_selection as fn(&mut App), Status::Idle      => copied_keeping_the_text() ; "selection_copies_and_keeps_the_text")]
 #[test_case(with_selection as fn(&mut App), Status::Streaming => copied_keeping_the_text() ; "selection_copies_while_streaming")]
 #[test_case(with_text as fn(&mut App),      Status::Idle      => CTRL_C_EMPTIED ; "text_clears_the_input")]
 #[test_case(with_image as fn(&mut App),     Status::Idle      => CTRL_C_EMPTIED ; "image_clears_the_input")]
 #[test_case(with_nothing as fn(&mut App),   Status::Idle      => CtrlC { quit: true, ..CTRL_C_EMPTIED } ; "empty_idle_quits")]
-#[test_case(with_nothing as fn(&mut App),   Status::Streaming => CtrlC { cancelled: true, ..CTRL_C_EMPTIED } ; "empty_streaming_cancels_the_turn")]
+#[test_case(with_nothing as fn(&mut App),   Status::Streaming => CTRL_C_EMPTIED ; "empty_streaming_waits_for_the_burst")]
 fn ctrl_c_in_the_chat_input(setup: fn(&mut App), status: Status) -> CtrlC {
     let mut app = test_app();
     app.clipboard = ClipboardState::terminal_only();
@@ -1089,8 +1091,37 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
 }
 
 pub(crate) fn cancel_app(app: &mut App) {
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    press_esc(app, STOP_PRESSES);
+}
+
+/// Presses `Esc` {times} times and answers with what the last one did.
+pub(crate) fn press_esc(app: &mut App, times: u8) -> Vec<Action> {
+    (0..times)
+        .map(|_| app.update(Msg::Key(key(KeyCode::Esc))))
+        .last()
+        .unwrap_or_default()
+}
+
+/// Presses `Ctrl+C` {times} times and answers with what the last one did.
+fn ctrl_c_presses(app: &mut App, times: u8) -> Vec<Action> {
+    (0..times)
+        .map(|_| app.update(Msg::Key(kb::QUIT.to_key_event())))
+        .last()
+        .unwrap_or_default()
+}
+
+/// Moves a burst's first press back past [`STOP_PRESS_WINDOW`], standing in for
+/// presses a second apart without a test ever sleeping.
+fn expire(burst: &mut Burst) {
+    burst.first = Some(Instant::now().checked_sub(STOP_PRESS_WINDOW).unwrap());
+}
+
+fn esc_hint(left: u8) -> String {
+    presses_hint(ESC_HINT, left, STOP_HINT_TAIL)
+}
+
+fn ctrl_c_hint(left: u8) -> String {
+    presses_hint(CTRL_C_HINT, left, STOP_HINT_TAIL)
 }
 
 pub(crate) fn error_app(app: &mut App) {
@@ -2574,9 +2605,8 @@ fn esc_in_a_plugin_task_tab_stops_its_session() {
     let mut app = app_with_plugin_task();
     plugin_event(&mut app, done());
     app.run_builtin(BuiltinAction::NextChat);
-    app.last_esc = Some(Instant::now());
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
     assert!(matches!(
         actions.as_slice(),
@@ -3193,7 +3223,7 @@ fn mouse_up_clears_edge_scroll() {
 }
 
 #[test]
-fn double_esc_cancels_flushes_and_fails_tools() {
+fn esc_burst_cancels_flushes_and_fails_tools() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -3211,11 +3241,10 @@ fn double_esc_cancels_flushes_and_fails_tools() {
         render_header: None,
     }))));
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES - 1);
     assert!(actions.is_empty());
 
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, 1);
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.chats[0].in_progress_count(), 0);
@@ -3231,16 +3260,14 @@ fn double_esc_idle_opens_rewind_picker() {
         .session_mut()
         .push_message(Message::user("hello".into()));
 
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    press_esc(&mut app, REWIND_PRESSES);
     assert!(app.rewind_picker.is_open());
 }
 
 #[test]
 fn double_esc_idle_no_user_turns_flashes_error() {
     let mut app = test_app();
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    press_esc(&mut app, REWIND_PRESSES);
     assert!(!app.rewind_picker.is_open());
 }
 
@@ -7108,7 +7135,8 @@ fn an_enter_held_while_another_plugin_edited_sends_nothing() {
 /// Leaving cannot wait on a plugin, but the input it would clear is not yet
 /// what the user typed. The first `Ctrl+C` drops the keys and the fallback
 /// still waiting, and only that. An empty input must not quit or stop the
-/// turn because the typed keys had not landed yet. The next one acts.
+/// turn because the typed keys had not landed yet. The presses after it act as
+/// usual, and a running turn goes on a full burst.
 #[test_case("hi", false ; "clears_nothing_on_a_draft")]
 #[test_case("",   false ; "does_not_quit_when_idle")]
 #[test_case("",   true  ; "does_not_cancel_a_running_turn")]
@@ -7138,13 +7166,17 @@ fn ctrl_c_first_drops_the_held_keys(text: &str, streaming: bool) {
     app.keybind_done(pressed.id());
     assert_eq!(app.input_box.buffer.value(), text, "nothing held landed");
 
-    app.update(Msg::Key(kb::QUIT.to_key_event()));
-    if !text.is_empty() {
-        assert_eq!(app.input_box.buffer.value(), "");
-    } else if streaming {
-        assert_ne!(app.status, Status::Streaming);
+    if streaming {
+        let actions = ctrl_c_presses(&mut app, STOP_PRESSES);
+        assert_eq!(app.status, Status::Idle, "the burst stopped the turn");
+        assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
     } else {
-        assert_eq!(app.exit_request, ExitRequest::Success);
+        app.update(Msg::Key(kb::QUIT.to_key_event()));
+        if text.is_empty() {
+            assert_eq!(app.exit_request, ExitRequest::Success);
+        } else {
+            assert_eq!(app.input_box.buffer.value(), "");
+        }
     }
 }
 
@@ -7157,12 +7189,8 @@ fn a_streaming_esc_waits_its_turn_then_cancels() {
 
     let tab = press_bound(&mut app, &probe, KeyCode::Tab);
     type_keys(&mut app, "x");
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(
-        app.last_esc.is_none(),
-        "the Esc went ahead of the held keys"
-    );
+    press_esc(&mut app, STOP_PRESSES);
+    assert_eq!(app.esc_presses.count, 0, "the Esc went ahead of the held keys");
 
     let actions = app.keybind_done(tab.id());
     assert_eq!(app.input_box.buffer.value(), "x");
@@ -9200,8 +9228,8 @@ fn override_shadows_esc_builtin() {
 
     assert!(actions.is_empty());
     assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
-    assert!(
-        app.last_esc.is_none(),
+    assert_eq!(
+        app.esc_presses.count, 0,
         "override must consume Esc before the built-in esc handler runs"
     );
 }
@@ -9263,7 +9291,7 @@ fn streaming_cancel_wins_over_quit_override() {
     app.run_id = 1;
     let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES);
 
     assert!(
         matches!(&actions[0], Action::CancelAgent { .. }),
@@ -9484,11 +9512,9 @@ fn streaming_cancel_wins_over_esc_override() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.status_bar.flash_duration = Duration::from_secs(3600);
-    app.last_esc = Some(Instant::now());
     let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
     assert!(
         matches!(&actions[0], Action::CancelAgent { .. }),
@@ -9504,48 +9530,77 @@ fn streaming_cancel_wins_over_esc_override() {
 /// The same key, claimed by a popup instead of bound globally: it puts
 /// `Esc close` in its own footer, so taking the key from it leaves the user
 /// pressing Esc at a popup that will not go away while the flash tells them to
-/// press again - and the second press destroys the turn they were reading.
-/// The popup takes the first Esc, and the next one, with the popup gone, arms
-/// the cancel. No conditional reservation, just the order of the chain.
+/// press again - and those presses destroy the turn they were reading. The
+/// popup takes the `Esc`s until it closes, and only the burst after that stops
+/// the turn. No conditional reservation, just the order of the chain.
 #[test]
-fn a_popup_claiming_esc_closes_before_the_streaming_cancel_is_armed() {
+fn a_popup_claiming_esc_closes_before_the_streaming_cancel_counts() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
     let (mut events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
-    assert!(actions.is_empty(), "the popup took the Esc");
+    assert!(actions.is_empty(), "the popup took every Esc");
     assert!(took_a_key(&mut events), "{CLAIM_DELIVERED}");
     assert_eq!(app.status, Status::Streaming);
-    assert!(
-        app.last_esc.is_none(),
-        "the cancel is not armed while the popup is the thing in front"
-    );
+    assert_eq!(app.esc_presses.count, 0, "no press counts while a popup is in front");
 
     // The popup answers its own Esc by closing, which is what hands the key
-    // back for the press the user was reaching for.
+    // back for the presses the user was reaching for.
     drop(cmd_tx);
     let _ = app.float_mgr.tick();
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
-    assert!(app.last_esc.is_some(), "the second Esc arms the cancel");
-    assert_eq!(app.status, Status::Streaming, "and not in one press");
+    assert!(
+        matches!(&actions[0], Action::CancelAgent { .. }),
+        "the burst after the popup stops the turn"
+    );
 }
 
-/// With nothing on screen the first Esc arms the cancel on its own, which is
-/// the behaviour the popup above borrows for one press and gives back.
+/// With nothing on screen a press below the burst only says what it still
+/// needs, which is the behaviour the popup above borrows for its own close.
 #[test]
-fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
+fn esc_presses_below_the_burst_only_report_the_cancel_hint() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES - 1);
 
-    assert!(app.last_esc.is_some(), "the cancel is armed");
-    assert_eq!(app.status, Status::Streaming, "and not taken in one press");
+    assert!(actions.is_empty(), "no press stopped the turn");
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.status_bar.flash_text(), Some(esc_hint(1).as_str()));
+}
+
+/// A burst is a burst of presses in one window: the same key spread over
+/// longer than that never stops the turn, and a repeat right after it fired is
+/// spent, so the rewind the user never asked for stays shut.
+#[test]
+fn esc_presses_spaced_out_never_stop_the_turn() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    for _ in 0..STOP_PRESSES {
+        expire(&mut app.esc_presses);
+        let actions = press_esc(&mut app, 1);
+        assert!(actions.is_empty());
+    }
+
+    assert_eq!(app.status, Status::Streaming);
+    assert!(!app.rewind_picker.is_open());
+
+    let actions = press_esc(&mut app, STOP_PRESSES);
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert_eq!(app.status, Status::Idle);
+
+    let actions = press_esc(&mut app, STOP_PRESSES - 1);
+    assert!(
+        actions.is_empty() && !app.rewind_picker.is_open(),
+        "the repeats after the burst fired are spent"
+    );
 }
 
 /// The list a plugin is refused and the list the host answers itself are one
@@ -10382,9 +10437,9 @@ fn a_selection_alone_fires_a_cursor_only_change() {
 }
 
 /// A selection must not cost a turn's cancel a press: during a turn the `Esc`
-/// that drops it arms the cancel too. Idle it only drops it.
+/// that drops it counts towards the cancel too. Idle it only drops it.
 #[test_case(Status::Idle,      None               ; "idle_only_deselects")]
-#[test_case(Status::Streaming, Some(FLASH_CANCEL) ; "streaming_also_arms_cancel")]
+#[test_case(Status::Streaming, Some(esc_hint(STOP_PRESSES - 1).as_str()) ; "streaming_also_counts_towards_cancel")]
 fn esc_with_a_selection(status: Status, expected_flash: Option<&str>) {
     let mut app = test_app();
     type_keys(&mut app, "ab");
@@ -10778,10 +10833,9 @@ fn app_with_active_subagent() -> App {
 }
 
 #[test]
-fn double_esc_in_subagent_cancels_subagent() {
+fn esc_burst_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
     assert_eq!(actions.len(), 1);
     assert!(matches!(
         &actions[0],
@@ -10792,14 +10846,14 @@ fn double_esc_in_subagent_cancels_subagent() {
 }
 
 #[test]
-fn single_or_stale_esc_in_subagent_flashes() {
+fn esc_presses_below_the_burst_in_subagent_only_flash() {
     let mut app = app_with_active_subagent();
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
-    assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_CANCEL);
+    assert_eq!(app.status_bar.flash_text(), Some(esc_hint(STOP_PRESSES - 1).as_str()));
 
-    app.last_esc = Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    expire(&mut app.esc_presses);
+    let actions = press_esc(&mut app, STOP_PRESSES - 1);
     assert!(actions.is_empty());
     assert!(!app.chats[1].is_finished());
 }
@@ -10808,8 +10862,7 @@ fn single_or_stale_esc_in_subagent_flashes() {
 fn esc_in_main_chat_with_active_subagent_no_cancel() {
     let mut app = app_with_subagent();
     assert_eq!(app.active_chat, 0);
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
     assert!(!matches!(&actions[0], Action::CancelSubagent { .. }));
@@ -10821,8 +10874,7 @@ fn new_session(app: &mut App) {
 
 fn stop_in_its_tab(app: &mut App) {
     app.focus_task(TASK_ID).unwrap();
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    press_esc(app, STOP_PRESSES);
 }
 
 /// The answer sender lives on the chat, so whatever ends the chat or drops
@@ -10853,8 +10905,7 @@ fn multiple_subagents_cancel_one_other_unaffected() {
     assert_eq!(app.chats.len(), 3);
 
     app.active_chat = *app.chat_index.get("task2").unwrap();
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
     assert_eq!(actions.len(), 1);
     assert!(matches!(
@@ -10867,19 +10918,17 @@ fn multiple_subagents_cancel_one_other_unaffected() {
 }
 
 #[test]
-fn double_esc_in_finished_subagent_noop() {
+fn esc_in_finished_subagent_noop() {
     let mut app = app_with_active_subagent();
     finish_subagent_task(&mut app, false);
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, 1);
     assert!(actions.is_empty());
 }
 
 #[test]
 fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    press_esc(&mut app, STOP_PRESSES);
     assert!(app.chats[1].is_finished());
 
     app.run_builtin(BuiltinAction::PrevChat);
@@ -11084,8 +11133,95 @@ fn ctrl_c_in_subagent_chat_discards_draft_before_cancelling() {
     assert!(actions.is_empty());
     assert!(app.input_box.is_empty());
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES);
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+}
+
+/// `Ctrl+C` stops the turn on the fifth press of a second, and says what is
+/// still missing on the ones before it.
+#[test]
+fn ctrl_c_burst_stops_the_turn() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+    assert!(actions.is_empty(), "no press stopped the turn yet");
+    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.status_bar.flash_text(), Some(ctrl_c_hint(1).as_str()));
+
+    let actions = ctrl_c_presses(&mut app, 1);
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    assert_eq!(app.status, Status::Idle);
+}
+
+/// Clearing the draft is not a press aimed at the turn, so it restarts the
+/// burst: the presses spent on it never count towards a stop.
+#[test]
+fn ctrl_c_clearing_the_input_leaves_the_burst_unfilled() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+
+    app.input_box.set_input("a draft");
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(app.input_box.is_empty());
+
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+    assert!(actions.is_empty(), "the burst started over at the draft");
+    assert_eq!(app.status, Status::Streaming);
+}
+
+/// The burst stopped the turn, so the key repeat that carried on with it has
+/// nothing left to stop. Idle, `Ctrl+C` quits, and a repeat that quit would be
+/// the same accident a single press used to be. Once the window passes the next
+/// press is a press on its own again, and it quits.
+#[test]
+fn a_ctrl_c_right_after_the_burst_does_not_quit() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    ctrl_c_presses(&mut app, STOP_PRESSES);
+    assert_eq!(app.status, Status::Idle);
+
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+    assert!(actions.is_empty(), "the repeat after the burst is spent");
+    assert_eq!(app.exit_request, ExitRequest::None);
+
+    expire(&mut app.ctrl_presses);
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(
+        matches!(actions.as_slice(), [Action::ManualExit]),
+        "after the window the press acts on its own"
+    );
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+#[test_case(1, Some(STOP_PRESSES - 1) ; "the first press")]
+#[test_case(STOP_PRESSES, Some(0) ; "the press that fills it")]
+#[test_case(STOP_PRESSES + 3, None ; "every repeat after it")]
+fn burst_presses_report_what_is_left(presses: u8, expected: Option<u8>) {
+    let mut burst = Burst::default();
+    let last = (0..presses)
+        .map(|_| burst.press(STOP_PRESS_WINDOW, STOP_PRESSES))
+        .last()
+        .unwrap();
+
+    assert_eq!(last, expected);
+}
+
+#[test]
+fn a_burst_that_aged_starts_again_from_one() {
+    let mut burst = Burst::default();
+    for _ in 0..STOP_PRESSES - 1 {
+        burst.press(STOP_PRESS_WINDOW, STOP_PRESSES);
+    }
+
+    expire(&mut burst);
+
+    let left = burst.press(STOP_PRESS_WINDOW, STOP_PRESSES);
+    assert_eq!(left, Some(STOP_PRESSES - 1));
 }
 
 // -- Every frame checkpoints: one way in for a history, one trigger to save --
@@ -12132,7 +12268,7 @@ fn tool_movable_sets_the_rows_flag(movable: bool) {
     );
 }
 
-/// A quit ends every open session, so it asks twice, the way Esc does, and
+/// A quit ends every open session, so it asks twice before it lands, and
 /// counts the tasks of the other sessions with this one's.
 #[test_case(true,  0, QUIT_ONE_RUNNING.to_owned()                  ; "only_here")]
 #[test_case(false, 2, format!("2{QUIT_MANY_RUNNING_SUFFIX}")        ; "only_elsewhere")]
@@ -12196,10 +12332,10 @@ fn ending_running_background_tasks_by_command_needs_the_bang(
 fn esc_says_background_tasks_keep_running() {
     let (mut app, _buf) = app_with_moved_call();
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert_eq!(
-        app.status_bar.flash_text(),
-        Some(format!("{FLASH_CANCEL} {ESC_ONE_RUNNING}").as_str())
-    );
+
+    let hint = esc_hint(STOP_PRESSES - 1);
+    let flash = format!("{hint} {ESC_ONE_RUNNING}");
+    assert_eq!(app.status_bar.flash_text(), Some(flash.as_str()));
 }
 
 /// A moved call keeps the agent waiting after its turn. While the agent
@@ -12717,10 +12853,9 @@ fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
         },
     );
 
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
-    assert!(actions.is_empty());
+    assert!(actions.is_empty(), "the prompt answers its own Esc");
     assert_eq!(app.status, Status::Streaming);
     app.update(Msg::Key(key(KeyCode::Char('y'))));
     assert_eq!(sub_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
@@ -12756,8 +12891,7 @@ fn esc_in_an_adopted_nested_subagents_tab_stops_it_by_its_own_id(adopt: fn(&mut 
         app.chats[app.active_chat].task_status(),
         TaskStatus::Working
     );
-    app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = press_esc(&mut app, STOP_PRESSES);
 
     assert!(matches!(
         actions.as_slice(),
