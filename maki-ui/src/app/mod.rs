@@ -337,15 +337,15 @@ impl Sending {
 /// the window passes, so the key repeat right after the press that fired it
 /// does not fire a second action.
 #[derive(Default)]
-struct Burst {
+pub(crate) struct Burst {
     first: Option<Instant>,
-    count: u8,
+    pub(crate) count: u8,
 }
 
 impl Burst {
     /// `Some(left)` for a press with {left} of {needed} still to go, `Some(0)`
     /// for the press that fills the burst, `None` for a press it already spent.
-    fn press(&mut self, window: Duration, needed: u8) -> Option<u8> {
+    pub(crate) fn press(&mut self, window: Duration, needed: u8) -> Option<u8> {
         if self.first.is_none_or(|first| first.elapsed() >= window) {
             self.first = Some(Instant::now());
             self.count = 0;
@@ -363,7 +363,7 @@ impl Burst {
 
     /// Whether a burst already filled and has not aged out yet, so every press
     /// on the key repeat after it is still spent.
-    fn spent(&self, window: Duration, needed: u8) -> bool {
+    pub(crate) fn spent(&self, window: Duration, needed: u8) -> bool {
         self.count >= needed && self.first.is_some_and(|first| first.elapsed() < window)
     }
 }
@@ -1476,7 +1476,7 @@ impl App {
                 self.ctrl_presses.reset();
                 return Some(vec![]);
             }
-            Some(if self.status == Status::Streaming {
+            return Some(if self.status == Status::Streaming {
                 self.handle_ctrl_cancel()
             } else if self.ctrl_presses.spent(STOP_PRESS_WINDOW, STOP_PRESSES) {
                 // The key repeat right after the burst that stopped a turn. The run

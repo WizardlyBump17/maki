@@ -9584,9 +9584,9 @@ fn esc_presses_spaced_out_never_stop_the_turn() {
     app.run_id = 1;
 
     for _ in 0..STOP_PRESSES {
-        expire(&mut app.esc_presses);
         let actions = press_esc(&mut app, 1);
         assert!(actions.is_empty());
+        expire(&mut app.esc_presses);
     }
 
     assert_eq!(app.status, Status::Streaming);
