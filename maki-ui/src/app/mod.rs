@@ -1,7 +1,7 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
 //! Stopping a running turn takes `STOP_PRESSES` presses of `Esc` or `Ctrl+C` inside
 //! `STOP_PRESS_WINDOW`; the earlier ones only flash how many are left. Idle, `Esc`
-//! still rewinds on two presses.
+//! rewinds on two presses and `Ctrl+C` quits on the same five.
 //! `run_id` invalidates in-flight agent events. It bumps in exactly three
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
@@ -114,9 +114,10 @@ const EXIT_COMMAND: &str = "/exit";
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
-/// Presses of `Esc` or `Ctrl+C` it takes to stop a running turn, and how long
-/// they have to land in. One press is a keystroke anyone can make by accident;
-/// a burst of five inside a second is the user asking for it.
+/// Presses of `Esc` or `Ctrl+C` it takes to stop a running turn, or to quit an
+/// idle one, and how long they have to land in. One press is a keystroke anyone
+/// can make by accident; a burst of five inside a second is the user asking for
+/// it.
 const STOP_PRESSES: u8 = 5;
 const STOP_PRESS_WINDOW: Duration = Duration::from_secs(1);
 /// Idle `Esc` opens the rewind picker, which needs no such confirmation: it
@@ -125,6 +126,7 @@ const REWIND_PRESSES: u8 = 2;
 const ESC_HINT: &str = "esc";
 const CTRL_C_HINT: &str = "ctrl+c";
 const STOP_HINT_TAIL: &str = "to stop...";
+const QUIT_HINT_TAIL: &str = "to quit...";
 const REWIND_HINT_TAIL: &str = "to rewind...";
 // Short, because the flash shares the status bar with the model and cost.
 const ESC_ONE_RUNNING: &str = "1 task in background";
@@ -359,12 +361,6 @@ impl Burst {
 
     fn reset(&mut self) {
         *self = Self::default();
-    }
-
-    /// Whether a burst already filled and has not aged out yet, so every press
-    /// on the key repeat after it is still spent.
-    pub(crate) fn spent(&self, window: Duration, needed: u8) -> bool {
-        self.count >= needed && self.first.is_some_and(|first| first.elapsed() < window)
     }
 }
 
@@ -610,7 +606,7 @@ pub struct App {
     pub(super) clipboard: ClipboardState,
     /// The `Esc` burst, see [`Self::handle_esc`].
     pub(super) esc_presses: Burst,
-    /// The `Ctrl+C` burst that stops a turn, see [`Self::handle_ctrl_cancel`].
+    /// The `Ctrl+C` burst that stops a turn or quits, see [`Self::handle_ctrl_cancel`].
     pub(super) ctrl_presses: Burst,
     /// The last key was a `Ctrl+C` that copied, see [`Self::handle_ctrl`].
     quit_copied: bool,
@@ -1476,16 +1472,12 @@ impl App {
                 self.ctrl_presses.reset();
                 return Some(vec![]);
             }
-            return Some(if self.status == Status::Streaming {
-                self.handle_ctrl_cancel()
-            } else if self.ctrl_presses.spent(STOP_PRESS_WINDOW, STOP_PRESSES) {
-                // The key repeat right after the burst that stopped a turn. The run
-                // is gone, so this press has nothing left to stop, and quitting on
-                // it is the accident the burst exists to prevent.
-                vec![]
-            } else {
-                self.quit()
-            })
+            // A quit the user already agreed to a second press ago goes now, and
+            // the burst is what an unagreed one needs.
+            if self.quit_armed() {
+                return Some(self.quit());
+            }
+            return Some(self.handle_ctrl_cancel())
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
@@ -1510,16 +1502,25 @@ impl App {
         None
     }
 
-    /// `Ctrl+C` stops the turn only once it lands [`STOP_PRESSES`] times inside
-    /// [`STOP_PRESS_WINDOW`]. A press before that says how many are left and
-    /// leaves the run alone, so the one meant for something else cannot end a
-    /// turn by accident. The presses after the one that fired are spent, see
-    /// [`Burst`], which is also what keeps that key repeat from quitting.
+    /// `Ctrl+C` quits, or stops the turn, only once it lands [`STOP_PRESSES`]
+    /// times inside [`STOP_PRESS_WINDOW`]. A press before that says how many are
+    /// left and leaves the run alone, so the one meant for something else cannot
+    /// end a turn or a session by accident. The presses after the one that fired
+    /// are spent, see [`Burst`], which is also what keeps that key repeat from
+    /// quitting.
     fn handle_ctrl_cancel(&mut self) -> Vec<Action> {
+        let stopping = self.status == Status::Streaming;
         match self.ctrl_presses.press(STOP_PRESS_WINDOW, STOP_PRESSES) {
-            Some(0) => self.handle_cancel(),
+            Some(0) => {
+                if stopping {
+                    self.handle_cancel()
+                } else {
+                    self.quit()
+                }
+            }
             Some(left) => {
-                self.flash(presses_hint(CTRL_C_HINT, left, STOP_HINT_TAIL));
+                let tail = if stopping { STOP_HINT_TAIL } else { QUIT_HINT_TAIL };
+                self.flash(presses_hint(CTRL_C_HINT, left, tail));
                 vec![]
             }
             None => vec![],
@@ -2423,17 +2424,22 @@ impl App {
         true
     }
 
+    /// Whether the quit's own second press is armed, see [`Self::quit`].
+    fn quit_armed(&self) -> bool {
+        self.last_quit
+            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration)
+    }
+
     /// With background tasks running, quitting takes a second press.
     fn quit(&mut self) -> Vec<Action> {
         let running = self.background_everywhere();
-        let armed = self
-            .last_quit
-            .take()
-            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
-        if !armed && self.warn_if_running(running, QUIT_ONE_RUNNING, QUIT_MANY_RUNNING_SUFFIX) {
+        if !self.quit_armed()
+            && self.warn_if_running(running, QUIT_ONE_RUNNING, QUIT_MANY_RUNNING_SUFFIX)
+        {
             self.last_quit = Some(Instant::now());
             return vec![];
         }
+        self.last_quit = None;
         self.quit_with(ExitRequest::Success)
     }
 

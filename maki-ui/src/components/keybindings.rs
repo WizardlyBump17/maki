@@ -263,7 +263,7 @@ const fn single(label: &'static str, description: &'static str, context: Ctx) ->
 pub const KEYBINDS: &[Keybind] = &[
     single(
         key::QUIT.label,
-        "Quit / clear input / copy selection",
+        "Quit (5 presses in a second) / clear input / copy selection",
         Ctx::General,
     ),
     single(key::HELP.label, "Show keybindings", Ctx::General),

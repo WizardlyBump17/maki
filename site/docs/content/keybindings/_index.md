@@ -13,7 +13,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit / clear input / copy selection |
+| `Ctrl+C` | Quit (5 presses in a second) / clear input / copy selection |
 | `Ctrl+H` | Show keybindings |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |

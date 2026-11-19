@@ -684,15 +684,15 @@ fn copied_keeping_the_text() -> CtrlC {
     }
 }
 
-/// Each press does the first thing that applies: copy a selection, clear
-/// the input, then, idle, quit. A running turn is stopped only by a full
-/// `Ctrl+C` burst, see [`ctrl_c_burst_stops_the_turn`], so a press aimed at
-/// the copy or the draft never ends it.
+/// Each press does the first thing that applies: copy a selection, clear the
+/// input. Only a full `Ctrl+C` burst quits, or stops a running turn, see
+/// [`ctrl_c_burst_stops_the_turn`], so a press aimed at the copy or the draft
+/// never ends either.
 #[test_case(with_selection as fn(&mut App), Status::Idle      => copied_keeping_the_text() ; "selection_copies_and_keeps_the_text")]
 #[test_case(with_selection as fn(&mut App), Status::Streaming => copied_keeping_the_text() ; "selection_copies_while_streaming")]
 #[test_case(with_text as fn(&mut App),      Status::Idle      => CTRL_C_EMPTIED ; "text_clears_the_input")]
 #[test_case(with_image as fn(&mut App),     Status::Idle      => CTRL_C_EMPTIED ; "image_clears_the_input")]
-#[test_case(with_nothing as fn(&mut App),   Status::Idle      => CtrlC { quit: true, ..CTRL_C_EMPTIED } ; "empty_idle_quits")]
+#[test_case(with_nothing as fn(&mut App),   Status::Idle      => CTRL_C_EMPTIED ; "empty_idle_waits_for_the_burst")]
 #[test_case(with_nothing as fn(&mut App),   Status::Streaming => CTRL_C_EMPTIED ; "empty_streaming_waits_for_the_burst")]
 fn ctrl_c_in_the_chat_input(setup: fn(&mut App), status: Status) -> CtrlC {
     let mut app = test_app();
@@ -1122,6 +1122,10 @@ fn esc_hint(left: u8) -> String {
 
 fn ctrl_c_hint(left: u8) -> String {
     presses_hint(CTRL_C_HINT, left, STOP_HINT_TAIL)
+}
+
+fn ctrl_c_quit_hint(left: u8) -> String {
+    presses_hint(CTRL_C_HINT, left, QUIT_HINT_TAIL)
 }
 
 pub(crate) fn error_app(app: &mut App) {
@@ -7136,7 +7140,7 @@ fn an_enter_held_while_another_plugin_edited_sends_nothing() {
 /// what the user typed. The first `Ctrl+C` drops the keys and the fallback
 /// still waiting, and only that. An empty input must not quit or stop the
 /// turn because the typed keys had not landed yet. The presses after it act as
-/// usual, and a running turn goes on a full burst.
+/// usual, which means a full burst before anything quits or stops.
 #[test_case("hi", false ; "clears_nothing_on_a_draft")]
 #[test_case("",   false ; "does_not_quit_when_idle")]
 #[test_case("",   true  ; "does_not_cancel_a_running_turn")]
@@ -7167,16 +7171,21 @@ fn ctrl_c_first_drops_the_held_keys(text: &str, streaming: bool) {
     assert_eq!(app.input_box.buffer.value(), text, "nothing held landed");
 
     if streaming {
-        let actions = ctrl_c_presses(&mut app, STOP_PRESSES);
-        assert_eq!(app.status, Status::Idle, "the burst stopped the turn");
+        ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+        assert_eq!(app.status, Status::Streaming, "the burst is one short");
+        assert_eq!(app.exit_request, ExitRequest::None);
+        let actions = ctrl_c_presses(&mut app, 1);
         assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    } else if text.is_empty() {
+        ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+        assert_eq!(app.exit_request, ExitRequest::None, "quitting takes the burst");
+        let actions = ctrl_c_presses(&mut app, 1);
+        assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+        assert_eq!(app.exit_request, ExitRequest::Success);
     } else {
-        app.update(Msg::Key(kb::QUIT.to_key_event()));
-        if text.is_empty() {
-            assert_eq!(app.exit_request, ExitRequest::Success);
-        } else {
-            assert_eq!(app.input_box.buffer.value(), "");
-        }
+        let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+        assert!(actions.is_empty());
+        assert_eq!(app.input_box.buffer.value(), "");
     }
 }
 
@@ -9194,12 +9203,13 @@ fn override_does_not_shadow_quit() {
     app.status = Status::Idle;
     let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
-    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES);
 
     assert!(
         probe.try_recv_keybind().is_none(),
         "{OVERRIDE_NOT_DISPATCHED}"
     );
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
     assert_eq!(app.exit_request, ExitRequest::Success);
 }
 
@@ -11156,7 +11166,7 @@ fn ctrl_c_burst_stops_the_turn() {
 }
 
 /// Clearing the draft is not a press aimed at the turn, so it restarts the
-/// burst: the presses spent on it never count towards a stop.
+/// burst: the presses spent on it never count towards a stop or a quit.
 #[test]
 fn ctrl_c_clearing_the_input_leaves_the_burst_unfilled() {
     let mut app = test_app();
@@ -11174,9 +11184,9 @@ fn ctrl_c_clearing_the_input_leaves_the_burst_unfilled() {
 }
 
 /// The burst stopped the turn, so the key repeat that carried on with it has
-/// nothing left to stop. Idle, `Ctrl+C` quits, and a repeat that quit would be
-/// the same accident a single press used to be. Once the window passes the next
-/// press is a press on its own again, and it quits.
+/// nothing left to stop. A repeat that quit would be the same accident a single
+/// press used to be. Once the window passes the burst starts over, and the new
+/// one has to fill before a press quits.
 #[test]
 fn a_ctrl_c_right_after_the_burst_does_not_quit() {
     let mut app = test_app();
@@ -11190,11 +11200,32 @@ fn a_ctrl_c_right_after_the_burst_does_not_quit() {
     assert_eq!(app.exit_request, ExitRequest::None);
 
     expire(&mut app.ctrl_presses);
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+    assert_eq!(app.exit_request, ExitRequest::None, "the new burst is short");
+    let actions = ctrl_c_presses(&mut app, 1);
     assert!(
         matches!(actions.as_slice(), [Action::ManualExit]),
-        "after the window the press acts on its own"
+        "the press that fills the new burst quits"
     );
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+/// Idle, `Ctrl+C` quits on the fifth press of a second, and says what is still
+/// missing on the ones before it.
+#[test]
+fn ctrl_c_burst_quits_when_idle() {
+    let mut app = test_app();
+
+    let actions = ctrl_c_presses(&mut app, STOP_PRESSES - 1);
+    assert!(actions.is_empty(), "no press quit yet");
+    assert_eq!(app.exit_request, ExitRequest::None);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(ctrl_c_quit_hint(1).as_str())
+    );
+
+    let actions = ctrl_c_presses(&mut app, 1);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
     assert_eq!(app.exit_request, ExitRequest::Success);
 }
 
@@ -12268,8 +12299,8 @@ fn tool_movable_sets_the_rows_flag(movable: bool) {
     );
 }
 
-/// A quit ends every open session, so it asks twice before it lands, and
-/// counts the tasks of the other sessions with this one's.
+/// A quit ends every open session, so it asks twice once its own burst has
+/// filled, and counts the tasks of the other sessions with this one's.
 #[test_case(true,  0, QUIT_ONE_RUNNING.to_owned()                  ; "only_here")]
 #[test_case(false, 2, format!("2{QUIT_MANY_RUNNING_SUFFIX}")        ; "only_elsewhere")]
 #[test_case(true,  2, format!("3{QUIT_MANY_RUNNING_SUFFIX}")        ; "here_and_elsewhere")]
@@ -12285,6 +12316,7 @@ fn quit_with_running_background_tasks_takes_a_second_press(
     };
     end_turn(&mut app);
     app.background_elsewhere = elsewhere;
+    ctrl_c_presses(&mut app, STOP_PRESSES - 1);
 
     let first = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert!(first.is_empty());
@@ -13178,7 +13210,7 @@ fn exit_on_done_awaits_background_work(outstanding: bool, quit: bool, awaits: bo
     }
     end_turn(&mut app);
     if quit {
-        app.update(Msg::Key(kb::QUIT.to_key_event()));
+        ctrl_c_presses(&mut app, STOP_PRESSES);
     }
 
     assert_eq!(app.exit_request, ExitRequest::Success);
