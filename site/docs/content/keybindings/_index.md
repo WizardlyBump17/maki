@@ -57,7 +57,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate input history |
-| `Esc Esc` | Cancel agent |
+| `Esc ×5` | Cancel agent (5 presses in a second) |
+| `Ctrl+C` | Cancel agent (5 presses in a second) |
 | `Ctrl+B` | Move running calls to the background (tmux: press twice) |
 
 ## Form
@@ -133,7 +134,7 @@ end)
 Some keys stay out of reach (the full order is in [Key resolution](/docs/lua-api/#key-resolution)):
 
 - `Ctrl+C` and `Ctrl+Z`, so quit and suspend always work.
-- `Esc` while the agent runs, so `Esc Esc` can cancel the turn.
+- `Esc` while the agent runs, so the presses that stop the turn stay the host's.
 - The keys of an open modal, picker or prompt, which it handles first.
 - Keys a plugin binds while it loads, like `Ctrl+P`. Plugins load after your global and project `init.lua`, so their `set` comes last.
 - Multi-key combinations and rows like `Type` to filter. Only single keys can be bound.

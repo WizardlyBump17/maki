@@ -339,7 +339,8 @@ pub const KEYBINDS: &[Keybind] = &[
         "Navigate input history",
         Ctx::Streaming,
     ),
-    single("Esc Esc", "Cancel agent", Ctx::Streaming),
+    single("Esc ×5", "Cancel agent (5 presses in a second)", Ctx::Streaming),
+    single(key::QUIT.label, "Cancel agent (5 presses in a second)", Ctx::Streaming),
     single(
         key::BACKGROUND.label,
         "Move running calls to the background (tmux: press twice)",

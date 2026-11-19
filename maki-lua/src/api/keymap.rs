@@ -1002,7 +1002,7 @@ lua_table! {
     /// 3. Windows on screen, front first: each one's buffer bindings, then
     ///    the keys it claimed with the `keys` option of `maki.ui.open_win`.
     /// 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
-    ///    second one in a row cancels the turn.
+    ///    burst of five presses in a row cancels the turn.
     /// 5. Global bindings, the last `set` first.
     /// 6. Maki's built-in keys and the chat input.
     ///

@@ -314,7 +314,8 @@ impl App {
         self.recoverable_queue.clear();
         self.close_all_overlays();
         self.status_bar.clear_flash();
-        self.last_esc = None;
+        self.esc_presses.reset();
+        self.ctrl_presses.reset();
         self.last_quit = None;
         self.background_moves = BackgroundMoves::default();
         self.early_finals.clear();
